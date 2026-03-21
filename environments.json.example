@@ -1,0 +1,16 @@
+{
+  "region": "us-west-2",
+  "ecr_repo_name": "ccag",
+  "stack_name": "CCAG",
+  "prod": {
+    "account_id": "123456789012",
+    "desired_count": 1,
+    "domain_name": null,
+    "hosted_zone_name": null,
+    "certificate_arn": null,
+    "admin_users": null,
+    "admin_password": null,
+    "rds_iam_auth": false,
+    "allowed_cidrs": null
+  }
+}

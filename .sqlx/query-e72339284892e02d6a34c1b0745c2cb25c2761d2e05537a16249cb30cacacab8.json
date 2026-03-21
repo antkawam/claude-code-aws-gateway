@@ -1,0 +1,32 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT anthropic_prefix, bedrock_suffix, anthropic_display\n           FROM model_mappings\n           ORDER BY length(anthropic_prefix) DESC",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "anthropic_prefix",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 1,
+        "name": "bedrock_suffix",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 2,
+        "name": "anthropic_display",
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      false,
+      false,
+      true
+    ]
+  },
+  "hash": "e72339284892e02d6a34c1b0745c2cb25c2761d2e05537a16249cb30cacacab8"
+}

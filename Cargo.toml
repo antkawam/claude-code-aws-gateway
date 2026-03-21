@@ -1,0 +1,112 @@
+[package]
+name = "ccag"
+version = "1.0.0"
+edition = "2024"
+description = "Self-hosted API gateway that routes Claude Code through AWS Bedrock"
+repository = "https://github.com/antkawam/claude-code-aws-gateway"
+license = "MIT"
+keywords = ["claude-code", "aws-bedrock", "api-gateway", "anthropic", "llm-proxy"]
+categories = ["web-programming::http-server"]
+
+# Gateway server
+[[bin]]
+name = "ccag-server"
+path = "src/main.rs"
+
+# CLI management tool
+[[bin]]
+name = "ccag"
+path = "src/cli/main.rs"
+
+[dependencies]
+# CLI
+clap = { version = "4", features = ["derive", "env"] }
+dialoguer = "0.11"
+indicatif = "0.17"
+
+# Web framework
+axum = { version = "0.8", features = ["macros"] }
+tokio = { version = "1", features = ["full"] }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["cors", "trace"] }
+
+# AWS SDK
+aws-config = { version = "1", features = ["behavior-version-latest"] }
+aws-sdk-bedrock = "1"
+aws-sdk-bedrockruntime = "1"
+aws-sdk-eventbridge = "1"
+aws-sdk-sns = "1"
+aws-sdk-servicequotas = "1"
+aws-sdk-sts = "1"
+aws-credential-types = { version = "1", features = ["hardcoded-credentials"] }
+aws-sigv4 = "1"
+aws-smithy-types = "1"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Async streaming
+async-stream = "0.3"
+futures = "0.3"
+tokio-stream = "0.1"
+bytes = "1"
+
+# Logging / Telemetry
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+opentelemetry = { version = "0.29", features = ["metrics"] }
+opentelemetry_sdk = { version = "0.29", features = ["rt-tokio", "metrics"] }
+opentelemetry-otlp = { version = "0.29", features = ["metrics", "grpc-tonic"] }
+opentelemetry-prometheus = { version = "0.29" }
+prometheus = "0.14"
+
+# Error handling
+anyhow = "1"
+thiserror = "2"
+
+# Database
+sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "postgres", "uuid", "chrono", "migrate"] }
+
+# Crypto / Auth
+sha2 = "0.10"
+rand = "0.9"
+hex = "0.4"
+jsonwebtoken = "9"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+
+# TLS (self-signed for local dev)
+rcgen = "0.13"
+rustls = "0.23"
+rustls-pemfile = "2"
+tokio-rustls = "0.26"
+axum-server = { version = "0.7", features = ["tls-rustls"] }
+
+# Pattern matching
+regex = "1"
+
+# Misc
+uuid = { version = "1", features = ["v4", "v5", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+dirs = "6.0.0"
+urlencoding = "2"
+url = "2"
+subtle = "2.6.1"
+
+[features]
+integration = []
+
+[dev-dependencies]
+tokio-test = "0.4"
+wiremock = "0.6"
+base64 = "0.22"
+rsa = "0.9"
+
+[profile.dev]
+opt-level = 0
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
