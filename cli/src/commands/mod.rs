@@ -5,4 +5,5 @@ pub mod keys;
 pub mod logs;
 pub mod status;
 pub mod teams;
+pub mod update;
 pub mod users;

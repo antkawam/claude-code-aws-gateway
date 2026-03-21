@@ -16,7 +16,7 @@ services:
       retries: 10
 
   gateway:
-    build: .
+    image: ghcr.io/antkawam/claude-code-aws-gateway:${CCAG_VERSION:-latest}
     depends_on:
       postgres:
         condition: service_healthy

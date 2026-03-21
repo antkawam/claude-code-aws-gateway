@@ -18,8 +18,8 @@ import { Construct } from 'constructs';
 
 export interface GatewayStackProps extends cdk.StackProps {
   desiredCount: number;
-  /** ECR repository name (from environments.json) */
-  ecrRepoName: string;
+  /** ECR repository name. If omitted, pulls from GHCR (ghcr.io/antkawam/claude-code-aws-gateway) */
+  ecrRepoName?: string;
   /** Full domain name for the gateway, e.g. ccag.example.com */
   domainName?: string;
   /** Route53 hosted zone name, e.g. example.com */
@@ -30,9 +30,9 @@ export interface GatewayStackProps extends cdk.StackProps {
   adminUsers?: string;
   /** Admin login password (default: 'admin' — override per environment) */
   adminPassword?: string;
-  /** ECR image tag to deploy (default: latest) */
+  /** Image tag to deploy (default: latest). Used for both ECR and GHCR sources */
   imageTag?: string;
-  /** ECR image digest (sha256:...) — preferred over imageTag to avoid no-op deploys */
+  /** ECR image digest (sha256:...) — preferred over imageTag to avoid no-op deploys. ECR only */
   imageDigest?: string;
   /** Use RDS IAM authentication instead of Secrets Manager password (default: false) */
   rdsIamAuth?: boolean;
@@ -172,11 +172,19 @@ export class GatewayStack extends cdk.Stack {
       removalPolicy: cdk.RemovalPolicy.RETAIN,
     });
 
-    const repo = ecr.Repository.fromRepositoryName(this, 'EcrRepo', props.ecrRepoName);
-    const container = taskDef.addContainer(props.ecrRepoName, {
-      image: ecs.ContainerImage.fromEcrRepository(repo, props.imageDigest ?? props.imageTag ?? 'latest'),
+    // Image source: ECR (private) if ecrRepoName is set, otherwise GHCR (public)
+    const ghcrImage = `ghcr.io/antkawam/claude-code-aws-gateway:${props.imageTag ?? 'latest'}`;
+    const containerImage = props.ecrRepoName
+      ? ecs.ContainerImage.fromEcrRepository(
+          ecr.Repository.fromRepositoryName(this, 'EcrRepo', props.ecrRepoName),
+          props.imageDigest ?? props.imageTag ?? 'latest',
+        )
+      : ecs.ContainerImage.fromRegistry(ghcrImage);
+    const containerName = props.ecrRepoName ?? 'ccag';
+    const container = taskDef.addContainer(containerName, {
+      image: containerImage,
       logging: ecs.LogDrivers.awsLogs({
-        streamPrefix: props.ecrRepoName,
+        streamPrefix: containerName,
         logGroup,
       }),
       environment: {
@@ -283,23 +291,25 @@ export class GatewayStack extends cdk.Stack {
     // during deployments (streaming responses can be long-running)
     service.targetGroup.setAttribute('deregistration_delay.timeout_seconds', '120');
 
-    // ECR pull access for deploy.sh image swaps (points to ccag repo, not CDK asset repo)
-    taskDef.executionRole!.addToPrincipalPolicy(
-      new iam.PolicyStatement({
-        actions: [
-          'ecr:GetDownloadUrlForLayer',
-          'ecr:BatchGetImage',
-          'ecr:BatchCheckLayerAvailability',
-        ],
-        resources: [`arn:aws:ecr:${this.region}:${this.account}:repository/${props.ecrRepoName}`],
-      }),
-    );
-    taskDef.executionRole!.addToPrincipalPolicy(
-      new iam.PolicyStatement({
-        actions: ['ecr:GetAuthorizationToken'],
-        resources: ['*'],
-      }),
-    );
+    // ECR pull access (only needed when using private ECR, not GHCR)
+    if (props.ecrRepoName) {
+      taskDef.executionRole!.addToPrincipalPolicy(
+        new iam.PolicyStatement({
+          actions: [
+            'ecr:GetDownloadUrlForLayer',
+            'ecr:BatchGetImage',
+            'ecr:BatchCheckLayerAvailability',
+          ],
+          resources: [`arn:aws:ecr:${this.region}:${this.account}:repository/${props.ecrRepoName}`],
+        }),
+      );
+      taskDef.executionRole!.addToPrincipalPolicy(
+        new iam.PolicyStatement({
+          actions: ['ecr:GetAuthorizationToken'],
+          resources: ['*'],
+        }),
+      );
+    }
 
     // Allow Fargate tasks to connect to RDS
     db.connections.allowDefaultPortFrom(service.service);

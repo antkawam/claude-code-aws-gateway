@@ -1,0 +1,15 @@
+# Multi-arch release Dockerfile — uses pre-built binaries from CI
+# Used by the release workflow; for local builds use the standard Dockerfile
+FROM alpine:3.21
+
+RUN apk add --no-cache ca-certificates curl postgresql16-client && \
+    addgroup -S proxy && adduser -S proxy -G proxy
+
+ARG TARGETPLATFORM
+COPY build/${TARGETPLATFORM}/ccag-server /usr/local/bin/ccag-server
+
+USER proxy
+EXPOSE 8080
+ENV PROXY_HOST=0.0.0.0
+ENV PROXY_PORT=8080
+CMD ["ccag-server"]

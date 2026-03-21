@@ -4,20 +4,20 @@ help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-20s\033[0m %s\n", $$1, $$2}'
 
 build: ## Build gateway and CLI
-	cargo build
+	cargo build --workspace
 
 build-release: ## Build release binaries
-	cargo build --release
+	cargo build --workspace --release
 
 test: ## Run unit tests
-	cargo test --lib
+	cargo test --workspace --lib
 
 lint: ## Check formatting and run clippy
-	cargo fmt --check
-	cargo clippy --all-targets -- -D warnings
+	cargo fmt --all --check
+	cargo clippy --workspace --all-targets -- -D warnings
 
 fmt: ## Auto-format code
-	cargo fmt
+	cargo fmt --all
 
 test-integration: ## Run integration tests (requires Docker)
 	@docker compose -f docker-compose.test.yml up -d --wait 2>/dev/null || \

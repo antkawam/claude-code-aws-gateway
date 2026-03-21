@@ -69,6 +69,9 @@ enum Commands {
 
     /// Tail gateway logs
     Logs(commands::logs::LogsArgs),
+
+    /// Update ccag CLI to the latest release
+    Update,
 }
 
 #[tokio::main]
@@ -116,5 +119,6 @@ async fn main() -> anyhow::Result<()> {
         Commands::Idps(cmd) => commands::idps::run(cmd, cli.url, cli.token).await,
         Commands::Status(args) => commands::status::run(args, cli.url).await,
         Commands::Logs(args) => commands::logs::run(args).await,
+        Commands::Update => commands::update::run().await,
     }
 }

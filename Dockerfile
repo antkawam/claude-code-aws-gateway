@@ -6,20 +6,24 @@ WORKDIR /app
 
 # Copy manifests first for better layer caching
 COPY Cargo.toml Cargo.lock ./
+COPY cli/Cargo.toml cli/Cargo.toml
 
-# Pre-build dependencies with a dummy main (cached unless Cargo.toml/Cargo.lock change)
+# Pre-build dependencies with dummy sources (cached unless Cargo.toml/Cargo.lock change)
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
     --mount=type=cache,target=/app/target \
-    mkdir -p src && echo 'fn main() {}' > src/main.rs && \
-    cargo build --release 2>&1 | tail -1 && \
-    rm -rf src
+    mkdir -p src cli/src && \
+    echo 'fn main() {}' > src/main.rs && \
+    echo 'fn main() {}' > cli/src/main.rs && \
+    cargo build --release --bin ccag-server 2>&1 | tail -1 && \
+    rm -rf src cli/src
 
 # Copy source and build (incremental — only recompiles project code)
 COPY src/ src/
 COPY static/ static/
 COPY migrations/ migrations/
 COPY .sqlx/ .sqlx/
+COPY build.rs build.rs
 ENV SQLX_OFFLINE=true
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \

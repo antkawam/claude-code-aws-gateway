@@ -1,0 +1,23 @@
+[package]
+name = "ccag-cli"
+version = "1.0.0"
+edition = "2024"
+description = "CLI management tool for Claude Code AWS Gateway"
+repository = "https://github.com/antkawam/claude-code-aws-gateway"
+license = "MIT"
+
+[[bin]]
+name = "ccag"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive", "env"] }
+dialoguer = "0.11"
+dirs = "6.0.0"
+indicatif = "0.17"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "process"] }
+self_update = { version = "0.42", default-features = false, features = ["rustls"] }
