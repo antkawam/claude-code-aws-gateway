@@ -856,6 +856,7 @@ dependencies = [
  "base64",
  "bytes",
  "chrono",
+ "dirs",
  "futures",
  "hex",
  "jsonwebtoken",
