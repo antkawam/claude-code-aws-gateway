@@ -151,31 +151,56 @@ docker compose logs gateway    # Docker Compose
 
 ## CLI Management Tool
 
-CCAG includes a CLI (`ccag`) for managing a running gateway:
+CCAG includes a CLI (`ccag`) for managing a running gateway. Download the latest binary from [GitHub Releases](https://github.com/antkawam/claude-code-aws-gateway/releases):
 
 ```bash
-cargo build --bin ccag
+# macOS (Apple Silicon)
+curl -fsSL https://github.com/antkawam/claude-code-aws-gateway/releases/latest/download/ccag-cli-darwin-aarch64.tar.gz | tar xz
+sudo mv ccag /usr/local/bin/
 
-# Manage keys
-ccag --url http://localhost:8080 keys list
-ccag --url http://localhost:8080 keys create --name "dev-key"
+# macOS (Intel)
+curl -fsSL https://github.com/antkawam/claude-code-aws-gateway/releases/latest/download/ccag-cli-darwin-x86_64.tar.gz | tar xz
+sudo mv ccag /usr/local/bin/
 
-# Manage settings
-ccag --url http://localhost:8080 config list
+# Linux (x86_64)
+curl -fsSL https://github.com/antkawam/claude-code-aws-gateway/releases/latest/download/ccag-cli-linux-x86_64.tar.gz | tar xz
+sudo mv ccag /usr/local/bin/
 
-# Check health
-ccag --url http://localhost:8080 status
+# Linux (ARM64)
+curl -fsSL https://github.com/antkawam/claude-code-aws-gateway/releases/latest/download/ccag-cli-linux-aarch64.tar.gz | tar xz
+sudo mv ccag /usr/local/bin/
 ```
 
-Set `CCAG_URL` to avoid repeating the `--url` flag. See [CLI Reference](cli-reference.md) for all commands.
+Windows binaries (`.zip`) are also available on the releases page.
+
+Log in and manage your gateway:
+
+```bash
+ccag login --url http://localhost:8080
+ccag keys list
+ccag keys create --name "dev-key"
+ccag config list
+```
+
+Set `CCAG_URL` to avoid repeating the `--url` flag. Update the CLI with `ccag update`. See [CLI Reference](cli-reference.md) for all commands.
 
 ## Upgrading
 
+### Docker Compose
+
 ```bash
-git pull                       # Get latest code
-docker compose up -d --build   # Docker Compose: rebuild and restart
-# OR
-npx cdk deploy                 # CDK: build + deploy (see infra/README.md)
+# Update to latest
+docker compose pull && docker compose up -d
+
+# Or pin to a specific version
+CCAG_VERSION=1.1.0 docker compose up -d
+```
+
+### CDK
+
+```bash
+cd infra
+npx cdk deploy -c environment=prod -c imageTag=1.1.0
 ```
 
 Database migrations run automatically on gateway startup. See [Upgrading](upgrading.md) for details.

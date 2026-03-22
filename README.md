@@ -1,9 +1,7 @@
 # Claude Code AWS Gateway (CCAG)
 
-<!-- Badges: uncomment when CI and releases are configured
 [![Build](https://img.shields.io/github/actions/workflow/status/antkawam/claude-code-aws-gateway/ci.yml?branch=main)](https://github.com/antkawam/claude-code-aws-gateway/actions)
 [![Release](https://img.shields.io/github/v/release/antkawam/claude-code-aws-gateway)](https://github.com/antkawam/claude-code-aws-gateway/releases)
--->
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
 A self-hosted API gateway that translates the Anthropic Messages API to AWS Bedrock, enabling extended thinking and web search when using [Claude Code](https://docs.anthropic.com/en/docs/claude-code) with your own AWS account.
@@ -56,6 +54,7 @@ docker compose up -d
 
 The gateway starts at `http://localhost:8080`. Log in at `http://localhost:8080/portal` with the default admin credentials (`admin`/`admin`) to create API keys and manage users.
 
+If port 8080 is already in use: `GATEWAY_PORT=9080 docker compose up -d`
 If port 5432 is already in use: `POSTGRES_PORT=5488 docker compose up -d`
 
 ### Option B: AWS CDK (ECS Fargate + RDS)
@@ -64,7 +63,7 @@ For teams that need managed infrastructure with load balancing, autoscaling, cus
 
 ```bash
 cd infra && npm install
-# See infra/README.md for the complete 9-step deployment guide
+# See infra/README.md for the deployment guide
 ```
 
 This creates a production stack: VPC, ALB, ECS Fargate (ARM64/Graviton), RDS Postgres, autoscaling, CloudWatch alarms, and optional Route53/TLS. See [`infra/README.md`](infra/README.md) for the deployment guide.

@@ -24,29 +24,41 @@ git fetch origin
 git log HEAD..origin/main --oneline
 ```
 
-## Standard Upgrade Flow
+## Docker Compose
+
+Pre-built images are published to GitHub Container Registry on every release.
+
+### Update to latest
 
 ```bash
-# Pull latest changes
-git fetch origin
-git pull origin main
+docker compose pull        # Pull latest image from GHCR
+docker compose up -d       # Restart with new image
 ```
 
-To review changes before upgrading:
+### Pin to a specific version
+
+Set `CCAG_VERSION` in your `.env` file or pass it directly:
 
 ```bash
-git fetch origin
-git log HEAD..origin/main --oneline
-ls migrations/
+CCAG_VERSION=1.1.0 docker compose up -d
 ```
 
-Then rebuild and redeploy:
+### Check available versions
 
 ```bash
-# Rebuild and deploy (see infra/README.md for full deployment steps)
-docker buildx build --platform linux/arm64 -t ccag .
-# Tag, push to ECR, and deploy via CDK
+gh release list --repo antkawam/claude-code-aws-gateway
 ```
+
+## CDK (ECS Fargate)
+
+CDK deployments pull from GHCR by default. Deploy a specific release version:
+
+```bash
+cd infra
+npx cdk deploy -c environment=prod -c imageTag=1.1.0
+```
+
+To review what changed between versions, check the [release notes](https://github.com/antkawam/claude-code-aws-gateway/releases).
 
 ## Database Migrations
 

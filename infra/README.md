@@ -83,7 +83,6 @@ Create `environments.json` in the **project root** (not in `infra/`). This is th
 ```json
 {
   "region": "us-west-2",
-  "ecr_repo_name": "ccag",
   "stack_name": "CCAG",
   "prod": {
     "account_id": "123456789012",
@@ -96,33 +95,11 @@ Create `environments.json` in the **project root** (not in `infra/`). This is th
 }
 ```
 
+> **Note:** `ecr_repo_name` is omitted — the stack pulls from GHCR by default. Only add it if you need private ECR images (see [Using ECR Instead](#using-ecr-instead) below).
+
 See [Configuration](#configuration) below for all available fields.
 
-### 4. Create the ECR Repository
-
-```bash
-aws ecr create-repository --repository-name ccag --region us-west-2
-```
-
-### 5. Build and Push the Docker Image
-
-> **Note:** Steps 5-9 run from the project root. If you followed step 2 (`cd infra`), run `cd ..` first.
-
-```bash
-# Authenticate Docker with ECR
-aws ecr get-login-password --region us-west-2 | \
-  docker login --username AWS --password-stdin 123456789012.dkr.ecr.us-west-2.amazonaws.com
-
-# Build for ARM64 (required: ECS tasks run on Graviton)
-docker buildx build --platform linux/arm64 -t ccag .
-
-# Tag and push
-IMAGE_TAG=$(git rev-parse --short=8 HEAD)
-docker tag ccag:latest 123456789012.dkr.ecr.us-west-2.amazonaws.com/ccag:${IMAGE_TAG}
-docker push 123456789012.dkr.ecr.us-west-2.amazonaws.com/ccag:${IMAGE_TAG}
-```
-
-### 6. Bootstrap CDK (First Time Only)
+### 4. Bootstrap CDK (First Time Only)
 
 ```bash
 cd infra
@@ -131,16 +108,19 @@ npx cdk bootstrap aws://123456789012/us-west-2 -c environment=prod
 
 Replace `prod` with your environment name from `environments.json` if different.
 
-### 7. Deploy
+### 5. Deploy
 
 ```bash
 cd infra
-npx cdk deploy -c environment=prod -c imageTag=${IMAGE_TAG}
+npx cdk deploy -c environment=prod -c imageTag=1.0.0
 ```
+
+Use a version tag from [GitHub Releases](https://github.com/antkawam/claude-code-aws-gateway/releases).
+
 
 CDK will show the resources it plans to create. Review and confirm.
 
-### 8. Access the Gateway
+### 6. Access the Gateway
 
 After deployment, CDK prints several outputs:
 
@@ -156,7 +136,7 @@ After deployment, CDK prints several outputs:
   aws sns subscribe --topic-arn <AlarmTopicArn> --protocol email --notification-endpoint you@example.com
   ```
 
-### 9. Configure Claude Code
+### 7. Configure Claude Code
 
 Point Claude Code at your gateway:
 
@@ -176,7 +156,7 @@ The file is read by `infra/app.ts`. Top-level fields apply to all environments; 
 | Field | Required | Description |
 |---|---|---|
 | `region` | Yes | AWS region for the stack (must have Bedrock Claude access) |
-| `ecr_repo_name` | Yes | ECR repository name (e.g., `ccag`) |
+| `ecr_repo_name` | No | ECR repository name (e.g., `ccag`). If omitted, pulls from GHCR (recommended for most users) |
 | `stack_name` | No | CloudFormation stack name (default: `CCAG`) |
 
 **Per-environment fields** (nested under `staging`, `prod`, or any name you choose):
@@ -260,45 +240,27 @@ You can define multiple environments in `environments.json`:
 Deploy to a specific environment:
 
 ```bash
-npx cdk deploy -c environment=staging -c imageTag=abcd1234
-npx cdk deploy -c environment=prod -c imageTag=abcd1234
+npx cdk deploy -c environment=staging -c imageTag=1.0.0
+npx cdk deploy -c environment=prod -c imageTag=1.0.0
 ```
 
 ## Upgrading
 
-1. **Pull latest code:**
-   ```bash
-   git pull
-   ```
+1. **Check for new releases** at [GitHub Releases](https://github.com/antkawam/claude-code-aws-gateway/releases). Review the release notes for breaking changes.
 
-2. **Check for breaking changes** in the changelog or release notes.
-
-3. **Update CDK dependencies** (if `package.json` changed):
-   ```bash
-   cd infra && npm install
-   ```
-
-4. **Build and push the new Docker image:**
-   ```bash
-   IMAGE_TAG=$(git rev-parse --short=8 HEAD)
-   docker buildx build --platform linux/arm64 -t ccag .
-   docker tag ccag:latest <account>.dkr.ecr.<region>.amazonaws.com/ccag:${IMAGE_TAG}
-   docker push <account>.dkr.ecr.<region>.amazonaws.com/ccag:${IMAGE_TAG}
-   ```
-
-5. **Deploy:**
+2. **Deploy the new version:**
    ```bash
    cd infra
-   npx cdk deploy -c environment=prod -c imageTag=${IMAGE_TAG}
+   npx cdk deploy -c environment=prod -c imageTag=1.1.0
    ```
 
    CloudFormation computes the delta and only updates changed resources. ECS performs a rolling deployment: new tasks start, pass health checks, then old tasks drain.
 
-6. **Database migrations** run automatically on application startup. No manual migration step is needed.
+3. **Database migrations** run automatically on application startup. No manual migration step is needed.
 
-7. **Rollback:** If deployment fails, CloudFormation automatically rolls back to the previous state. To manually roll back to a previous image:
+4. **Rollback:** If deployment fails, CloudFormation automatically rolls back. To manually roll back to a previous version:
    ```bash
-   npx cdk deploy -c environment=prod -c imageTag=<previous-tag>
+   npx cdk deploy -c environment=prod -c imageTag=1.0.0
    ```
 
 ## Monitoring
