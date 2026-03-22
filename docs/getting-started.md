@@ -110,32 +110,14 @@ curl -sf -X POST $GATEWAY/admin/keys \
 
 ## Connecting Claude Code
 
-### Environment Variables
+Log in to the admin portal and navigate to the **Connect** page. It provides a setup script that configures Claude Code automatically — creating a virtual API key and setting the required environment variables.
 
-```bash
-export ANTHROPIC_BASE_URL=http://localhost:8080   # or your production URL
-export ANTHROPIC_API_KEY=sk-proxy-...              # your virtual key
-claude
+```
+http://localhost:8080/portal            # Docker Compose
+https://your-domain.com/portal          # CDK deployment
 ```
 
-### Claude Code Settings
-
-Add to `~/.claude/settings.json`:
-
-```json
-{
-  "env": {
-    "ANTHROPIC_BASE_URL": "http://localhost:8080",
-    "ANTHROPIC_API_KEY": "sk-proxy-..."
-  }
-}
-```
-
-Set `ANTHROPIC_BASE_URL`, not `CLAUDE_CODE_USE_BEDROCK`. CCAG presents as the Anthropic Messages API, enabling extended thinking and web search.
-
-### OIDC/SSO Auth
-
-For browser-based SSO login (no static API keys), see [Authentication](authentication.md).
+For OIDC/SSO authentication (browser-based login, no static API keys), see [Authentication](authentication.md).
 
 ## Verifying It Works
 

@@ -70,17 +70,7 @@ This creates a production stack: VPC, ALB, ECS Fargate (ARM64/Graviton), RDS Pos
 
 ### Connect Claude Code
 
-```json
-// ~/.claude/settings.json
-{
-  "env": {
-    "ANTHROPIC_BASE_URL": "http://localhost:8080",
-    "ANTHROPIC_API_KEY": "sk-proxy-..."
-  }
-}
-```
-
-For production deployments, replace `localhost:8080` with your ALB URL or custom domain. Use a virtual API key (created via the portal) as your `ANTHROPIC_API_KEY`.
+Log in to the admin portal at `http://localhost:8080/portal` and navigate to the **Connect** page. It provides a setup script that configures Claude Code automatically.
 
 ## Features
 

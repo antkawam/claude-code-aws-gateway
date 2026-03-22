@@ -136,14 +136,9 @@ After deployment, CDK prints several outputs:
   aws sns subscribe --topic-arn <AlarmTopicArn> --protocol email --notification-endpoint you@example.com
   ```
 
-### 7. Configure Claude Code
+### 7. Connect Claude Code
 
-Point Claude Code at your gateway:
-
-```bash
-export ANTHROPIC_BASE_URL=https://ccag.example.com
-export ANTHROPIC_API_KEY=<api-key-from-step-8>
-```
+Log in to the admin portal at `https://your-domain.com/portal` (or the **PortalUrl** from step 6) and navigate to the **Connect** page. It provides a setup script that configures Claude Code automatically.
 
 ## Configuration
 
