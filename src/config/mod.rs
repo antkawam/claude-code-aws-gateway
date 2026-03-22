@@ -38,20 +38,30 @@ impl GatewayConfig {
         let database_name = std::env::var("DATABASE_NAME").unwrap_or_else(|_| "proxy".to_string());
         let database_user = std::env::var("DATABASE_USER").unwrap_or_else(|_| "proxy".to_string());
 
-        // When RDS_IAM_AUTH is enabled, we don't need a password — token is generated at runtime.
-        let database_url = if rds_iam_auth && database_host.is_some() {
-            // Placeholder URL — the actual connection uses IAM token via PgConnectOptions
-            format!(
-                "postgres://{}@{}:{}/{}",
-                database_user,
-                database_host.as_deref().unwrap(),
-                database_port,
-                database_name,
-            )
+        // Database URL resolution:
+        // 1. DATABASE_HOST + RDS_IAM_AUTH → passwordless URL (IAM token at runtime)
+        // 2. DATABASE_HOST + DB_PASSWORD  → URL with password (CDK with Secrets Manager)
+        // 3. DATABASE_URL                 → direct URL (Docker Compose)
+        let database_url = if let Some(host) = &database_host {
+            if rds_iam_auth {
+                format!(
+                    "postgres://{}@{}:{}/{}",
+                    database_user, host, database_port, database_name,
+                )
+            } else {
+                let password = std::env::var("DB_PASSWORD").map_err(|_| {
+                    anyhow::anyhow!(
+                        "DB_PASSWORD is required when DATABASE_HOST is set and RDS_IAM_AUTH is not enabled"
+                    )
+                })?;
+                format!(
+                    "postgres://{}:{}@{}:{}/{}",
+                    database_user, password, host, database_port, database_name,
+                )
+            }
         } else {
-            std::env::var("DATABASE_URL").map_err(|_| {
-                anyhow::anyhow!("DATABASE_URL is required when RDS_IAM_AUTH is not enabled.")
-            })?
+            std::env::var("DATABASE_URL")
+                .map_err(|_| anyhow::anyhow!("DATABASE_URL or DATABASE_HOST is required"))?
         };
 
         Ok(Self {
