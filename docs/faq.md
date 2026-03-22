@@ -191,7 +191,13 @@ curl https://ccag.example.com/admin/analytics/export \
 
 ### How do I upgrade CCAG?
 
-Pull the latest code, build, and redeploy. Database migrations run automatically on startup. See [Upgrading](upgrading.md) for the full procedure.
+Pre-built images and binaries are published to [GitHub Releases](https://github.com/antkawam/claude-code-aws-gateway/releases) on every release. No compilation required.
+
+- **Docker Compose:** `docker compose pull && docker compose up -d` (or pin with `CCAG_VERSION=1.0.2`)
+- **CDK:** `npx cdk deploy -c environment=prod -c imageTag=1.0.2`
+- **CLI:** `ccag update`
+
+Database migrations run automatically on startup. See [Upgrading](upgrading.md) for details.
 
 ### What is the performance overhead of CCAG?
 

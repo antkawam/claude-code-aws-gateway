@@ -239,7 +239,13 @@ CCAG adds 1-5ms for request translation and response normalization. When deploye
 
 ### How do I upgrade?
 
-Pull the latest code, rebuild, and redeploy. For CDK deployments, `cdk deploy` performs a rolling update with zero downtime. Database migrations run automatically on startup. See [docs/upgrading.md](docs/upgrading.md) for details.
+Pre-built images and binaries are published to [GitHub Releases](https://github.com/antkawam/claude-code-aws-gateway/releases) on every release. No compilation required.
+
+- **Docker Compose:** `docker compose pull && docker compose up -d` (or pin with `CCAG_VERSION=1.0.2`)
+- **CDK:** `npx cdk deploy -c environment=prod -c imageTag=1.0.2`
+- **CLI:** `ccag update`
+
+Database migrations run automatically on startup. See [docs/upgrading.md](docs/upgrading.md) for details.
 
 ### Can I use this with Claude Code in VS Code or JetBrains?
 
