@@ -1,6 +1,6 @@
 # Multi-arch release Dockerfile — uses pre-built binaries from CI
 # Used by the release workflow; for local builds use the standard Dockerfile
-FROM alpine:3.21
+FROM alpine:3.23
 
 RUN apk add --no-cache ca-certificates curl postgresql16-client && \
     addgroup -S proxy && adduser -S proxy -G proxy

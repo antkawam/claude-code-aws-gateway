@@ -32,7 +32,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     cp /app/target/release/ccag-server /usr/local/bin/ccag-server
 
 # Runtime stage — minimal Alpine
-FROM alpine:3.21
+FROM alpine:3.23
 RUN apk add --no-cache ca-certificates curl postgresql16-client && \
     addgroup -S proxy && adduser -S proxy -G proxy
 COPY --from=builder /usr/local/bin/ccag-server /usr/local/bin/
