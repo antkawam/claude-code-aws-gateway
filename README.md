@@ -18,7 +18,7 @@ A purpose-built gateway for running [Claude Code](https://docs.anthropic.com/en/
 
 ## Why CCAG?
 
-When Claude Code connects to Bedrock directly (`CLAUDE_CODE_USE_BEDROCK=1`), extended thinking, web search, and team management are not available. CCAG presents as the Anthropic Messages API while routing inference through your AWS account — unlocking the full Claude Code feature set and adding enterprise controls.
+When Claude Code connects to Bedrock directly (`CLAUDE_CODE_USE_BEDROCK=1`), it operates in a reduced-capability mode — extended thinking, web search, and some tool use features are disabled on the client side. CCAG presents as the Anthropic Messages API, so Claude Code enables its full feature set while inference still runs through your AWS account.
 
 | | Direct Bedrock | Through CCAG |
 |---|---|---|
