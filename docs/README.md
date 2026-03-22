@@ -1,5 +1,9 @@
 # Claude Code AWS Gateway - Documentation
 
+![Analytics Dashboard](images/portal-analytics.png)
+
+![Connect Page](images/portal-connect.png)
+
 ## User Guides
 
 - [Getting Started](getting-started.md). Prerequisites, deployment walkthrough, first login, connecting Claude Code.
