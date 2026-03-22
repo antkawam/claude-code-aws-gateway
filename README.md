@@ -12,7 +12,9 @@ A purpose-built gateway for running [Claude Code](https://docs.anthropic.com/en/
 
 **For developers:** One-command onboarding. No AWS credentials, no config files. A self-service portal shows personal usage metrics, budget consumption, and virtual key management.
 
-**For automation:** A management CLI (`ccag`) for scripting key provisioning, team setup, and budget enforcement. Self-updates from GitHub Releases.
+**For automation:** A management CLI (`ccag`) for scripting key provisioning, team setup, and budget enforcement. Webhook, SNS, and EventBridge integrations for piping budget alerts and events into your existing tools.
+
+**100% open source, every feature included.** No enterprise tier, no feature gates, no per-seat pricing.
 
 ## Why CCAG?
 
@@ -144,6 +146,14 @@ A built-in single-page application at `/portal` for:
   - Tools & MCP: tool call totals, MCP server usage, top tools
 - Multi-select filters (team, user, model, endpoint) with time range and granularity control
 - CSV export of filtered analytics data
+
+### Notifications & Integrations
+
+- Budget alerts, rate limit events, and system notifications delivered to your tools
+- **Webhook:** POST to any URL (Slack, PagerDuty, custom endpoints)
+- **SNS:** Publish to your own AWS SNS topic for fan-out to email, Lambda, SQS, etc.
+- **EventBridge:** Emit structured events to your own event bus for custom routing rules
+- Configure and test destinations from the admin portal — no config files needed
 
 ### Observability
 
@@ -278,6 +288,14 @@ Claude 4+ models on Bedrock are supported. Model IDs are translated automaticall
 ### How does web search work?
 
 Anthropic's `web_search` tool is a server-side feature that Bedrock does not implement. When Claude Code sends a request containing a `web_search` tool use, CCAG intercepts it, executes the search via DuckDuckGo, and returns the results in Anthropic's `server_tool_use`/`web_search_tool_result` format.
+
+## Roadmap
+
+- **MCP server** — manage CCAG as an MCP server alongside the CLI
+- **Custom guardrails** — configurable input/output validation rules beyond built-in detection
+- **SMTP notifications** — email delivery for budget alerts without requiring SNS
+
+See [GitHub Discussions](https://github.com/antkawam/claude-code-aws-gateway/discussions) to suggest features or vote on priorities.
 
 ## License
 

@@ -52,5 +52,8 @@ Claude Code → CCAG (Anthropic Messages API) → Amazon Bedrock (inference)
 - Teams with shared budgets (daily/weekly/monthly, notify/throttle/block)
 - OIDC SSO: Okta, Azure AD, Google, any compliant provider
 - Admin portal: embedded SPA with analytics dashboard (spend, activity, models, tools)
+- Event notifications via webhook, SNS, or EventBridge (budget alerts, rate limits, system events)
 - One-command developer onboarding: portal Connect page generates a setup script
+- Developer self-service portal: personal usage metrics, budget consumption, key management
 - CLI management tool with self-update from GitHub Releases
+- 100% open source, every feature included — no enterprise tier or feature gates
