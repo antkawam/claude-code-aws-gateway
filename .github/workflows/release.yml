@@ -10,6 +10,7 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
   SQLX_OFFLINE: true
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}
@@ -17,7 +18,7 @@ env:
 jobs:
   # ---------------------------------------------------------------------------
   # Server binary (linux only, x86_64 + aarch64)
-  # Built in Docker for musl static linking
+  # Built with musl for static linking
   # ---------------------------------------------------------------------------
   server:
     name: Server (${{ matrix.arch }})
@@ -28,11 +29,9 @@ jobs:
           - arch: x86_64
             target: x86_64-unknown-linux-musl
             runner: ubuntu-latest
-            platform: linux/amd64
           - arch: aarch64
             target: aarch64-unknown-linux-musl
             runner: ubuntu-24.04-arm
-            platform: linux/arm64
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -40,11 +39,12 @@ jobs:
           targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
         with:
-          key: server-${{ matrix.arch }}
+          key: release-server-${{ matrix.arch }}
+          save-if: true
       - name: Install musl tools
         run: sudo apt-get update && sudo apt-get install -y musl-tools
       - name: Build server
-        run: cargo build --release --bin ccag-server --target ${{ matrix.target }}
+        run: cargo build --release --bin ccag-server --target ${{ matrix.target }} --locked
       - name: Package
         run: |
           cd target/${{ matrix.target }}/release
@@ -56,7 +56,7 @@ jobs:
 
   # ---------------------------------------------------------------------------
   # CLI binary (linux, macOS, Windows × x86_64 + aarch64)
-  # Native builds on GitHub-hosted runners
+  # Native builds — thin crate, fast compile
   # ---------------------------------------------------------------------------
   cli:
     name: CLI (${{ matrix.os }}-${{ matrix.arch }})
@@ -65,39 +65,30 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # Linux
           - os: linux
             arch: x86_64
             target: x86_64-unknown-linux-musl
             runner: ubuntu-latest
-            ext: ""
           - os: linux
             arch: aarch64
             target: aarch64-unknown-linux-musl
             runner: ubuntu-24.04-arm
-            ext: ""
-          # macOS
           - os: darwin
             arch: x86_64
             target: x86_64-apple-darwin
             runner: macos-13
-            ext: ""
           - os: darwin
             arch: aarch64
             target: aarch64-apple-darwin
             runner: macos-latest
-            ext: ""
-          # Windows
           - os: windows
             arch: x86_64
             target: x86_64-pc-windows-msvc
             runner: windows-latest
-            ext: ".exe"
           - os: windows
             arch: aarch64
             target: aarch64-pc-windows-msvc
             runner: windows-latest
-            ext: ".exe"
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -105,13 +96,14 @@ jobs:
           targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
         with:
-          key: cli-${{ matrix.os }}-${{ matrix.arch }}
+          key: release-cli-${{ matrix.os }}-${{ matrix.arch }}
           workspaces: cli
+          save-if: true
       - name: Install musl tools
         if: matrix.os == 'linux'
         run: sudo apt-get update && sudo apt-get install -y musl-tools
       - name: Build CLI
-        run: cargo build --release --package ccag-cli --target ${{ matrix.target }}
+        run: cargo build --release --package ccag-cli --target ${{ matrix.target }} --locked
       - name: Package (Unix)
         if: matrix.os != 'windows'
         run: |
@@ -153,9 +145,6 @@ jobs:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - name: Extract version
-        id: version
-        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
       - uses: docker/metadata-action@v5
         id: meta
         with:
