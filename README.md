@@ -2,6 +2,8 @@
 
 [![Build](https://img.shields.io/github/actions/workflow/status/antkawam/claude-code-aws-gateway/ci.yml?branch=main)](https://github.com/antkawam/claude-code-aws-gateway/actions)
 [![Release](https://img.shields.io/github/v/release/antkawam/claude-code-aws-gateway)](https://github.com/antkawam/claude-code-aws-gateway/releases)
+[![crates.io](https://img.shields.io/crates/v/ccag-cli)](https://crates.io/crates/ccag-cli)
+[![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/antkawam/claude-code-aws-gateway/badge)](https://scorecard.dev/viewer/?uri=github.com/antkawam/claude-code-aws-gateway)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
 A self-hosted API gateway that translates the Anthropic Messages API to AWS Bedrock, enabling extended thinking and web search when using [Claude Code](https://docs.anthropic.com/en/docs/claude-code) with your own AWS account.
