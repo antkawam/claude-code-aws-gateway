@@ -35,6 +35,12 @@ graph LR
 
 Claude Code connects to CCAG as it would to the Anthropic API. The gateway translates requests to Bedrock format, handles SSE streaming, and maps model IDs. No client-side changes are needed.
 
+### Portal
+
+![Analytics Dashboard](docs/images/portal-analytics.png)
+
+![Connect Page](docs/images/portal-connect.png)
+
 ## Getting Started
 
 ### Prerequisites
