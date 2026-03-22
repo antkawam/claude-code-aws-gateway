@@ -16,7 +16,10 @@ if (!envConfig) {
   throw new Error(`Unknown environment '${envName}'. Use -c environment=staging or -c environment=prod`);
 }
 
-const stackName = environments.stack_name || 'CCAG';
+const baseStackName = environments.stack_name || 'CCAG';
+// Include environment name in stack name to allow multiple deploys per account
+// e.g. CCAG-staging, CCAG-prod (unless stack_name already includes it)
+const stackName = envConfig.stack_name || `${baseStackName}-${envName}`;
 
 new GatewayStack(app, stackName, {
   env: {
