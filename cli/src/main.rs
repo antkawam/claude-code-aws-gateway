@@ -100,9 +100,10 @@ async fn main() -> anyhow::Result<()> {
             // Verify the token works
             let client = config::AdminClient::new(&url, &token);
             let me = client.get("/auth/me").await?;
-            let who = me["email"]
+            let who = me["sub"]
                 .as_str()
-                .or(me["username"].as_str())
+                .or(me["email"].as_str())
+                .or(me["name"].as_str())
                 .unwrap_or("unknown");
             let role = me["role"].as_str().unwrap_or("unknown");
 

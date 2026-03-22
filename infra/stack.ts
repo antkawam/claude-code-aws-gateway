@@ -85,7 +85,7 @@ export class GatewayStack extends cdk.Stack {
     // ECS Cluster
     const cluster = new ecs.Cluster(this, 'Cluster', {
       vpc,
-      containerInsights: true,
+      containerInsightsV2: ecs.ContainerInsights.ENABLED,
     });
 
     // Task Definition
