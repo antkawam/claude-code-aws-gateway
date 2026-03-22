@@ -6,7 +6,7 @@ description = "CLI management tool for Claude Code AWS Gateway — manage keys, 
 repository = "https://github.com/antkawam/claude-code-aws-gateway"
 license = "MIT"
 readme = "../README.md"
-keywords = ["claude-code", "aws-bedrock", "api-gateway", "cli", "anthropic"]
+keywords = ["claude-code", "amazon-bedrock", "api-gateway", "cli", "anthropic"]
 categories = ["command-line-utilities"]
 
 [[bin]]

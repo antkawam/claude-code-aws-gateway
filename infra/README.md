@@ -1,6 +1,6 @@
 # Deploying Claude Code AWS Gateway (CCAG)
 
-Production deployment guide for CCAG, an API gateway that translates the Anthropic Messages API to AWS Bedrock.
+Production deployment guide for CCAG, an API gateway that translates the Anthropic Messages API to Amazon Bedrock.
 
 ## Prerequisites
 
@@ -22,7 +22,7 @@ Production deployment guide for CCAG, an API gateway that translates the Anthrop
                    │
           ┌────────▼────────┐
           │  ECS Fargate     │
-          │  ARM64 (Graviton)│───── AWS Bedrock
+          │  ARM64 (Graviton)│───── Amazon Bedrock
           │  x N tasks       │     (Claude models)
           └────────┬─────────┘
                    │

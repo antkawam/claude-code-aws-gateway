@@ -6,10 +6,10 @@ resolver = "3"
 name = "ccag"
 version = "1.0.0"
 edition = "2024"
-description = "Self-hosted API gateway that routes Claude Code through AWS Bedrock"
+description = "Self-hosted API gateway that routes Claude Code through Amazon Bedrock"
 repository = "https://github.com/antkawam/claude-code-aws-gateway"
 license = "MIT"
-keywords = ["claude-code", "aws-bedrock", "api-gateway", "anthropic", "llm-proxy"]
+keywords = ["claude-code", "amazon-bedrock", "api-gateway", "anthropic", "llm-proxy"]
 categories = ["web-programming::http-server"]
 
 # Gateway server

@@ -6,7 +6,7 @@
 [![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/antkawam/claude-code-aws-gateway/badge)](https://scorecard.dev/viewer/?uri=github.com/antkawam/claude-code-aws-gateway)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-A self-hosted API gateway that translates the Anthropic Messages API to AWS Bedrock, enabling extended thinking and web search when using [Claude Code](https://docs.anthropic.com/en/docs/claude-code) with your own AWS account.
+A self-hosted API gateway that translates the Anthropic Messages API to Amazon Bedrock, enabling extended thinking and web search when using [Claude Code](https://docs.anthropic.com/en/docs/claude-code) with your own AWS account.
 
 ## Why CCAG?
 
@@ -26,7 +26,7 @@ When Claude Code connects to Bedrock directly (`CLAUDE_CODE_USE_BEDROCK=1`), it 
 ```mermaid
 graph LR
     CC[Claude Code] -->|Anthropic Messages API| CCAG[CCAG]
-    CCAG -->|Bedrock Runtime API| BR[AWS Bedrock]
+    CCAG -->|Bedrock Runtime API| BR[Amazon Bedrock]
     CCAG -->|Keys, teams, spend| RDS[(Postgres)]
     CCAG -->|Web search| DDG[DuckDuckGo]
 

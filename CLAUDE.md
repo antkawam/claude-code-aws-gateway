@@ -1,6 +1,6 @@
 # Claude Code AWS Gateway (CCAG)
 
-Self-hosted API gateway that routes Claude Code through your AWS Bedrock account. Provides a centralized layer for teams to manage API keys, budgets, rate limits, and OIDC SSO, with a built-in admin portal for observability and configuration.
+Self-hosted API gateway that routes Claude Code through your Amazon Bedrock account. Provides a centralized layer for teams to manage API keys, budgets, rate limits, and OIDC SSO, with a built-in admin portal for observability and configuration.
 
 ## Build & Test
 

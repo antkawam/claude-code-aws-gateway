@@ -11,7 +11,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- API gateway translating Anthropic Messages API to AWS Bedrock
+- API gateway translating Anthropic Messages API to Amazon Bedrock
 - Streaming support (SSE translation from Bedrock binary events)
 - Multi-user authentication: virtual API keys, OIDC SSO (any provider), session tokens
 - Admin portal SPA with dashboard, key management, team management, and analytics

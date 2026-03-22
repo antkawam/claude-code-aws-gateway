@@ -1,6 +1,6 @@
 # Web Search
 
-AWS Bedrock does not support Anthropic's `web_search` server tool. When Claude Code sends a request containing a web search tool use, CCAG intercepts the request, executes the search using your configured provider, and returns results in the format Claude Code expects.
+Amazon Bedrock does not support Anthropic's `web_search` server tool. When Claude Code sends a request containing a web search tool use, CCAG intercepts the request, executes the search using your configured provider, and returns results in the format Claude Code expects.
 
 ## How It Works
 

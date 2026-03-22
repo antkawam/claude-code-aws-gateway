@@ -4,7 +4,7 @@
 
 ### What is Claude Code AWS Gateway (CCAG)?
 
-CCAG is a self-hosted API gateway that routes Claude Code through your AWS Bedrock account. It translates the Anthropic Messages API into Bedrock API calls, presenting as the Anthropic Direct API so Claude Code enables extended thinking and web search. It also provides centralized management for teams: virtual API keys, budgets, rate limits, OIDC SSO, and an admin portal for observability.
+CCAG is a self-hosted API gateway that routes Claude Code through your Amazon Bedrock account. It translates the Anthropic Messages API into Bedrock API calls, presenting as the Anthropic Direct API so Claude Code enables extended thinking and web search. It also provides centralized management for teams: virtual API keys, budgets, rate limits, OIDC SSO, and an admin portal for observability.
 
 ### How is CCAG different from using Bedrock directly?
 

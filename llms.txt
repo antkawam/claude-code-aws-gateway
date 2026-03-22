@@ -1,8 +1,8 @@
 # Claude Code AWS Gateway (CCAG)
 
-> Self-hosted API gateway that routes Claude Code through AWS Bedrock with team management, budgets, and SSO.
+> Self-hosted API gateway that routes Claude Code through Amazon Bedrock with team management, budgets, and SSO.
 
-CCAG sits between Claude Code and AWS Bedrock, presenting as the Anthropic Messages API. This enables features not available in direct Bedrock mode (extended thinking, web search, tool use) while adding multi-user management: virtual API keys, per-user/team budgets, rate limiting, OIDC SSO, and an analytics dashboard.
+CCAG sits between Claude Code and Amazon Bedrock, presenting as the Anthropic Messages API. This enables features not available in direct Bedrock mode (extended thinking, web search, tool use) while adding multi-user management: virtual API keys, per-user/team budgets, rate limiting, OIDC SSO, and an analytics dashboard.
 
 ## Key Details
 
@@ -37,7 +37,7 @@ Log in at http://localhost:8080/portal, navigate to Connect, and follow the setu
 
 ## Architecture
 
-Claude Code → CCAG (Anthropic Messages API) → AWS Bedrock (inference)
+Claude Code → CCAG (Anthropic Messages API) → Amazon Bedrock (inference)
                 ↕
             Postgres (keys, teams, spend, config)
 
