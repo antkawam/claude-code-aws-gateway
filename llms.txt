@@ -44,6 +44,9 @@ Claude Code → CCAG (Anthropic Messages API) → Amazon Bedrock (inference)
 ## Features
 
 - API translation: Anthropic Messages API ↔ Bedrock, SSE streaming, model ID mapping
+- Multi-endpoint routing across AWS accounts and regions with per-team assignment
+- Routing strategies: sticky user (cache-aware), primary/fallback, round robin
+- Cross-account Bedrock access via STS AssumeRole with automatic failover
 - Web search: DuckDuckGo (default), Tavily, Serper, or custom provider per user
 - Virtual API keys with per-key rate limits
 - Teams with shared budgets (daily/weekly/monthly, notify/throttle/block)

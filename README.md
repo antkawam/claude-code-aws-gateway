@@ -17,6 +17,7 @@ When Claude Code connects to Bedrock directly (`CLAUDE_CODE_USE_BEDROCK=1`), it 
 | Extended thinking | No | Yes |
 | Tool use | Partial | Yes |
 | Web search | No | Yes (DuckDuckGo, Tavily, Serper, or custom per user) |
+| Multi-account/region routing | N/A | Pool quota across accounts, regions, and teams |
 | Multi-user management | N/A | Virtual API keys, teams, budgets, rate limiting |
 | SSO authentication | N/A | OIDC with any provider (Okta, Azure AD, Google, etc.) |
 | Admin portal | N/A | Built-in SPA for key management and analytics |
@@ -90,6 +91,14 @@ Log in to the admin portal at `http://localhost:8080/portal` and navigate to the
 - Beta flag allowlisting (filters flags that Bedrock does not accept)
 - `cache_control` field passthrough for Bedrock
 - Web search interception with per-user configurable providers (DuckDuckGo, Tavily, Serper, or custom)
+
+### Multi-Endpoint Routing
+
+- Route requests across multiple AWS accounts, regions, or inference profiles from a single gateway
+- Assign endpoints to teams with per-team routing strategies (sticky user, primary/fallback, round robin)
+- Cross-account access via STS AssumeRole with external ID support
+- Automatic failover on 429/5xx with health tracking per endpoint
+- Sticky user routing preserves prompt cache affinity across conversations
 
 ### Multi-User Management
 
@@ -231,7 +240,7 @@ Any provider that exposes a `.well-known/openid-configuration` endpoint: Okta, A
 
 ### Can I use multiple AWS accounts or regions?
 
-CCAG routes to the Bedrock endpoint configured through the standard AWS SDK (environment variables, config files, or ECS task role). For multiple regions, deploy separate CCAG instances, each configured for its target region. The model routing prefix is auto-detected from the region.
+Yes. A single CCAG instance can route to multiple Bedrock endpoints across different AWS accounts and regions. Configure endpoints through the admin portal or API, then assign them to teams with routing strategies (sticky user, primary/fallback, or round robin). Cross-account access is supported via STS AssumeRole. See [docs/endpoints.md](docs/endpoints.md) for details.
 
 ### What is the latency overhead?
 
