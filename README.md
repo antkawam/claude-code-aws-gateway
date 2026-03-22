@@ -10,7 +10,7 @@ A purpose-built gateway for running [Claude Code](https://docs.anthropic.com/en/
 
 **For admins:** Real-time budget controls, multi-account routing for latency optimization and data sovereignty, OIDC SSO, and a full analytics dashboard — all from a built-in portal.
 
-**For developers:** One-command onboarding. No AWS credentials, no config files. The portal generates a setup script that installs Claude Code and connects it to the gateway automatically.
+**For developers:** One-command onboarding. No AWS credentials, no config files. A self-service portal shows personal usage metrics, budget consumption, and virtual key management.
 
 **For automation:** A management CLI (`ccag`) for scripting key provisioning, team setup, and budget enforcement. Self-updates from GitHub Releases.
 
