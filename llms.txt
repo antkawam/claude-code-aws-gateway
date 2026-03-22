@@ -1,0 +1,52 @@
+# Claude Code AWS Gateway (CCAG)
+
+> Self-hosted API gateway that routes Claude Code through AWS Bedrock with team management, budgets, and SSO.
+
+CCAG sits between Claude Code and AWS Bedrock, presenting as the Anthropic Messages API. This enables features not available in direct Bedrock mode (extended thinking, web search, tool use) while adding multi-user management: virtual API keys, per-user/team budgets, rate limiting, OIDC SSO, and an analytics dashboard.
+
+## Key Details
+
+- Language: Rust
+- License: MIT
+- Deployment: Docker Compose (evaluation) or AWS CDK (ECS Fargate + RDS)
+- Docker image: ghcr.io/antkawam/claude-code-aws-gateway
+- CLI binaries: GitHub Releases (linux/macOS/Windows, x86_64/ARM64)
+- Claude models supported: Claude 4+ on Bedrock
+
+## Documentation
+
+- [README](https://github.com/antkawam/claude-code-aws-gateway/blob/main/README.md): Overview, quick start, feature list
+- [Getting Started](https://github.com/antkawam/claude-code-aws-gateway/blob/main/docs/getting-started.md): Docker Compose and CDK setup
+- [Configuration](https://github.com/antkawam/claude-code-aws-gateway/blob/main/docs/configuration.md): Environment variables reference
+- [Authentication](https://github.com/antkawam/claude-code-aws-gateway/blob/main/docs/authentication.md): OIDC SSO setup
+- [CLI Reference](https://github.com/antkawam/claude-code-aws-gateway/blob/main/docs/cli-reference.md): Management CLI commands
+- [CDK Deployment](https://github.com/antkawam/claude-code-aws-gateway/blob/main/infra/README.md): Production AWS deployment guide
+- [FAQ](https://github.com/antkawam/claude-code-aws-gateway/blob/main/docs/faq.md): Common questions
+- [Upgrading](https://github.com/antkawam/claude-code-aws-gateway/blob/main/docs/upgrading.md): Version updates and rollback
+
+## Quick Start
+
+```bash
+git clone https://github.com/antkawam/claude-code-aws-gateway.git
+cd claude-code-aws-gateway
+cp .env.example .env    # edit: set AWS_REGION and credentials
+docker compose up -d    # gateway at http://localhost:8080
+```
+
+Log in at http://localhost:8080/portal, navigate to Connect, and follow the setup script.
+
+## Architecture
+
+Claude Code → CCAG (Anthropic Messages API) → AWS Bedrock (inference)
+                ↕
+            Postgres (keys, teams, spend, config)
+
+## Features
+
+- API translation: Anthropic Messages API ↔ Bedrock, SSE streaming, model ID mapping
+- Web search: DuckDuckGo (default), Tavily, Serper, or custom provider per user
+- Virtual API keys with per-key rate limits
+- Teams with shared budgets (daily/weekly/monthly, notify/throttle/block)
+- OIDC SSO: Okta, Azure AD, Google, any compliant provider
+- Admin portal: embedded SPA with analytics dashboard (spend, activity, models, tools)
+- CLI management tool with self-update from GitHub Releases
