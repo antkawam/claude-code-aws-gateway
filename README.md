@@ -6,11 +6,17 @@
 [![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/antkawam/claude-code-aws-gateway/badge)](https://scorecard.dev/viewer/?uri=github.com/antkawam/claude-code-aws-gateway)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-A self-hosted API gateway that translates the Anthropic Messages API to Amazon Bedrock, enabling extended thinking and web search when using [Claude Code](https://docs.anthropic.com/en/docs/claude-code) with your own AWS account.
+A purpose-built gateway for running [Claude Code](https://docs.anthropic.com/en/docs/claude-code) through Amazon Bedrock. Deploy once, then give every developer on your team a single command to get connected.
+
+**For admins:** Real-time budget controls, multi-account routing for latency optimization and data sovereignty, OIDC SSO, and a full analytics dashboard — all from a built-in portal.
+
+**For developers:** One-command onboarding. No AWS credentials, no config files. The portal generates a setup script that installs Claude Code and connects it to the gateway automatically.
+
+**For automation:** A management CLI (`ccag`) for scripting key provisioning, team setup, and budget enforcement. Self-updates from GitHub Releases.
 
 ## Why CCAG?
 
-When Claude Code connects to Bedrock directly (`CLAUDE_CODE_USE_BEDROCK=1`), it identifies as a Bedrock client. In this mode, extended thinking and web search are not available. CCAG provides these by presenting as the Anthropic Messages API while routing inference through your AWS account.
+When Claude Code connects to Bedrock directly (`CLAUDE_CODE_USE_BEDROCK=1`), extended thinking, web search, and team management are not available. CCAG presents as the Anthropic Messages API while routing inference through your AWS account — unlocking the full Claude Code feature set and adding enterprise controls.
 
 | | Direct Bedrock | Through CCAG |
 |---|---|---|
@@ -18,10 +24,10 @@ When Claude Code connects to Bedrock directly (`CLAUDE_CODE_USE_BEDROCK=1`), it 
 | Tool use | Partial | Yes |
 | Web search | No | Yes (DuckDuckGo, Tavily, Serper, or custom per user) |
 | Multi-account/region routing | N/A | Pool quota across accounts, regions, and teams |
-| Multi-user management | N/A | Virtual API keys, teams, budgets, rate limiting |
+| Budget controls | N/A | Per-user and per-team limits (notify, throttle, or block) |
 | Developer onboarding | Manual config | One-command setup via portal Connect page |
 | SSO authentication | N/A | OIDC with any provider (Okta, Azure AD, Google, etc.) |
-| Admin portal | N/A | Built-in SPA for key management and analytics |
+| Admin portal | N/A | Built-in SPA with real-time analytics |
 
 ## Architecture
 
