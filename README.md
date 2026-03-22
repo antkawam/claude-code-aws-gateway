@@ -19,6 +19,7 @@ When Claude Code connects to Bedrock directly (`CLAUDE_CODE_USE_BEDROCK=1`), it 
 | Web search | No | Yes (DuckDuckGo, Tavily, Serper, or custom per user) |
 | Multi-account/region routing | N/A | Pool quota across accounts, regions, and teams |
 | Multi-user management | N/A | Virtual API keys, teams, budgets, rate limiting |
+| Developer onboarding | Manual config | One-command setup via portal Connect page |
 | SSO authentication | N/A | OIDC with any provider (Okta, Azure AD, Google, etc.) |
 | Admin portal | N/A | Built-in SPA for key management and analytics |
 
@@ -79,7 +80,11 @@ This creates a production stack: VPC, ALB, ECS Fargate (ARM64/Graviton), RDS Pos
 
 ### Connect Claude Code
 
-Log in to the admin portal at `http://localhost:8080/portal` and navigate to the **Connect** page. It provides a setup script that configures Claude Code automatically.
+Log in to the admin portal at `http://localhost:8080/portal` and navigate to the **Connect** page. Developers get a single command that installs Claude Code (if needed), creates an API key, and configures the gateway connection — no manual env vars or config files.
+
+```bash
+curl -fsSL https://your-gateway/setup | sh   # one command, fully configured
+```
 
 ## Features
 
