@@ -18,7 +18,7 @@ anyhow = "1"
 clap = { version = "4", features = ["derive", "env"] }
 dialoguer = "0.11"
 dirs = "6.0.0"
-indicatif = "0.17"
+indicatif = "0.18"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
