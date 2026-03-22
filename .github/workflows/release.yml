@@ -16,13 +16,11 @@ env:
   IMAGE_NAME: ${{ github.repository }}
 
 jobs:
-  # ---------------------------------------------------------------------------
-  # Server binary (linux only, x86_64 + aarch64)
-  # Built with musl for static linking
-  # ---------------------------------------------------------------------------
   server:
     name: Server (${{ matrix.arch }})
     runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
     strategy:
       matrix:
         include:
@@ -33,11 +31,11 @@ jobs:
             target: aarch64-unknown-linux-musl
             runner: ubuntu-24.04-arm
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
         with:
           targets: ${{ matrix.target }}
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
         with:
           key: release-server-${{ matrix.arch }}
           save-if: true
@@ -49,18 +47,16 @@ jobs:
         run: |
           cd target/${{ matrix.target }}/release
           tar czf ../../../ccag-server-linux-${{ matrix.arch }}.tar.gz ccag-server
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: server-${{ matrix.arch }}
           path: ccag-server-linux-${{ matrix.arch }}.tar.gz
 
-  # ---------------------------------------------------------------------------
-  # CLI binary (linux, macOS, Windows × x86_64 + aarch64)
-  # Native builds — thin crate, fast compile
-  # ---------------------------------------------------------------------------
   cli:
     name: CLI (${{ matrix.os }}-${{ matrix.arch }})
     runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
     strategy:
       fail-fast: false
       matrix:
@@ -90,11 +86,11 @@ jobs:
             target: aarch64-pc-windows-msvc
             runner: windows-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
         with:
           targets: ${{ matrix.target }}
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
         with:
           key: release-cli-${{ matrix.os }}-${{ matrix.arch }}
           workspaces: cli
@@ -114,21 +110,21 @@ jobs:
         shell: pwsh
         run: |
           Compress-Archive -Path "target/${{ matrix.target }}/release/ccag.exe" -DestinationPath "ccag-cli-windows-${{ matrix.arch }}.zip"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: cli-${{ matrix.os }}-${{ matrix.arch }}
           path: ccag-cli-${{ matrix.os }}-${{ matrix.arch }}.*
 
-  # ---------------------------------------------------------------------------
-  # Docker image (multi-arch linux/amd64 + linux/arm64) → GHCR
-  # ---------------------------------------------------------------------------
   docker:
     name: Docker Image
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
     needs: [server]
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           pattern: server-*
           merge-multiple: true
@@ -138,14 +134,14 @@ jobs:
           tar xzf ccag-server-linux-x86_64.tar.gz -C build/linux/amd64
           tar xzf ccag-server-linux-aarch64.tar.gz -C build/linux/arm64
           chmod +x build/linux/amd64/ccag-server build/linux/arm64/ccag-server
-      - uses: docker/setup-qemu-action@v3
-      - uses: docker/setup-buildx-action@v3
-      - uses: docker/login-action@v3
+      - uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - uses: docker/metadata-action@v5
+      - uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5
         id: meta
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
@@ -154,7 +150,7 @@ jobs:
             type=semver,pattern={{major}}.{{minor}}
             type=semver,pattern={{major}}
             type=raw,value=latest,enable={{is_default_branch}}
-      - uses: docker/build-push-action@v6
+      - uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
         with:
           context: .
           file: Dockerfile.release
@@ -164,21 +160,20 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           provenance: false
 
-  # ---------------------------------------------------------------------------
-  # GitHub Release with all artifacts + checksums
-  # ---------------------------------------------------------------------------
   release:
     name: GitHub Release
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     needs: [server, cli, docker]
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           pattern: "{server,cli}-*"
           merge-multiple: true
       - name: Generate checksums
         run: sha256sum ccag-*.tar.gz ccag-*.zip > checksums-sha256.txt 2>/dev/null || sha256sum ccag-*.tar.gz > checksums-sha256.txt
-      - uses: softprops/action-gh-release@v2
+      - uses: softprops/action-gh-release@153bb8e04406b158c6c84fc1615b65b24149a1fe # v2
         with:
           generate_release_notes: true
           files: |
