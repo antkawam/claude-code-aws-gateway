@@ -76,7 +76,7 @@ jobs:
           - os: darwin
             arch: x86_64
             target: x86_64-apple-darwin
-            runner: macos-13
+            runner: macos-latest
           - os: darwin
             arch: aarch64
             target: aarch64-apple-darwin
@@ -134,10 +134,10 @@ jobs:
           merge-multiple: true
       - name: Prepare binaries
         run: |
-          mkdir -p build/linux-amd64 build/linux-arm64
-          tar xzf ccag-server-linux-x86_64.tar.gz -C build/linux-amd64
-          tar xzf ccag-server-linux-aarch64.tar.gz -C build/linux-arm64
-          chmod +x build/linux-amd64/ccag-server build/linux-arm64/ccag-server
+          mkdir -p build/linux/amd64 build/linux/arm64
+          tar xzf ccag-server-linux-x86_64.tar.gz -C build/linux/amd64
+          tar xzf ccag-server-linux-aarch64.tar.gz -C build/linux/arm64
+          chmod +x build/linux/amd64/ccag-server build/linux/arm64/ccag-server
       - uses: docker/setup-qemu-action@v3
       - uses: docker/setup-buildx-action@v3
       - uses: docker/login-action@v3
