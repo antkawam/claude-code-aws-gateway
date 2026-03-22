@@ -1,0 +1,26 @@
+title: Claude Code AWS Gateway
+description: Self-hosted API gateway for Claude Code on AWS Bedrock
+remote_theme: pages-themes/minimal@v0.2.0
+plugins:
+  - jekyll-remote-theme
+
+exclude:
+  - src
+  - cli
+  - infra/node_modules
+  - target
+  - tests
+  - static
+  - Cargo.toml
+  - Cargo.lock
+  - Makefile
+  - Dockerfile
+  - Dockerfile.release
+  - docker-compose.yml
+  - docker-compose.test.yml
+  - build.rs
+  - .sqlx
+  - .github
+  - .claude
+  - .env.example
+  - environments.json.example
