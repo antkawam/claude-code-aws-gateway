@@ -126,12 +126,20 @@ pub async fn send_sns(
 }
 
 /// Send a notification via AWS EventBridge.
+/// Strips `source`, `event_type`, and `timestamp` from the detail payload since
+/// these are already present in the EventBridge envelope (source, detail-type, time).
 pub async fn send_eventbridge(
     eb_client: &aws_sdk_eventbridge::Client,
     bus_arn: &str,
     payload: &NotificationPayload,
 ) -> anyhow::Result<()> {
-    let detail = serde_json::to_string(payload)?;
+    let mut detail_value = serde_json::to_value(payload)?;
+    if let Some(obj) = detail_value.as_object_mut() {
+        obj.remove("source");
+        obj.remove("event_type");
+        obj.remove("timestamp");
+    }
+    let detail = serde_json::to_string(&detail_value)?;
 
     let entry = aws_sdk_eventbridge::types::PutEventsRequestEntry::builder()
         .source("ccag.notifications")
@@ -566,5 +574,28 @@ mod tests {
             },
             timestamp: "2026-03-19T14:30:00Z".to_string(),
         }
+    }
+
+    #[test]
+    fn eventbridge_detail_excludes_envelope_fields() {
+        let payload = test_payload();
+        let mut detail_value = serde_json::to_value(&payload).unwrap();
+        if let Some(obj) = detail_value.as_object_mut() {
+            obj.remove("source");
+            obj.remove("event_type");
+            obj.remove("timestamp");
+        }
+
+        // Envelope-redundant fields must be absent
+        assert!(detail_value.get("source").is_none());
+        assert!(detail_value.get("event_type").is_none());
+        assert!(detail_value.get("timestamp").is_none());
+
+        // Retained fields must be present
+        assert_eq!(detail_value["version"], "1");
+        assert_eq!(detail_value["category"], "budget");
+        assert_eq!(detail_value["severity"], "warning");
+        assert_eq!(detail_value["user_identity"], "test@example.com");
+        assert!(detail_value["detail"]["threshold_percent"].is_number());
     }
 }

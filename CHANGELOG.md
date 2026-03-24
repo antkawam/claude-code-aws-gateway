@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- EventBridge notification `detail` no longer includes `source`, `event_type`, or `timestamp` fields — these are redundant with the EventBridge envelope (`source`, `detail-type`, `time`). Webhook and SNS payloads are unchanged. **Breaking** for consumers parsing these fields from EventBridge `detail`.
+
+### Fixed
+
+- IAM policy: split Bedrock invoke and ListInferenceProfiles into separate statements so the wildcard resource only applies to List, not Invoke.
+- Documentation: clarified `OIDC_ISSUER` is a one-time bootstrap seed (not a persistent override). Changing it after first startup has no effect unless the IDP is deleted from the portal first.
+- Documentation: expanded `ADMIN_USERS` description with OIDC subject identifier details and startup seeding behavior.
+- Documentation: renamed confusing "Notifications" env var section to "Infrastructure Alarms" and corrected inaccurate `alarmWebhookUrl` reference. Separated from app-level notifications.
+- Documentation: added separate EventBridge payload example showing envelope structure without redundant fields.
+
 ## [1.0.0] - 2026-03-21
 
 ### Added

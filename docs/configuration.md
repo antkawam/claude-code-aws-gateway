@@ -76,8 +76,8 @@ When `DATABASE_HOST` is set, the gateway constructs the connection string from t
 | `ADMIN_USERNAME` | `admin` | Bootstrap admin username for password-based login. |
 | `ADMIN_PASSWORD` | `admin` | Bootstrap admin password. **Change this in production.** The gateway logs a warning on startup if the default is used. Setting this env var does NOT force admin login to be enabled; use `ADMIN_PASSWORD_ENABLE` for that. |
 | `ADMIN_PASSWORD_ENABLE` | _(none)_ | Set to `true` to force admin login on, overriding the portal setting. Use as a **recovery mechanism** when SSO is broken. Remove after recovery. |
-| `ADMIN_USERS` | _(none)_ | Comma-separated OIDC subject identifiers auto-provisioned as admin users on login. |
-| `OIDC_ISSUER` | _(none)_ | OIDC issuer URL (e.g., `https://dev-12345.okta.com`). Env-level IDP takes precedence over DB-configured IDPs. |
+| `ADMIN_USERS` | _(none)_ | Comma-separated list of OIDC subject identifiers (typically email addresses) to pre-provision as `admin` users. Created in the database on startup — if a user already exists, they are skipped. When these users later log in via SSO, they inherit the pre-seeded admin role. |
+| `OIDC_ISSUER` | _(none)_ | OIDC issuer URL (e.g., `https://dev-12345.okta.com`). **One-time bootstrap:** seeds the IDP to the database on first startup. On subsequent restarts, if the issuer already exists in the DB, this env var is silently ignored. After seeding, manage the IDP via the admin portal or API. See [Identity Providers](#identity-providers-idps) below. |
 | `OIDC_NAME` | _(auto)_ | Display name for the env-level IDP. Auto-detected from issuer URL (Okta, Azure AD, Google, or "SSO"). |
 | `OIDC_AUDIENCE` | _(none)_ | Expected JWT audience claim. |
 | `OIDC_JWKS_URL` | _(auto)_ | JWKS endpoint URL. Auto-discovered from `{issuer}/.well-known/openid-configuration` if not set. |
@@ -96,13 +96,15 @@ When `DATABASE_HOST` is set, the gateway constructs the connection string from t
 |---|---|---|
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | _(none)_ | OTLP gRPC endpoint for exporting metrics (e.g., `http://otel-collector:4317`). When set, all metric instruments are exported via gRPC every 60 seconds alongside the Prometheus scrape endpoint. See `docs/metrics.md` for the full metric list. |
 
-### Notifications
+### Infrastructure Alarms
 
-Alarm notifications (via CloudWatch Alarms and EventBridge) are configured in the CDK stack props:
+CloudWatch Alarms for infrastructure monitoring (ALB 5xx errors, unhealthy targets, RDS CPU/storage) are configured in the CDK stack. Alarms route to an SNS topic (`AlarmTopicArn`, available as a CDK output). Subscribe after deployment:
 
-| CDK Prop | Description |
-|---|---|
-| `alarmWebhookUrl` | Webhook URL for alarm notifications (Slack incoming webhook, etc.) |
+```bash
+aws sns subscribe --topic-arn <AlarmTopicArn> --protocol email --notification-endpoint you@example.com
+```
+
+> **Note:** These are infrastructure-level alarms (CDK/CloudWatch). For application-level event notifications (budget alerts, rate limit events), see the [Notifications](#notifications) section below.
 
 ## Runtime Settings (Admin API / Portal)
 
@@ -117,6 +119,8 @@ These settings are stored in the database and can be changed at any time through
 | `session_token_ttl_hours` | `24` | How long session tokens (from portal login) remain valid. |
 
 ### Identity Providers (IDPs)
+
+> **Bootstrap behavior:** `OIDC_ISSUER` is a one-time seed. On first startup, the gateway inserts the IDP into the database. On subsequent restarts, if an IDP with the same issuer URL already exists, the env var is silently ignored — changing `OIDC_AUDIENCE` or other OIDC env vars will have no effect. To re-bootstrap: delete the IDP from Portal > Identity Providers, then restart the gateway. After seeding, the IDP is fully editable via the portal (name, audience, auto-provision settings, etc.).
 
 Additional OIDC providers can be configured through the portal or API (beyond the env-level `OIDC_ISSUER`):
 
@@ -214,6 +218,8 @@ Each category can be independently toggled on the active config:
 
 ### Event Payload Schema
 
+**Webhook / SNS** — the full payload is sent as the request body (webhook) or message (SNS):
+
 ```json
 {
   "source": "ccag",
@@ -236,7 +242,31 @@ Each category can be independently toggled on the active config:
 }
 ```
 
-For EventBridge, events use `source: "ccag.notifications"` and `detail-type` set to the event type.
+**EventBridge** — fields that duplicate the EventBridge envelope (`source`, `event_type`, `timestamp`) are omitted from `detail`. Use the envelope fields instead:
+
+```json
+{
+  "source": "ccag.notifications",
+  "detail-type": "budget_warning",
+  "time": "2026-03-19T14:30:00Z",
+  "detail": {
+    "version": "1",
+    "category": "budget",
+    "severity": "warning",
+    "user_identity": "jane@corp.com",
+    "team_id": "uuid",
+    "team_name": "frontend",
+    "detail": {
+      "threshold_percent": 80,
+      "spend_usd": 41.20,
+      "limit_usd": 50.00,
+      "percent": 82.4,
+      "period": "weekly",
+      "period_start": "2026-03-17T00:00:00Z"
+    }
+  }
+}
+```
 
 ### IAM Resource Policies (BYO SNS / EventBridge)
 

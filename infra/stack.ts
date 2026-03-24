@@ -106,13 +106,19 @@ export class GatewayStack extends cdk.Stack {
         actions: [
           'bedrock:InvokeModel',
           'bedrock:InvokeModelWithResponseStream',
-          'bedrock:ListInferenceProfiles',
         ],
         resources: [
           'arn:aws:bedrock:*::foundation-model/anthropic.claude*',
           `arn:aws:bedrock:*:${this.account}:inference-profile/*anthropic.claude*`,
-          '*', // ListInferenceProfiles requires wildcard resource
         ],
+      }),
+    );
+
+    // ListInferenceProfiles requires wildcard resource (no resource-level permissions)
+    taskDef.taskRole.addToPrincipalPolicy(
+      new iam.PolicyStatement({
+        actions: ['bedrock:ListInferenceProfiles'],
+        resources: ['*'],
       }),
     );
 
