@@ -33,3 +33,9 @@ docs/backlog/
 
 # Playwright
 .playwright*/
+tests/frontend/node_modules/
+tests/frontend/test-results/
+tests/frontend/playwright-report/
+
+# Coverage
+coverage/

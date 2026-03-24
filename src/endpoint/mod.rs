@@ -292,6 +292,483 @@ impl EndpointPool {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::Ordering;
+    use std::time::{Duration, Instant};
+
+    fn make_test_endpoint(id: Uuid, name: &str, is_default: bool) -> Endpoint {
+        Endpoint {
+            id,
+            name: name.to_string(),
+            role_arn: None,
+            external_id: None,
+            inference_profile_arn: None,
+            region: "us-east-1".to_string(),
+            routing_prefix: "us".to_string(),
+            priority: 0,
+            is_default,
+            enabled: true,
+            created_at: chrono::Utc::now(),
+        }
+    }
+
+    fn make_test_client(ep: Endpoint) -> EndpointClient {
+        let runtime_client = aws_sdk_bedrockruntime::Client::from_conf(
+            aws_sdk_bedrockruntime::Config::builder()
+                .behavior_version(aws_sdk_bedrockruntime::config::BehaviorVersion::latest())
+                .region(aws_config::Region::new("us-east-1"))
+                .build(),
+        );
+        let control_client = aws_sdk_bedrock::Client::from_conf(
+            aws_sdk_bedrock::Config::builder()
+                .behavior_version(aws_sdk_bedrock::config::BehaviorVersion::latest())
+                .region(aws_config::Region::new("us-east-1"))
+                .build(),
+        );
+        let quota_client = aws_sdk_servicequotas::Client::from_conf(
+            aws_sdk_servicequotas::Config::builder()
+                .behavior_version(aws_sdk_servicequotas::config::BehaviorVersion::latest())
+                .region(aws_config::Region::new("us-east-1"))
+                .build(),
+        );
+        EndpointClient {
+            config: ep,
+            runtime_client,
+            control_client,
+            quota_cache: crate::quota::QuotaCache::new(quota_client),
+            healthy: AtomicBool::new(true),
+            last_health_check: AtomicI64::new(0),
+        }
+    }
+
+    async fn insert_client(pool: &EndpointPool, client: EndpointClient) {
+        let mut clients = pool.clients.write().await;
+        clients.insert(client.config.id, Arc::new(client));
+    }
+
+    async fn set_default(pool: &EndpointPool, id: Uuid) {
+        let mut default_id = pool.default_endpoint_id.write().await;
+        *default_id = Some(id);
+    }
+
+    // ── select_endpoint ──
+
+    #[tokio::test]
+    async fn test_select_empty_pool_returns_none() {
+        let pool = EndpointPool::new();
+        let result = pool.select_endpoint(&[], None, "primary_fallback").await;
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_select_no_team_endpoints_uses_default() {
+        let pool = EndpointPool::new();
+        let id = Uuid::new_v4();
+        let ep = make_test_endpoint(id, "default-ep", true);
+        let client = make_test_client(ep);
+        client.healthy.store(true, Ordering::Relaxed);
+        insert_client(&pool, client).await;
+        set_default(&pool, id).await;
+
+        let result = pool.select_endpoint(&[], None, "primary_fallback").await;
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().config.id, id);
+    }
+
+    #[tokio::test]
+    async fn test_select_no_team_endpoints_unhealthy_default() {
+        let pool = EndpointPool::new();
+        let id = Uuid::new_v4();
+        let ep = make_test_endpoint(id, "default-ep", true);
+        let client = make_test_client(ep);
+        client.healthy.store(false, Ordering::Relaxed);
+        insert_client(&pool, client).await;
+        set_default(&pool, id).await;
+
+        let result = pool.select_endpoint(&[], None, "primary_fallback").await;
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_round_robin_distributes() {
+        let pool = EndpointPool::new();
+        let mut ids = Vec::new();
+        let mut team_eps = Vec::new();
+
+        for i in 0..3 {
+            let id = Uuid::new_v4();
+            ids.push(id);
+            let ep = make_test_endpoint(id, &format!("ep-{i}"), false);
+            team_eps.push(ep.clone());
+            let client = make_test_client(ep);
+            client.healthy.store(true, Ordering::Relaxed);
+            insert_client(&pool, client).await;
+        }
+
+        let mut counts = HashMap::new();
+        for _ in 0..6 {
+            let selected = pool
+                .select_endpoint(&team_eps, None, "round_robin")
+                .await
+                .unwrap();
+            *counts.entry(selected.config.id).or_insert(0u32) += 1;
+        }
+
+        for id in &ids {
+            assert_eq!(
+                counts.get(id).copied().unwrap_or(0),
+                2,
+                "Each endpoint should be selected exactly 2 times"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_round_robin_skips_unhealthy() {
+        let pool = EndpointPool::new();
+        let mut team_eps = Vec::new();
+        let mut healthy_ids = Vec::new();
+
+        for i in 0..3 {
+            let id = Uuid::new_v4();
+            let ep = make_test_endpoint(id, &format!("ep-{i}"), false);
+            team_eps.push(ep.clone());
+            let client = make_test_client(ep);
+            if i == 1 {
+                client.healthy.store(false, Ordering::Relaxed);
+            } else {
+                client.healthy.store(true, Ordering::Relaxed);
+                healthy_ids.push(id);
+            }
+            insert_client(&pool, client).await;
+        }
+
+        for _ in 0..6 {
+            let selected = pool
+                .select_endpoint(&team_eps, None, "round_robin")
+                .await
+                .unwrap();
+            assert!(
+                healthy_ids.contains(&selected.config.id),
+                "Should only select healthy endpoints"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_round_robin_all_unhealthy() {
+        let pool = EndpointPool::new();
+        let mut team_eps = Vec::new();
+
+        for i in 0..3 {
+            let id = Uuid::new_v4();
+            let ep = make_test_endpoint(id, &format!("ep-{i}"), false);
+            team_eps.push(ep.clone());
+            let client = make_test_client(ep);
+            client.healthy.store(false, Ordering::Relaxed);
+            insert_client(&pool, client).await;
+        }
+
+        let result = pool.select_endpoint(&team_eps, None, "round_robin").await;
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_primary_fallback_picks_first_healthy() {
+        let pool = EndpointPool::new();
+        let mut team_eps = Vec::new();
+        let mut ids = Vec::new();
+
+        for i in 0..3 {
+            let id = Uuid::new_v4();
+            ids.push(id);
+            let ep = make_test_endpoint(id, &format!("ep-{i}"), false);
+            team_eps.push(ep.clone());
+            let client = make_test_client(ep);
+            client.healthy.store(true, Ordering::Relaxed);
+            insert_client(&pool, client).await;
+        }
+
+        let selected = pool
+            .select_endpoint(&team_eps, None, "primary_fallback")
+            .await
+            .unwrap();
+        assert_eq!(
+            selected.config.id, ids[0],
+            "Should pick the first healthy endpoint"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_primary_fallback_skips_unhealthy() {
+        let pool = EndpointPool::new();
+        let mut team_eps = Vec::new();
+        let mut ids = Vec::new();
+
+        for i in 0..3 {
+            let id = Uuid::new_v4();
+            ids.push(id);
+            let ep = make_test_endpoint(id, &format!("ep-{i}"), false);
+            team_eps.push(ep.clone());
+            let client = make_test_client(ep);
+            if i == 0 {
+                client.healthy.store(false, Ordering::Relaxed);
+            } else {
+                client.healthy.store(true, Ordering::Relaxed);
+            }
+            insert_client(&pool, client).await;
+        }
+
+        let selected = pool
+            .select_endpoint(&team_eps, None, "primary_fallback")
+            .await
+            .unwrap();
+        assert_eq!(
+            selected.config.id, ids[1],
+            "Should skip unhealthy first and pick second"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_sticky_user_returns_affinity() {
+        let pool = EndpointPool::new();
+        let mut team_eps = Vec::new();
+        let mut ids = Vec::new();
+
+        for i in 0..3 {
+            let id = Uuid::new_v4();
+            ids.push(id);
+            let ep = make_test_endpoint(id, &format!("ep-{i}"), false);
+            team_eps.push(ep.clone());
+            let client = make_test_client(ep);
+            client.healthy.store(true, Ordering::Relaxed);
+            insert_client(&pool, client).await;
+        }
+
+        // Set affinity to the third endpoint
+        pool.update_affinity("user@example.com", ids[2]).await;
+
+        let selected = pool
+            .select_endpoint(&team_eps, Some("user@example.com"), "sticky_user")
+            .await
+            .unwrap();
+        assert_eq!(
+            selected.config.id, ids[2],
+            "Should return affinity endpoint"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_sticky_user_expired_falls_through() {
+        let pool = EndpointPool::new();
+        let mut team_eps = Vec::new();
+        let mut ids = Vec::new();
+
+        for i in 0..3 {
+            let id = Uuid::new_v4();
+            ids.push(id);
+            let ep = make_test_endpoint(id, &format!("ep-{i}"), false);
+            team_eps.push(ep.clone());
+            let client = make_test_client(ep);
+            client.healthy.store(true, Ordering::Relaxed);
+            insert_client(&pool, client).await;
+        }
+
+        // Manually insert expired affinity (past TTL)
+        {
+            let mut affinity = pool.user_affinity.write().await;
+            affinity.insert(
+                "user@example.com".to_string(),
+                (
+                    ids[2],
+                    Instant::now() - Duration::from_secs(AFFINITY_TTL_SECS + 60),
+                ),
+            );
+        }
+
+        let selected = pool
+            .select_endpoint(&team_eps, Some("user@example.com"), "sticky_user")
+            .await
+            .unwrap();
+        // With expired affinity, falls through to primary_fallback which picks first healthy
+        assert_eq!(
+            selected.config.id, ids[0],
+            "Should fall through to first healthy endpoint"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_sticky_user_unhealthy_falls_through() {
+        let pool = EndpointPool::new();
+        let mut team_eps = Vec::new();
+        let mut ids = Vec::new();
+
+        for i in 0..3 {
+            let id = Uuid::new_v4();
+            ids.push(id);
+            let ep = make_test_endpoint(id, &format!("ep-{i}"), false);
+            team_eps.push(ep.clone());
+            let client = make_test_client(ep);
+            // Mark the affinity endpoint (index 2) as unhealthy
+            if i == 2 {
+                client.healthy.store(false, Ordering::Relaxed);
+            } else {
+                client.healthy.store(true, Ordering::Relaxed);
+            }
+            insert_client(&pool, client).await;
+        }
+
+        // Set affinity to the unhealthy third endpoint
+        pool.update_affinity("user@example.com", ids[2]).await;
+
+        let selected = pool
+            .select_endpoint(&team_eps, Some("user@example.com"), "sticky_user")
+            .await
+            .unwrap();
+        // Unhealthy affinity endpoint should be skipped, falls through to primary_fallback
+        assert_eq!(
+            selected.config.id, ids[0],
+            "Should fall through when affinity endpoint is unhealthy"
+        );
+    }
+
+    // ── get_fallback_endpoints ──
+
+    #[tokio::test]
+    async fn test_fallback_excludes_primary() {
+        let pool = EndpointPool::new();
+        let mut team_eps = Vec::new();
+        let mut ids = Vec::new();
+
+        for i in 0..3 {
+            let id = Uuid::new_v4();
+            ids.push(id);
+            let ep = make_test_endpoint(id, &format!("ep-{i}"), false);
+            team_eps.push(ep.clone());
+            let client = make_test_client(ep);
+            client.healthy.store(true, Ordering::Relaxed);
+            insert_client(&pool, client).await;
+        }
+
+        let fallbacks = pool.get_fallback_endpoints(ids[0], &team_eps).await;
+        assert_eq!(fallbacks.len(), 2);
+        for fb in &fallbacks {
+            assert_ne!(
+                fb.config.id, ids[0],
+                "Fallbacks should not include the primary"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_fallback_empty_for_no_team_endpoints() {
+        let pool = EndpointPool::new();
+        let id = Uuid::new_v4();
+        let ep = make_test_endpoint(id, "default-ep", true);
+        let client = make_test_client(ep);
+        client.healthy.store(true, Ordering::Relaxed);
+        insert_client(&pool, client).await;
+        set_default(&pool, id).await;
+
+        let fallbacks = pool.get_fallback_endpoints(id, &[]).await;
+        assert!(
+            fallbacks.is_empty(),
+            "No fallbacks when team_endpoints is empty"
+        );
+    }
+
+    // ── affinity ──
+
+    #[tokio::test]
+    async fn test_update_affinity_creates_entry() {
+        let pool = EndpointPool::new();
+        let id = Uuid::new_v4();
+
+        pool.update_affinity("user@test.com", id).await;
+
+        let affinity = pool.user_affinity.read().await;
+        assert!(affinity.contains_key("user@test.com"));
+        let (ep_id, _) = affinity.get("user@test.com").unwrap();
+        assert_eq!(*ep_id, id);
+    }
+
+    #[tokio::test]
+    async fn test_affinity_lru_eviction() {
+        let pool = EndpointPool {
+            clients: RwLock::new(HashMap::new()),
+            default_endpoint_id: RwLock::new(None),
+            user_affinity: RwLock::new(HashMap::new()),
+            max_affinity_entries: 3,
+            round_robin_counter: AtomicUsize::new(0),
+        };
+
+        let ep_id = Uuid::new_v4();
+
+        // Insert 3 entries with staggered timestamps so LRU ordering is deterministic
+        {
+            let mut affinity = pool.user_affinity.write().await;
+            affinity.insert(
+                "user1".to_string(),
+                (ep_id, Instant::now() - Duration::from_secs(30)),
+            );
+            affinity.insert(
+                "user2".to_string(),
+                (ep_id, Instant::now() - Duration::from_secs(20)),
+            );
+            affinity.insert(
+                "user3".to_string(),
+                (ep_id, Instant::now() - Duration::from_secs(10)),
+            );
+        }
+
+        // Insert a 4th — should evict user1 (oldest timestamp)
+        pool.update_affinity("user4", ep_id).await;
+
+        let affinity = pool.user_affinity.read().await;
+        assert_eq!(affinity.len(), 3);
+        assert!(
+            !affinity.contains_key("user1"),
+            "user1 (oldest) should have been evicted"
+        );
+        assert!(affinity.contains_key("user2"));
+        assert!(affinity.contains_key("user3"));
+        assert!(affinity.contains_key("user4"));
+    }
+
+    #[tokio::test]
+    async fn test_cleanup_removes_expired() {
+        let pool = EndpointPool::new();
+        let ep_id = Uuid::new_v4();
+
+        // Insert one fresh and one expired entry
+        {
+            let mut affinity = pool.user_affinity.write().await;
+            affinity.insert("fresh_user".to_string(), (ep_id, Instant::now()));
+            affinity.insert(
+                "expired_user".to_string(),
+                (
+                    ep_id,
+                    Instant::now() - Duration::from_secs(AFFINITY_TTL_SECS + 60),
+                ),
+            );
+        }
+
+        pool.cleanup_affinity().await;
+
+        let affinity = pool.user_affinity.read().await;
+        assert!(
+            affinity.contains_key("fresh_user"),
+            "Fresh entry should remain"
+        );
+        assert!(
+            !affinity.contains_key("expired_user"),
+            "Expired entry should be removed"
+        );
+    }
+}
+
 /// STS AssumeRole credential provider.
 #[derive(Debug)]
 struct AssumeRoleProvider {
