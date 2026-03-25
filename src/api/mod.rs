@@ -1,6 +1,8 @@
 pub mod admin;
 pub mod cli_auth;
 mod handlers;
+#[cfg(feature = "mock-bedrock")]
+pub mod mock_bedrock;
 
 use std::sync::Arc;
 

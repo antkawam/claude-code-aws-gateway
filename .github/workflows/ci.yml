@@ -161,7 +161,7 @@ jobs:
       - name: Install Playwright
         working-directory: tests/frontend
         run: |
-          npm ci
+          npm install
           npx playwright install chromium --with-deps
       - name: Run frontend tests
         working-directory: tests/frontend
@@ -174,3 +174,48 @@ jobs:
           name: playwright-report
           path: tests/frontend/playwright-report/
         if: always()
+
+  load-test:
+    name: Load Test (Smoke)
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_DB: proxy
+          POSTGRES_USER: proxy
+          POSTGRES_PASSWORD: testpass
+        ports:
+          - 5433:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 2s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+      - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
+        with:
+          save-if: false
+      - name: Install k6
+        run: |
+          sudo gpg -k
+          sudo gpg --no-default-keyring --keyring /usr/share/keyrings/k6-archive-keyring.gpg --keyserver hkp://keyserver.ubuntu.com:80 --recv-keys C5AD17C747E3415A3642D57D77C6C491D6AC1D69
+          echo "deb [signed-by=/usr/share/keyrings/k6-archive-keyring.gpg] https://dl.k6.io/deb stable main" | sudo tee /etc/apt/sources.list.d/k6.list
+          sudo apt-get update
+          sudo apt-get install -y k6
+      - name: Build gateway (mock Bedrock)
+        run: cargo build --bin ccag-server --features mock-bedrock --locked
+      - name: Start gateway
+        run: |
+          DATABASE_URL=postgres://proxy:testpass@127.0.0.1:5433/proxy \
+            ADMIN_PASSWORD_ENABLE=true \
+            ./target/debug/ccag-server &
+          for i in 1 2 3 4 5; do
+            curl -sf http://127.0.0.1:8080/health && break || sleep 2
+          done
+      - name: Run k6 smoke test
+        run: k6 run tests/load/smoke.js
+        env:
+          GATEWAY_URL: http://localhost:8080

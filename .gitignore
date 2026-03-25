@@ -39,3 +39,6 @@ tests/frontend/playwright-report/
 
 # Coverage
 coverage/
+
+# Load test results
+tests/load/results/

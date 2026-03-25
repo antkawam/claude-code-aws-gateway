@@ -1,0 +1,74 @@
+# Docker Compose for load testing with Fargate/RDS-equivalent resource constraints.
+#
+# Simulates production deployment:
+#   - Gateway: 0.5 vCPU, 1GB RAM (matches ECS Fargate task definition)
+#   - Postgres: 2 vCPU, 2GB RAM, 45 max connections (matches db.t4g.small)
+#
+# Usage:
+#   docker compose -f docker-compose.load.yml up -d --build
+#   k6 run tests/load/stress.js
+#   docker compose -f docker-compose.load.yml down
+#
+# Or via: make test-load-constrained
+
+services:
+  postgres-load:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: proxy
+      POSTGRES_USER: proxy
+      POSTGRES_PASSWORD: testpass
+    ports:
+      - "5434:5432"
+    # Match db.t4g.small: 2 vCPU, 2GB RAM, ~45 max connections
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 2g
+    command: >
+      postgres
+        -c max_connections=45
+        -c shared_buffers=512MB
+        -c work_mem=4MB
+        -c maintenance_work_mem=64MB
+        -c effective_cache_size=1GB
+    tmpfs:
+      - /var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U proxy -d proxy"]
+      interval: 1s
+      timeout: 5s
+      retries: 30
+
+  gateway-load:
+    build:
+      context: .
+      dockerfile: Dockerfile.load
+    ports:
+      - "8081:8080"
+    environment:
+      DATABASE_URL: postgres://proxy:testpass@postgres-load:5432/proxy
+      PROXY_HOST: "0.0.0.0"
+      PROXY_PORT: "8080"
+      ADMIN_PASSWORD_ENABLE: "true"
+      RUST_LOG: "warn"
+      # Mock Bedrock latency config (realistic CC workload)
+      MOCK_TTFT_MS: "1500"
+      MOCK_CHUNK_DELAY_MS: "60"
+      MOCK_CHUNKS: "100"
+      MOCK_JITTER_PCT: "25"
+    # Match ECS Fargate: 0.5 vCPU, 1GB RAM
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 1g
+    depends_on:
+      postgres-load:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8080/health"]
+      interval: 2s
+      timeout: 5s
+      retries: 15

@@ -215,6 +215,7 @@ pub async fn resolve_oidc_role(state: &GatewayState, identity: &OidcIdentity) ->
     }
 }
 
+#[cfg_attr(feature = "mock-bedrock", allow(unreachable_code))]
 pub async fn messages(
     State(state): State<Arc<GatewayState>>,
     headers: HeaderMap,
@@ -403,6 +404,7 @@ pub async fn messages(
     };
 
     // Select the runtime client: endpoint pool or fallback to gateway default
+    #[cfg_attr(feature = "mock-bedrock", allow(unused_variables))]
     let runtime_client = selected_endpoint
         .as_ref()
         .map(|ep| ep.runtime_client.clone())
@@ -430,6 +432,64 @@ pub async fn messages(
         && let Ok(s) = std::str::from_utf8(&body_bytes)
     {
         tracing::debug!(body = %s, "Bedrock request body");
+    }
+
+    // Mock Bedrock: return canned responses with realistic latency for load testing.
+    // Feature-gated at compile time — zero overhead in production builds.
+    #[cfg(feature = "mock-bedrock")]
+    #[allow(unreachable_code, unused_variables)]
+    {
+        tracing::info!(request_id = %request_id, "Using mock Bedrock response (load testing mode)");
+        let (input_tokens, output_tokens) = crate::api::mock_bedrock::mock_token_counts(None);
+
+        // Record spend (just like real requests)
+        let entry = crate::db::spend::RequestLogEntry {
+            key_id: identity.key_id,
+            user_identity: identity.user_identity.clone(),
+            request_id: request_id.clone(),
+            model: original_model.clone(),
+            streaming: is_streaming,
+            duration_ms: 0, // will be overridden below
+            input_tokens,
+            output_tokens,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
+            stop_reason: Some("end_turn".to_string()),
+            tool_count: req_info.tool_count,
+            tool_names: req_info.tool_names.clone(),
+            turn_count: req_info.turn_count,
+            thinking_enabled: req_info.thinking_enabled,
+            has_system_prompt: req_info.has_system_prompt,
+            session_id: req_info.session_id.clone(),
+            project_key: req_info.project_key.clone(),
+            tool_errors: req_info.tool_errors.clone(),
+            has_correction: req_info.has_correction,
+            content_block_types: vec!["text".to_string()],
+            system_prompt_hash: req_info.system_prompt_hash.clone(),
+            detection_flags: None,
+            endpoint_id,
+        };
+
+        let mock_resp = if is_streaming {
+            crate::api::mock_bedrock::mock_streaming_response(&original_model, &request_id)
+        } else {
+            crate::api::mock_bedrock::mock_non_streaming_response(&original_model, &request_id)
+        };
+
+        // Record spend after response (spawn so we don't block)
+        let tracker = state.spend_tracker.clone();
+        let mut final_entry = entry;
+        final_entry.duration_ms = start.elapsed().as_millis() as i32;
+        tokio::spawn(async move { tracker.record(final_entry).await });
+
+        state.metrics.record_request(
+            &original_model,
+            is_streaming,
+            start.elapsed().as_millis() as f64,
+            "ok",
+        );
+
+        return mock_resp;
     }
 
     // If web search is active, use the search-aware handler for both streaming and non-streaming.

@@ -89,6 +89,7 @@ subtle = "2.6.1"
 
 [features]
 integration = []
+mock-bedrock = []
 
 [dev-dependencies]
 tokio-test = "0.4"
