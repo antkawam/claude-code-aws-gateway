@@ -2565,6 +2565,18 @@ input[type="date"].oa-filter-select { background-image: none; padding-right: 8px
         <label class="form-label">JWKS URL (optional)</label>
         <input class="form-input" id="mi-jwks" placeholder="Auto-discovered if empty">
       </div>
+      <div class="form-group">
+        <label class="form-label">User Identifier Claim</label>
+        <select class="form-select" id="mi-user-claim">
+          <option value="">Auto (email &gt; preferred_username &gt; upn &gt; name &gt; sub)</option>
+          <option value="email">email</option>
+          <option value="preferred_username">preferred_username</option>
+          <option value="upn">upn (User Principal Name)</option>
+          <option value="oid">oid (Entra Object ID)</option>
+          <option value="name">name</option>
+          <option value="sub">sub (opaque identifier)</option>
+        </select>
+      </div>
     </div>
     <div class="modal-footer">
       <button class="btn btn-secondary" onclick="closeModal()">Cancel</button>
@@ -5424,6 +5436,7 @@ function showIdpModal(idp) {
   document.getElementById('mi-flow').value = idp ? idp.flow_type : 'device_code';
   document.getElementById('mi-role').value = idp ? (idp.default_role || 'member') : 'member';
   document.getElementById('mi-auto-provision').checked = idp ? idp.auto_provision : true;
+  document.getElementById('mi-user-claim').value = idp ? (idp.user_claim || '') : '';
   document.getElementById('modal-idp').style.display = 'flex';
   setTimeout(() => document.getElementById('mi-name').focus(), 100);
 }
@@ -5443,6 +5456,7 @@ async function saveIdp() {
     flow_type: document.getElementById('mi-flow').value,
     default_role: document.getElementById('mi-role').value,
     auto_provision: document.getElementById('mi-auto-provision').checked,
+    user_claim: document.getElementById('mi-user-claim').value || undefined,
   };
   if (!body.name || !body.issuer_url) { toast('Name and Issuer URL are required', 'error'); return; }
 

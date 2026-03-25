@@ -34,6 +34,7 @@ async fn test_app(pool: &sqlx::PgPool) -> (axum::Router, String) {
     // Issue a session token for the admin
     let identity = ccag::auth::oidc::OidcIdentity {
         sub: "admin".to_string(),
+        email: None,
         idp_name: "Local".to_string(),
     };
     let admin_token = ccag::auth::session::issue(signing_key, &identity, 24);
@@ -86,6 +87,7 @@ async fn test_app(pool: &sqlx::PgPool) -> (axum::Router, String) {
 fn member_token(signing_key: &str, sub: &str) -> String {
     let identity = ccag::auth::oidc::OidcIdentity {
         sub: sub.to_string(),
+        email: None,
         idp_name: "Local".to_string(),
     };
     ccag::auth::session::issue(signing_key, &identity, 24)

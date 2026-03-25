@@ -164,14 +164,15 @@ pub async fn auth_me(State(state): State<Arc<GatewayState>>, headers: HeaderMap)
         Ok(AuthResult::Oidc(identity)) => {
             let role = resolve_oidc_role(&state, &identity).await;
             // Look up user DB id for portal features (e.g. filtering keys)
-            let user_id = crate::db::users::get_user_by_email(&state.db().await, &identity.sub)
-                .await
-                .ok()
-                .flatten()
-                .map(|u| u.id);
+            let user_id =
+                crate::db::users::get_user_by_email(&state.db().await, identity.user_id())
+                    .await
+                    .ok()
+                    .flatten()
+                    .map(|u| u.id);
             Json(json!({
                 "type": "oidc",
-                "sub": identity.sub,
+                "sub": identity.user_id(),
                 "idp": identity.idp_name,
                 "role": role,
                 "user_id": user_id,
@@ -197,19 +198,19 @@ pub async fn resolve_oidc_role(state: &GatewayState, identity: &OidcIdentity) ->
     let pool = state.db().await;
     let pool = &pool;
 
-    // Check if user exists in DB (keyed by email = sub)
-    if let Ok(Some(user)) = crate::db::users::get_user_by_email(pool, &identity.sub).await {
+    // Check if user exists in DB (keyed by email, falling back to sub)
+    if let Ok(Some(user)) = crate::db::users::get_user_by_email(pool, identity.user_id()).await {
         return user.role;
     }
 
     // Auto-provision new user as member
-    match crate::db::users::create_user(pool, &identity.sub, None, "member").await {
+    match crate::db::users::create_user(pool, identity.user_id(), None, "member").await {
         Ok(user) => {
-            tracing::info!(sub = %identity.sub, role = %user.role, "Auto-provisioned OIDC user");
+            tracing::info!(sub = %identity.sub, user_id = %identity.user_id(), role = %user.role, "Auto-provisioned OIDC user");
             user.role
         }
         Err(e) => {
-            tracing::warn!(%e, sub = %identity.sub, "Failed to auto-provision user");
+            tracing::warn!(%e, sub = %identity.sub, user_id = %identity.user_id(), "Failed to auto-provision user");
             "member".to_string()
         }
     }
@@ -239,14 +240,14 @@ pub async fn messages(
             user_id: k.user_id,
         },
         AuthResult::Oidc(id) => {
-            let user_id = crate::db::users::get_user_by_email(&state.db().await, &id.sub)
+            let user_id = crate::db::users::get_user_by_email(&state.db().await, id.user_id())
                 .await
                 .ok()
                 .flatten()
                 .map(|u| u.id);
             AuthIdentity {
                 key_id: None,
-                user_identity: Some(id.sub.clone()),
+                user_identity: Some(id.user_id().to_string()),
                 user_id,
             }
         }
@@ -254,7 +255,7 @@ pub async fn messages(
 
     // Budget check for OIDC users (replaces old spend limit check)
     let budget_status = if let AuthResult::Oidc(ref oidc) = auth_result {
-        match check_budget(&state, &oidc.sub).await {
+        match check_budget(&state, oidc.user_id()).await {
             Ok(status) => status,
             Err(resp) => return resp,
         }

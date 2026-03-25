@@ -18,6 +18,10 @@ pub struct IdpConfig {
     pub auto_provision: bool,
     pub default_role: String,
     pub allowed_domains: Option<Vec<String>>,
+    /// Which JWT claim to use as the user identifier.
+    /// None or "auto" = fallback chain: email > preferred_username > upn > name > sub.
+    /// Explicit values: "email", "preferred_username", "upn", "oid", "name", "sub".
+    pub user_claim: Option<String>,
 }
 
 impl IdpConfig {
@@ -25,6 +29,7 @@ impl IdpConfig {
         let issuer = std::env::var("OIDC_ISSUER").ok()?;
         let audience = std::env::var("OIDC_AUDIENCE").ok();
         let jwks_url = std::env::var("OIDC_JWKS_URL").ok();
+        let user_claim = std::env::var("OIDC_USER_CLAIM").ok();
 
         // Derive a friendly name from the issuer URL, or allow explicit override
         let name = std::env::var("OIDC_NAME").unwrap_or_else(|_| {
@@ -47,6 +52,7 @@ impl IdpConfig {
             auto_provision: true,
             default_role: "member".to_string(),
             allowed_domains: None,
+            user_claim,
         })
     }
 
@@ -59,6 +65,7 @@ impl IdpConfig {
             auto_provision: row.auto_provision,
             default_role: row.default_role.clone(),
             allowed_domains: row.allowed_domains.clone(),
+            user_claim: row.user_claim.clone(),
         }
     }
 
@@ -76,6 +83,10 @@ impl IdpConfig {
 pub struct OidcClaims {
     pub sub: String,
     pub email: Option<String>,
+    pub preferred_username: Option<String>,
+    pub upn: Option<String>,
+    pub oid: Option<String>,
+    pub name: Option<String>,
     pub iss: String,
     pub aud: OidcAudience,
     pub exp: u64,
@@ -92,7 +103,56 @@ pub enum OidcAudience {
 #[derive(Debug, Clone)]
 pub struct OidcIdentity {
     pub sub: String,
+    /// Best available human-readable identifier: email > preferred_username > upn > sub.
+    pub email: Option<String>,
     pub idp_name: String,
+}
+
+impl OidcIdentity {
+    /// Returns the best available user identifier for DB storage and display.
+    /// Prefers email/preferred_username/upn over the opaque `sub` claim,
+    /// since some IDPs (e.g. Entra ID) use non-human-readable sub values.
+    pub fn user_id(&self) -> &str {
+        self.email.as_deref().unwrap_or(&self.sub)
+    }
+}
+
+/// Resolve the user identifier from JWT claims based on the IDP's `user_claim` config.
+///
+/// When `user_claim` is None or "auto", uses a fallback chain:
+///   email > preferred_username > upn > name
+/// When set to a specific claim name, extracts that claim.
+/// Returns None if the configured/fallback claim is not present in the token.
+fn resolve_user_claim(user_claim: &Option<String>, claims: &OidcClaims) -> Option<String> {
+    match user_claim.as_deref() {
+        None | Some("auto") | Some("") => {
+            // Fallback chain (industry standard for multi-IDP compatibility)
+            claims
+                .email
+                .clone()
+                .or_else(|| claims.preferred_username.clone())
+                .or_else(|| claims.upn.clone())
+                .or_else(|| claims.name.clone())
+        }
+        Some("email") => claims.email.clone(),
+        Some("preferred_username") => claims.preferred_username.clone(),
+        Some("upn") => claims.upn.clone(),
+        Some("oid") => claims.oid.clone(),
+        Some("name") => claims.name.clone(),
+        Some("sub") => Some(claims.sub.clone()),
+        Some(other) => {
+            tracing::warn!(
+                user_claim = other,
+                "Unknown user_claim value, falling back to auto"
+            );
+            claims
+                .email
+                .clone()
+                .or_else(|| claims.preferred_username.clone())
+                .or_else(|| claims.upn.clone())
+                .or_else(|| claims.name.clone())
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -266,8 +326,13 @@ impl MultiIdpValidator {
             }
         }
 
+        // Resolve user identifier based on IDP's user_claim config.
+        // "auto" (or unset) uses fallback chain: email > preferred_username > upn > name > sub.
+        let resolved_email = resolve_user_claim(&config.user_claim, &claims);
+
         Ok(OidcIdentity {
             sub: claims.sub,
+            email: resolved_email,
             idp_name: config.name.clone(),
         })
     }
@@ -398,6 +463,7 @@ mod tests {
             auto_provision: true,
             default_role: "member".to_string(),
             allowed_domains: None,
+            user_claim: None,
         };
 
         validator.load_idps(vec![config]).await;
@@ -423,6 +489,10 @@ mod tests {
         OidcClaims {
             sub: "user-123".to_string(),
             email: Some("user@example.com".to_string()),
+            preferred_username: None,
+            upn: None,
+            oid: None,
+            name: None,
             iss: issuer.to_string(),
             aud: OidcAudience::Single("test-audience".to_string()),
             exp: (chrono::Utc::now() + chrono::Duration::hours(1)).timestamp() as u64,
@@ -443,6 +513,8 @@ mod tests {
 
         let identity = result.unwrap();
         assert_eq!(identity.sub, "user-123");
+        assert_eq!(identity.email.as_deref(), Some("user@example.com"));
+        assert_eq!(identity.user_id(), "user@example.com");
         assert_eq!(identity.idp_name, "test-idp");
     }
 
@@ -565,6 +637,7 @@ mod tests {
                 auto_provision: true,
                 default_role: "member".to_string(),
                 allowed_domains: None,
+                user_claim: None,
             },
             IdpConfig {
                 name: "IDP-B".to_string(),
@@ -574,6 +647,7 @@ mod tests {
                 auto_provision: true,
                 default_role: "member".to_string(),
                 allowed_domains: None,
+                user_claim: None,
             },
         ];
         validator.load_idps(configs).await;
@@ -645,12 +719,17 @@ mod tests {
             auto_provision: true,
             default_role: "member".to_string(),
             allowed_domains: None,
+            user_claim: None,
         };
         validator.load_idps(vec![config]).await;
 
         let claims = OidcClaims {
             sub: "fetched-user".to_string(),
             email: None,
+            preferred_username: None,
+            upn: None,
+            oid: None,
+            name: None,
             iss: issuer.clone(),
             aud: OidcAudience::Single("any".to_string()),
             exp: (chrono::Utc::now() + chrono::Duration::hours(1)).timestamp() as u64,
@@ -681,6 +760,7 @@ mod tests {
             auto_provision: true,
             default_role: "member".to_string(),
             allowed_domains: Some(vec!["@allowed.com".to_string()]),
+            user_claim: None,
         };
         validator.load_idps(vec![config]).await;
         {
@@ -692,6 +772,10 @@ mod tests {
         let claims_ok = OidcClaims {
             sub: "user-ok".to_string(),
             email: Some("user@allowed.com".to_string()),
+            preferred_username: None,
+            upn: None,
+            oid: None,
+            name: None,
             iss: issuer.to_string(),
             aud: OidcAudience::Single("any".to_string()),
             exp: (chrono::Utc::now() + chrono::Duration::hours(1)).timestamp() as u64,
@@ -731,6 +815,7 @@ mod tests {
             auto_provision: true,
             default_role: "member".to_string(),
             allowed_domains: None,
+            user_claim: None,
         };
         validator.load_idps(vec![config]).await;
         {
@@ -766,6 +851,7 @@ mod tests {
             auto_provision: true,
             default_role: "member".to_string(),
             allowed_domains: None,
+            user_claim: None,
         };
         validator.load_idps(vec![config.clone()]).await;
         {
@@ -795,6 +881,7 @@ mod tests {
             auto_provision: true,
             default_role: "member".to_string(),
             allowed_domains: None,
+            user_claim: None,
         };
         assert_eq!(
             config.effective_jwks_url(),
@@ -812,6 +899,7 @@ mod tests {
             auto_provision: true,
             default_role: "member".to_string(),
             allowed_domains: None,
+            user_claim: None,
         };
         assert_eq!(
             config.effective_jwks_url(),

@@ -77,4 +77,5 @@ pub struct IdentityProvider {
     pub enabled: bool,
     pub source: String,
     pub created_at: DateTime<Utc>,
+    pub user_claim: Option<String>,
 }

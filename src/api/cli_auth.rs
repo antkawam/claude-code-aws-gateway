@@ -219,12 +219,13 @@ async fn build_auth_url(
     };
 
     let redirect_host = host.split(':').next().unwrap_or(host);
-    // If the IDP has an audience configured (typically the gateway domain),
+    // If the IDP has an audience configured that looks like a domain name,
     // use it as the trusted redirect host to prevent Host header injection.
+    // Skip if audience is a UUID/client_id (e.g. Entra uses UUIDs as client_ids).
     let trusted_host = idp
         .audience
         .as_deref()
-        .filter(|a| !a.is_empty())
+        .filter(|a| !a.is_empty() && a.contains('.'))
         .unwrap_or(redirect_host);
     let redirect_uri = format!("https://{}/auth/cli/callback", trusted_host);
     let audience = idp.audience.as_deref().unwrap_or("");
@@ -239,7 +240,7 @@ async fn build_auth_url(
     let nonce = format!("{:032x}", rand::random::<u128>());
 
     Some(format!(
-        "{authorize_endpoint}{separator}response_type=id_token&client_id={audience}&redirect_uri={redirect_uri}&state={session_id}&nonce={nonce}&scope=openid"
+        "{authorize_endpoint}{separator}response_type=id_token&client_id={audience}&redirect_uri={redirect_uri}&state={session_id}&nonce={nonce}&scope=openid%20email%20profile"
     ))
 }
 

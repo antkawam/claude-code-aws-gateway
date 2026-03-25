@@ -226,6 +226,7 @@ async fn auth_login(
         // Issue a gateway session token for the bootstrap admin
         let identity = crate::auth::oidc::OidcIdentity {
             sub: username.to_string(),
+            email: None,
             idp_name: "Local".to_string(),
         };
         let ttl = state

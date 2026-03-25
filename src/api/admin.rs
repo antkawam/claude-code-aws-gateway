@@ -1541,6 +1541,7 @@ pub struct CreateIdpRequest {
     #[serde(default = "default_role")]
     pub default_role: String,
     pub allowed_domains: Option<Vec<String>>,
+    pub user_claim: Option<String>,
 }
 
 fn default_flow_type() -> String {
@@ -1568,6 +1569,7 @@ pub async fn create_idp(
         body.auto_provision,
         &body.default_role,
         body.allowed_domains.as_deref(),
+        body.user_claim.as_deref(),
     )
     .await
     {
@@ -1612,6 +1614,7 @@ pub struct UpdateIdpRequest {
     pub allowed_domains: Option<Vec<String>>,
     #[serde(default = "default_true")]
     pub enabled: bool,
+    pub user_claim: Option<String>,
 }
 
 fn default_true() -> bool {
@@ -1642,6 +1645,7 @@ pub async fn update_idp(
         &body.default_role,
         body.allowed_domains.as_deref(),
         body.enabled,
+        body.user_claim.as_deref(),
     )
     .await
     {
@@ -1783,12 +1787,12 @@ pub async fn check_auth_identity(
     if let Ok(identity) = crate::auth::session::validate(&state.session_signing_key, key) {
         let role = super::handlers::resolve_oidc_role(state, &identity).await;
         let pool = state.db().await;
-        let user_id = crate::db::users::get_user_by_email(&pool, &identity.sub)
+        let user_id = crate::db::users::get_user_by_email(&pool, identity.user_id())
             .await
             .ok()
             .flatten()
             .map(|u| u.id);
-        return Ok((identity.sub, role, user_id));
+        return Ok((identity.user_id().to_string(), role, user_id));
     }
 
     // Try OIDC token (external IDP)
@@ -1797,12 +1801,12 @@ pub async fn check_auth_identity(
     {
         let role = super::handlers::resolve_oidc_role(state, &identity).await;
         let pool = state.db().await;
-        let user_id = crate::db::users::get_user_by_email(&pool, &identity.sub)
+        let user_id = crate::db::users::get_user_by_email(&pool, identity.user_id())
             .await
             .ok()
             .flatten()
             .map(|u| u.id);
-        return Ok((identity.sub, role, user_id));
+        return Ok((identity.user_id().to_string(), role, user_id));
     }
 
     Err(error_response(

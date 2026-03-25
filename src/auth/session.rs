@@ -8,6 +8,8 @@ const ISSUER: &str = "ccag";
 #[derive(Debug, Serialize, Deserialize)]
 struct SessionClaims {
     sub: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    email: Option<String>,
     idp: String,
     iss: String,
     exp: i64,
@@ -19,6 +21,7 @@ pub fn issue(signing_key: &str, identity: &OidcIdentity, ttl_hours: u64) -> Stri
     let now = chrono::Utc::now().timestamp();
     let claims = SessionClaims {
         sub: identity.sub.clone(),
+        email: identity.email.clone(),
         idp: identity.idp_name.clone(),
         iss: ISSUER.to_string(),
         iat: now,
@@ -53,6 +56,7 @@ pub fn validate(signing_key: &str, token: &str) -> Result<OidcIdentity, anyhow::
 
     Ok(OidcIdentity {
         sub: token_data.claims.sub,
+        email: token_data.claims.email,
         idp_name: token_data.claims.idp,
     })
 }
@@ -66,6 +70,7 @@ mod tests {
         let key = "test-secret-key";
         let identity = OidcIdentity {
             sub: "testuser".to_string(),
+            email: None,
             idp_name: "TestIDP".to_string(),
         };
 
@@ -79,6 +84,7 @@ mod tests {
     fn test_wrong_key_rejected() {
         let identity = OidcIdentity {
             sub: "user".to_string(),
+            email: None,
             idp_name: "IDP".to_string(),
         };
         let token = issue("key1", &identity, 24);
@@ -92,6 +98,7 @@ mod tests {
         let now = chrono::Utc::now().timestamp();
         let claims = super::SessionClaims {
             sub: "user".to_string(),
+            email: None,
             idp: "IDP".to_string(),
             iss: "ccag".to_string(),
             iat: now - 7200,
