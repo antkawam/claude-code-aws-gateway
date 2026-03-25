@@ -18,9 +18,10 @@ test.describe('Admin Authentication', () => {
 
   test('rejects invalid credentials', async ({ page }) => {
     await page.goto('/portal');
+    await page.waitForSelector('#auth-admin-login', { state: 'visible' });
     await page.fill('#auth-username', 'admin');
     await page.fill('#auth-password', 'wrong-password');
-    await page.click('button:has-text("Sign in")');
+    await page.click('#auth-admin-login button:has-text("Sign in")');
     // Should show error and stay on auth screen
     await expect(page.locator('#auth-error')).toBeVisible({ timeout: 5_000 });
     await expect(page.locator('#app-shell')).toBeHidden();

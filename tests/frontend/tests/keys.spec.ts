@@ -9,7 +9,7 @@ test.describe('Virtual Key Lifecycle', () => {
 
   test('creates a new virtual key', async ({ page }) => {
     // Open create key modal
-    await page.click('button:has-text("Create Key")');
+    await page.click('#page-keys button:has-text("Create Key")');
     await expect(page.locator('#modal-create-key')).toBeVisible();
 
     // Fill optional name and submit
@@ -24,7 +24,7 @@ test.describe('Virtual Key Lifecycle', () => {
 
   test('shows key in the keys table after creation', async ({ page }) => {
     // Create a key
-    await page.click('button:has-text("Create Key")');
+    await page.click('#page-keys button:has-text("Create Key")');
     await page.fill('#mk-name', 'table-test-key');
     await page.click('#modal-create-key button:has-text("Create Key")');
     await expect(page.locator('#new-key-banner')).toBeVisible({ timeout: 5_000 });
@@ -34,22 +34,26 @@ test.describe('Virtual Key Lifecycle', () => {
   });
 
   test('revokes a virtual key', async ({ page }) => {
-    // Create a key first
-    await page.click('button:has-text("Create Key")');
-    await page.fill('#mk-name', 'revoke-test-key');
+    // Create a key with a unique name
+    const keyName = `revoke-key-${Date.now()}`;
+    await page.click('#page-keys button:has-text("Create Key")');
+    await page.fill('#mk-name', keyName);
     await page.click('#modal-create-key button:has-text("Create Key")');
     await expect(page.locator('#new-key-banner')).toBeVisible({ timeout: 5_000 });
 
-    // Find and click revoke button for the new key
-    const revokeBtn = page.locator('#keys-table tr:has-text("revoke-test-key") button:has-text("Revoke")');
-    await revokeBtn.click();
+    // Accept the confirm dialog before clicking revoke
+    page.on('dialog', (dialog) => dialog.accept());
 
-    // After revoke, the key should no longer have a Revoke button
-    await expect(revokeBtn).toBeHidden({ timeout: 5_000 });
+    // Find and click revoke button for the new key
+    const keyRow = page.locator(`#keys-table tr:has-text("${keyName}")`);
+    await keyRow.locator('button:has-text("Revoke")').click();
+
+    // After revoke, the row should show "Revoked" status
+    await expect(keyRow.locator('text=Revoked')).toBeVisible({ timeout: 5_000 });
   });
 
   test('displays copy button for new key', async ({ page }) => {
-    await page.click('button:has-text("Create Key")');
+    await page.click('#page-keys button:has-text("Create Key")');
     await page.fill('#mk-name', 'copy-test');
     await page.click('#modal-create-key button:has-text("Create Key")');
     await expect(page.locator('#new-key-banner')).toBeVisible({ timeout: 5_000 });

@@ -9,39 +9,33 @@ test.describe('Analytics Dashboard', () => {
 
   test('loads analytics page with controls', async ({ page }) => {
     await expect(page.locator('#page-org-analytics')).toBeVisible();
-    // Time range selector should exist
-    await expect(page.locator('#page-org-analytics select, #page-org-analytics [class*="time"], #page-org-analytics button:has-text("7d"), #page-org-analytics button:has-text("30d")').first()).toBeVisible();
+    // Time range selector should exist (custom dropdown with days label)
+    await expect(page.locator('#oa-days-label')).toBeVisible();
   });
 
   test('switches between analytics tabs', async ({ page }) => {
-    // Look for tab buttons (Spend, Activity, Models, Tools)
-    const spendTab = page.locator('button:has-text("Spend"), [data-tab="spend"]').first();
-    const activityTab = page.locator('button:has-text("Activity"), [data-tab="activity"]').first();
+    // Tab buttons live in #oa-tab-bar
+    const spendTab = page.locator('#oa-tab-bar button:has-text("Spend")');
+    const activityTab = page.locator('#oa-tab-bar button:has-text("Activity")');
 
-    if (await spendTab.isVisible()) {
-      await spendTab.click();
-      // Page should still be visible (no crash)
-      await expect(page.locator('#page-org-analytics')).toBeVisible();
-    }
+    await spendTab.click();
+    await expect(page.locator('#page-org-analytics')).toBeVisible();
 
-    if (await activityTab.isVisible()) {
-      await activityTab.click();
-      await expect(page.locator('#page-org-analytics')).toBeVisible();
-    }
+    await activityTab.click();
+    await expect(page.locator('#page-org-analytics')).toBeVisible();
   });
 
   test('has filter dropdowns', async ({ page }) => {
-    // Multi-select filter wrappers should exist
-    const teamFilter = page.locator('#oa-team-wrap, [id*="team-filter"]').first();
-    if (await teamFilter.isVisible()) {
-      await teamFilter.click();
-      // Dropdown should expand
-      await expect(page.locator('#page-org-analytics')).toBeVisible();
-    }
+    // Multi-select team filter wrapper
+    const teamFilter = page.locator('#oa-team-wrap');
+    await expect(teamFilter).toBeVisible();
+    await teamFilter.click();
+    // Dropdown should expand
+    await expect(page.locator('#oa-team-dropdown')).toBeVisible();
   });
 
   test('has CSV export button', async ({ page }) => {
-    const exportBtn = page.locator('button:has-text("CSV"), button:has-text("Export")').first();
+    const exportBtn = page.locator('#page-org-analytics button[onclick="oaExportCsv()"]');
     await expect(exportBtn).toBeVisible();
   });
 });

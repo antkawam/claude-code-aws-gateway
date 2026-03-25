@@ -4,13 +4,36 @@ export const ADMIN_USER = process.env.ADMIN_USERNAME || 'admin';
 export const ADMIN_PASS = process.env.ADMIN_PASSWORD || 'admin';
 export const BASE_URL = process.env.GATEWAY_URL || 'http://localhost:8080';
 
-/** Login via the portal UI and wait for the app shell to appear. */
+/** Get a session token via API. */
+export async function getSessionToken(): Promise<string> {
+  const resp = await fetch(`${BASE_URL}/auth/login`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ username: ADMIN_USER, password: ADMIN_PASS }),
+  });
+  const data = await resp.json();
+  if (!data.token) throw new Error(`Login failed: ${JSON.stringify(data)}`);
+  return data.token;
+}
+
+// Cache the token across tests to avoid hitting the rate limit (10 req/60s).
+let cachedToken: string | null = null;
+
+/**
+ * Login by injecting a session token into localStorage, then navigating to the portal.
+ * This avoids the UI login flow and the gateway's login rate limit.
+ */
 export async function loginViaPortal(page: Page): Promise<void> {
+  if (!cachedToken) cachedToken = await getSessionToken();
+
+  // Navigate to portal to establish the origin, then inject the token
   await page.goto('/portal');
-  await page.waitForSelector('#auth-screen', { state: 'visible' });
-  await page.fill('#auth-username', ADMIN_USER);
-  await page.fill('#auth-password', ADMIN_PASS);
-  await page.click('button:has-text("Sign in")');
+  await page.evaluate((token) => {
+    localStorage.setItem('proxyApiKey', token);
+  }, cachedToken);
+
+  // Reload so the init() function picks up the token from localStorage
+  await page.reload();
   await page.waitForSelector('#app-shell', { state: 'visible', timeout: 10_000 });
 }
 
@@ -37,15 +60,4 @@ export async function apiCall(
   if (body) opts.body = JSON.stringify(body);
   const resp = await fetch(`${BASE_URL}${path}`, opts);
   return resp.json();
-}
-
-/** Get a session token via API (for setup operations). */
-export async function getSessionToken(): Promise<string> {
-  const resp = await fetch(`${BASE_URL}/auth/login`, {
-    method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ username: ADMIN_USER, password: ADMIN_PASS }),
-  });
-  const data = await resp.json();
-  return data.token;
 }

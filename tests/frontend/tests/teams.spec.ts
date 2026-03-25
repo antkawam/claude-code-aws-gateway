@@ -9,13 +9,13 @@ test.describe('Team Management', () => {
 
   test('creates a new team', async ({ page }) => {
     // Click add team button
-    await page.click('button:has-text("Add Team")');
+    await page.click('button:has-text("Create Team")');
     await expect(page.locator('#modal-create-team')).toBeVisible();
 
     // Fill team name and submit
     const teamName = `test-team-${Date.now()}`;
     await page.fill('#mt-name', teamName);
-    await page.click('#modal-create-team button:has-text("Create")');
+    await page.click('#modal-create-team button:has-text("Create Team")');
 
     // Team should appear in the list
     await expect(page.locator('#page-budgets')).toContainText(teamName, { timeout: 5_000 });
@@ -23,10 +23,10 @@ test.describe('Team Management', () => {
 
   test('sets a team budget', async ({ page }) => {
     // Create team first
-    await page.click('button:has-text("Add Team")');
+    await page.click('button:has-text("Create Team")');
     const teamName = `budget-team-${Date.now()}`;
     await page.fill('#mt-name', teamName);
-    await page.click('#modal-create-team button:has-text("Create")');
+    await page.click('#modal-create-team button:has-text("Create Team")');
     await expect(page.locator('#page-budgets')).toContainText(teamName, { timeout: 5_000 });
 
     // Click budget edit for this team
@@ -46,10 +46,10 @@ test.describe('Team Management', () => {
 
   test('opens team members panel', async ({ page }) => {
     // Create team first
-    await page.click('button:has-text("Add Team")');
+    await page.click('button:has-text("Create Team")');
     const teamName = `members-team-${Date.now()}`;
     await page.fill('#mt-name', teamName);
-    await page.click('#modal-create-team button:has-text("Create")');
+    await page.click('#modal-create-team button:has-text("Create Team")');
     await expect(page.locator('#page-budgets')).toContainText(teamName, { timeout: 5_000 });
 
     // Click on team name or members button to open members panel
@@ -64,10 +64,10 @@ test.describe('Team Management', () => {
 
   test('deletes a team', async ({ page }) => {
     // Create team first
-    await page.click('button:has-text("Add Team")');
+    await page.click('button:has-text("Create Team")');
     const teamName = `delete-team-${Date.now()}`;
     await page.fill('#mt-name', teamName);
-    await page.click('#modal-create-team button:has-text("Create")');
+    await page.click('#modal-create-team button:has-text("Create Team")');
     await expect(page.locator('#page-budgets')).toContainText(teamName, { timeout: 5_000 });
 
     // Find and click delete button for this team
@@ -76,7 +76,7 @@ test.describe('Team Management', () => {
     if (await deleteBtn.isVisible()) {
       await deleteBtn.click();
       // Confirm deletion
-      const confirmBtn = page.locator('#modal-delete-team button:has-text("Delete")');
+      const confirmBtn = page.locator('#modal-delete-team button:has-text("Delete Team")');
       if (await confirmBtn.isVisible({ timeout: 2_000 }).catch(() => false)) {
         await confirmBtn.click();
       }

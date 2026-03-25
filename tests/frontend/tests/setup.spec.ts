@@ -19,17 +19,14 @@ test.describe('Setup / Connect Flow', () => {
     await loginViaPortal(page);
     await navigateTo(page, 'setup');
 
-    // Click the "Create Key & Setup" button
-    const createBtn = page.locator('button:has-text("Create Key")').first();
-    if (await createBtn.isVisible()) {
+    // Wait for dynamic setup content to render, then click "Create Key & Setup"
+    const createBtn = page.locator('#page-setup button:has-text("Create Key")').first();
+    if (await createBtn.isVisible({ timeout: 5_000 }).catch(() => false)) {
       await createBtn.click();
-      // Should show setup command with the gateway URL
-      await page.waitForTimeout(1_000);
       // Look for a terminal/code block with setup instructions
-      const setupBlock = page.locator('pre, code, .terminal, [class*="setup-cmd"]').first();
-      if (await setupBlock.isVisible({ timeout: 3_000 }).catch(() => false)) {
+      const setupBlock = page.locator('#page-setup pre, #page-setup code, #page-setup .terminal, #page-setup [class*="setup-cmd"]').first();
+      if (await setupBlock.isVisible({ timeout: 5_000 }).catch(() => false)) {
         const text = await setupBlock.textContent();
-        // Should reference the current host
         expect(text).toBeTruthy();
       }
     }
@@ -39,13 +36,12 @@ test.describe('Setup / Connect Flow', () => {
     await loginViaPortal(page);
     await navigateTo(page, 'setup');
 
-    const createBtn = page.locator('button:has-text("Create Key")').first();
-    if (await createBtn.isVisible()) {
+    const createBtn = page.locator('#page-setup button:has-text("Create Key")').first();
+    if (await createBtn.isVisible({ timeout: 5_000 }).catch(() => false)) {
       await createBtn.click();
-      await page.waitForTimeout(1_000);
       // Copy button should be available
       const copyBtn = page.locator('#page-setup button:has-text("Copy")').first();
-      if (await copyBtn.isVisible({ timeout: 3_000 }).catch(() => false)) {
+      if (await copyBtn.isVisible({ timeout: 5_000 }).catch(() => false)) {
         await expect(copyBtn).toBeVisible();
       }
     }
