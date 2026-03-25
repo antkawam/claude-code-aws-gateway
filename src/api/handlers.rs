@@ -71,6 +71,42 @@ struct RequestInfo {
     detection_flags: Option<Value>,
 }
 
+/// GET /v1/models — List available Claude models (Anthropic API format).
+/// Required by Claude for Excel/PowerPoint add-ins.
+pub async fn list_models() -> Response {
+    let models = vec![
+        ("claude-opus-4-6-20250605", "Claude Opus 4.6"),
+        ("claude-sonnet-4-6-20250514", "Claude Sonnet 4.6"),
+        ("claude-opus-4-5-20251101", "Claude Opus 4.5"),
+        ("claude-sonnet-4-5-20250929", "Claude Sonnet 4.5"),
+        ("claude-sonnet-4-20250514", "Claude Sonnet 4"),
+        ("claude-haiku-4-5-20251001", "Claude Haiku 4.5"),
+    ];
+
+    let data: Vec<serde_json::Value> = models
+        .iter()
+        .map(|(id, name)| {
+            json!({
+                "id": id,
+                "display_name": name,
+                "type": "model",
+                "created_at": "2025-01-01T00:00:00Z",
+            })
+        })
+        .collect();
+
+    (
+        StatusCode::OK,
+        Json(json!({
+            "data": data,
+            "has_more": false,
+            "first_id": data.first().map(|m| m["id"].as_str().unwrap_or("")),
+            "last_id": data.last().map(|m| m["id"].as_str().unwrap_or("")),
+        })),
+    )
+        .into_response()
+}
+
 pub async fn health(State(state): State<Arc<GatewayState>>) -> Response {
     let mut status = "ok";
     let mut db_ok = true;
@@ -2185,5 +2221,52 @@ mod tests {
         let info = extract_request_info(&req);
         assert!(info.system_prompt_hash.is_some());
         assert_eq!(info.system_prompt_hash.as_ref().unwrap().len(), 16);
+    }
+
+    #[tokio::test]
+    async fn test_list_models_response() {
+        let response = list_models().await;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+
+        // Verify structure
+        assert_eq!(json["has_more"], false);
+        let data = json["data"].as_array().unwrap();
+        assert!(!data.is_empty());
+
+        // Verify each model has required fields
+        for model in data {
+            assert!(model["id"].is_string());
+            assert!(model["display_name"].is_string());
+            assert_eq!(model["type"], "model");
+            assert!(model["created_at"].is_string());
+        }
+
+        // Verify first/last IDs match data
+        assert_eq!(json["first_id"], data.first().unwrap()["id"]);
+        assert_eq!(json["last_id"], data.last().unwrap()["id"]);
+    }
+
+    #[tokio::test]
+    async fn test_list_models_contains_known_models() {
+        let response = list_models().await;
+        let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        let ids: Vec<&str> = json["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["id"].as_str().unwrap())
+            .collect();
+
+        assert!(ids.contains(&"claude-sonnet-4-6-20250514"));
+        assert!(ids.contains(&"claude-opus-4-6-20250605"));
+        assert!(ids.contains(&"claude-haiku-4-5-20251001"));
     }
 }

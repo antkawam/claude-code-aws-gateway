@@ -16,5 +16,6 @@ A purpose-built gateway for running Claude Code through Amazon Bedrock. One-comm
 - [Web Search](web-search.md). Search provider configuration (DuckDuckGo, Tavily, Serper, custom).
 - [Upgrading](upgrading.md). Upgrade flow, database migrations, rollback procedures.
 - [Metrics](metrics.md). Prometheus scrape endpoint, OTLP export, metric reference, Grafana examples.
+- [Office Integration](office-integration.md). Claude for Excel and PowerPoint via Enterprise gateway.
 - [CLI Reference](cli-reference.md). `ccag` command reference.
 - [FAQ](faq.md). Common questions on setup, features, operations, and troubleshooting.
