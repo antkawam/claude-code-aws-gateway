@@ -203,6 +203,18 @@ Database migrations run automatically on startup. See [Upgrading](upgrading.md) 
 
 CCAG adds 1-5ms of latency for request translation. The gateway is written in Rust (axum/tokio) and processes requests asynchronously. The primary latency is Bedrock's inference time (typically hundreds of milliseconds); the gateway adds 1-5ms.
 
+### Does CCAG work with Claude for Excel and PowerPoint?
+
+Yes. The Claude for Excel and PowerPoint add-ins support connecting via an "Enterprise gateway" instead of a direct Claude account. CCAG is compatible with this integration.
+
+In the add-in's sign-in screen, select **Enterprise gateway**, enter your CCAG gateway URL (must be HTTPS) and a virtual key (`sk-proxy-...`). The add-in connects to your gateway and routes all requests through Bedrock — no Claude subscription required.
+
+See [Office Integration](office-integration.md) for setup details and requirements.
+
+### Does CCAG work with Claude Code Desktop?
+
+No. Claude Code Desktop (the Code tab in the Claude desktop app) connects directly to Anthropic's API and does not support custom gateways or `ANTHROPIC_BASE_URL`. Use the Claude Code CLI or IDE extensions (VS Code, JetBrains) instead — both support custom gateways via `ANTHROPIC_BASE_URL`.
+
 ---
 
 ## Troubleshooting

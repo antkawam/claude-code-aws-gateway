@@ -6,13 +6,16 @@ pub mod mock_bedrock;
 
 use std::sync::Arc;
 
+use axum::http::HeaderValue;
 use axum::{
     Router,
     extract::State,
+    http::Method,
     response::{Html, IntoResponse, Redirect},
     routing::{delete, get, post, put},
 };
 use subtle::ConstantTimeEq;
+use tower_http::cors::{AllowHeaders, AllowOrigin, CorsLayer};
 
 use crate::proxy::GatewayState;
 
@@ -25,6 +28,7 @@ pub fn router(state: Arc<GatewayState>) -> Router {
         .route("/health/deep", get(handlers::health_deep))
         .route("/v1/messages", post(handlers::messages))
         .route("/v1/messages/count_tokens", post(handlers::count_tokens))
+        .route("/v1/models", get(handlers::list_models))
         // Admin API — Keys
         .route("/admin/keys", post(admin::create_key))
         .route("/admin/keys", get(admin::list_keys))
@@ -180,6 +184,20 @@ pub fn router(state: Arc<GatewayState>) -> Router {
         .route("/portal", get(portal))
         .route("/metrics", get(prometheus_metrics))
         .with_state(state)
+        .layer(
+            CorsLayer::new()
+                .allow_origin(AllowOrigin::predicate(|origin: &HeaderValue, _| {
+                    is_allowed_cors_origin(origin)
+                }))
+                .allow_methods([
+                    Method::GET,
+                    Method::POST,
+                    Method::PUT,
+                    Method::DELETE,
+                    Method::OPTIONS,
+                ])
+                .allow_headers(AllowHeaders::mirror_request()),
+        )
 }
 
 async fn portal() -> impl IntoResponse {
@@ -338,7 +356,7 @@ static SETUP_SCRIPT_SSO: &str = r##"#!/bin/bash
 set -euo pipefail
 
 PROXY_HOST="__PROXY_HOST__"
-PROXY_URL="https://${PROXY_HOST}"
+PROXY_URL="__PROXY_URL__"
 SCOPE="__SCOPE__"
 
 if [ "${SCOPE}" = "project" ]; then
@@ -489,7 +507,7 @@ fi
 static SETUP_SCRIPT_APIKEY: &str = r##"#!/bin/bash
 set -euo pipefail
 
-PROXY_URL="https://__PROXY_HOST__"
+PROXY_URL="__PROXY_URL__"
 CLAUDE_DIR="${HOME}/.claude"
 SETTINGS_FILE="${CLAUDE_DIR}/settings.json"
 
@@ -628,7 +646,7 @@ static PROXY_LOGIN_SCRIPT_PS1: &str = include_str!("proxy_login.ps1");
 static SETUP_SCRIPT_SSO_PS1: &str = r##"$ErrorActionPreference = 'Stop'
 
 $ProxyHost = '__PROXY_HOST__'
-$ProxyUrl = 'https://__PROXY_HOST__'
+$ProxyUrl = '__PROXY_URL__'
 $Scope = '__SCOPE__'
 
 if ($Scope -eq 'project') {
@@ -850,7 +868,19 @@ async fn auth_setup(
         .and_then(|h| h.to_str().ok())
         .unwrap_or("localhost");
     let host_no_port = host.split(':').next().unwrap_or(host);
-    let proxy_url = format!("https://{}", host_no_port);
+    // Detect scheme: trust X-Forwarded-Proto from reverse proxies,
+    // otherwise default to http for localhost, https for everything else.
+    let scheme = headers
+        .get("x-forwarded-proto")
+        .and_then(|h| h.to_str().ok())
+        .unwrap_or_else(|| {
+            if host_no_port == "localhost" || host_no_port == "127.0.0.1" {
+                "http"
+            } else {
+                "https"
+            }
+        });
+    let proxy_url = format!("{}://{}", scheme, host);
 
     // Parse platform query param: "windows" or default "unix"
     let is_windows = uri
@@ -979,11 +1009,24 @@ async fn auth_setup(
         }
         None => {
             // No IDP: API key instructions only
-            SETUP_SCRIPT_APIKEY.replace("__PROXY_HOST__", host_no_port)
+            SETUP_SCRIPT_APIKEY
+                .replace("__PROXY_HOST__", host_no_port)
+                .replace("__PROXY_URL__", &proxy_url)
         }
     };
 
     ([(axum::http::header::CONTENT_TYPE, "text/plain")], script).into_response()
+}
+
+/// Check if an origin is allowed for CORS.
+/// Permits `https://claude.ai` and `https://*.claude.ai` (e.g. `pivot.claude.ai`).
+fn is_allowed_cors_origin(origin: &HeaderValue) -> bool {
+    origin
+        .to_str()
+        .map(|s| {
+            s == "https://claude.ai" || (s.ends_with(".claude.ai") && s.starts_with("https://"))
+        })
+        .unwrap_or(false)
 }
 
 async fn prometheus_metrics(
@@ -1002,4 +1045,62 @@ async fn prometheus_metrics(
         state.metrics.prometheus_text(),
     )
         .into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_cors_allows_claude_ai() {
+        assert!(is_allowed_cors_origin(&HeaderValue::from_static(
+            "https://claude.ai"
+        )));
+    }
+
+    #[test]
+    fn test_cors_allows_subdomain() {
+        assert!(is_allowed_cors_origin(&HeaderValue::from_static(
+            "https://pivot.claude.ai"
+        )));
+        assert!(is_allowed_cors_origin(&HeaderValue::from_static(
+            "https://excel.claude.ai"
+        )));
+        assert!(is_allowed_cors_origin(&HeaderValue::from_static(
+            "https://anything.claude.ai"
+        )));
+    }
+
+    #[test]
+    fn test_cors_blocks_unrelated_origins() {
+        assert!(!is_allowed_cors_origin(&HeaderValue::from_static(
+            "https://evil.com"
+        )));
+        assert!(!is_allowed_cors_origin(&HeaderValue::from_static(
+            "https://example.com"
+        )));
+    }
+
+    #[test]
+    fn test_cors_blocks_http() {
+        assert!(!is_allowed_cors_origin(&HeaderValue::from_static(
+            "http://claude.ai"
+        )));
+        assert!(!is_allowed_cors_origin(&HeaderValue::from_static(
+            "http://pivot.claude.ai"
+        )));
+    }
+
+    #[test]
+    fn test_cors_blocks_suffix_spoofing() {
+        assert!(!is_allowed_cors_origin(&HeaderValue::from_static(
+            "https://fakeclaude.ai"
+        )));
+        assert!(!is_allowed_cors_origin(&HeaderValue::from_static(
+            "https://notclaude.ai"
+        )));
+        assert!(!is_allowed_cors_origin(&HeaderValue::from_static(
+            "https://evil.claude.ai.attacker.com"
+        )));
+    }
 }
