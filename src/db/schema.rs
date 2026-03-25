@@ -78,4 +78,5 @@ pub struct IdentityProvider {
     pub source: String,
     pub created_at: DateTime<Utc>,
     pub user_claim: Option<String>,
+    pub scopes: Option<String>,
 }

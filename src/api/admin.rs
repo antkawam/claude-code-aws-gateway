@@ -1542,6 +1542,7 @@ pub struct CreateIdpRequest {
     pub default_role: String,
     pub allowed_domains: Option<Vec<String>>,
     pub user_claim: Option<String>,
+    pub scopes: Option<String>,
 }
 
 fn default_flow_type() -> String {
@@ -1570,6 +1571,7 @@ pub async fn create_idp(
         &body.default_role,
         body.allowed_domains.as_deref(),
         body.user_claim.as_deref(),
+        body.scopes.as_deref(),
     )
     .await
     {
@@ -1615,6 +1617,7 @@ pub struct UpdateIdpRequest {
     #[serde(default = "default_true")]
     pub enabled: bool,
     pub user_claim: Option<String>,
+    pub scopes: Option<String>,
 }
 
 fn default_true() -> bool {
@@ -1646,6 +1649,7 @@ pub async fn update_idp(
         body.allowed_domains.as_deref(),
         body.enabled,
         body.user_claim.as_deref(),
+        body.scopes.as_deref(),
     )
     .await
     {

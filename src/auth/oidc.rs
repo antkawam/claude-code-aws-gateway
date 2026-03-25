@@ -22,6 +22,9 @@ pub struct IdpConfig {
     /// None or "auto" = fallback chain: email > preferred_username > upn > name > sub.
     /// Explicit values: "email", "preferred_username", "upn", "oid", "name", "sub".
     pub user_claim: Option<String>,
+    /// OIDC scopes to request during login redirect.
+    /// None or empty = "openid" (safe default). Example: "openid email profile".
+    pub scopes: Option<String>,
 }
 
 impl IdpConfig {
@@ -30,6 +33,7 @@ impl IdpConfig {
         let audience = std::env::var("OIDC_AUDIENCE").ok();
         let jwks_url = std::env::var("OIDC_JWKS_URL").ok();
         let user_claim = std::env::var("OIDC_USER_CLAIM").ok();
+        let scopes = std::env::var("OIDC_SCOPES").ok();
 
         // Derive a friendly name from the issuer URL, or allow explicit override
         let name = std::env::var("OIDC_NAME").unwrap_or_else(|_| {
@@ -53,6 +57,7 @@ impl IdpConfig {
             default_role: "member".to_string(),
             allowed_domains: None,
             user_claim,
+            scopes,
         })
     }
 
@@ -66,6 +71,7 @@ impl IdpConfig {
             default_role: row.default_role.clone(),
             allowed_domains: row.allowed_domains.clone(),
             user_claim: row.user_claim.clone(),
+            scopes: row.scopes.clone(),
         }
     }
 
@@ -464,6 +470,7 @@ mod tests {
             default_role: "member".to_string(),
             allowed_domains: None,
             user_claim: None,
+            scopes: None,
         };
 
         validator.load_idps(vec![config]).await;
@@ -638,6 +645,7 @@ mod tests {
                 default_role: "member".to_string(),
                 allowed_domains: None,
                 user_claim: None,
+                scopes: None,
             },
             IdpConfig {
                 name: "IDP-B".to_string(),
@@ -648,6 +656,7 @@ mod tests {
                 default_role: "member".to_string(),
                 allowed_domains: None,
                 user_claim: None,
+                scopes: None,
             },
         ];
         validator.load_idps(configs).await;
@@ -720,6 +729,7 @@ mod tests {
             default_role: "member".to_string(),
             allowed_domains: None,
             user_claim: None,
+            scopes: None,
         };
         validator.load_idps(vec![config]).await;
 
@@ -761,6 +771,7 @@ mod tests {
             default_role: "member".to_string(),
             allowed_domains: Some(vec!["@allowed.com".to_string()]),
             user_claim: None,
+            scopes: None,
         };
         validator.load_idps(vec![config]).await;
         {
@@ -816,6 +827,7 @@ mod tests {
             default_role: "member".to_string(),
             allowed_domains: None,
             user_claim: None,
+            scopes: None,
         };
         validator.load_idps(vec![config]).await;
         {
@@ -852,6 +864,7 @@ mod tests {
             default_role: "member".to_string(),
             allowed_domains: None,
             user_claim: None,
+            scopes: None,
         };
         validator.load_idps(vec![config.clone()]).await;
         {
@@ -882,6 +895,7 @@ mod tests {
             default_role: "member".to_string(),
             allowed_domains: None,
             user_claim: None,
+            scopes: None,
         };
         assert_eq!(
             config.effective_jwks_url(),
@@ -900,6 +914,7 @@ mod tests {
             default_role: "member".to_string(),
             allowed_domains: None,
             user_claim: None,
+            scopes: None,
         };
         assert_eq!(
             config.effective_jwks_url(),

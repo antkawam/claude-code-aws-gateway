@@ -17,11 +17,12 @@ pub async fn create_idp(
     default_role: &str,
     allowed_domains: Option<&[String]>,
     user_claim: Option<&str>,
+    scopes: Option<&str>,
 ) -> anyhow::Result<IdentityProvider> {
     let row = sqlx::query_as::<_, IdentityProvider>(
         r#"INSERT INTO identity_providers
-            (name, issuer_url, client_id, audience, jwks_url, flow_type, auto_provision, default_role, allowed_domains, user_claim, source)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'admin')
+            (name, issuer_url, client_id, audience, jwks_url, flow_type, auto_provision, default_role, allowed_domains, user_claim, scopes, source)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, 'admin')
             RETURNING *"#,
     )
     .bind(name)
@@ -34,6 +35,7 @@ pub async fn create_idp(
     .bind(default_role)
     .bind(allowed_domains)
     .bind(user_claim)
+    .bind(scopes)
     .fetch_one(pool)
     .await?;
 
@@ -74,12 +76,13 @@ pub async fn update_idp(
     allowed_domains: Option<&[String]>,
     enabled: bool,
     user_claim: Option<&str>,
+    scopes: Option<&str>,
 ) -> anyhow::Result<bool> {
     let result = sqlx::query(
         r#"UPDATE identity_providers SET
             name = $2, issuer_url = $3, client_id = $4, audience = $5,
             jwks_url = $6, flow_type = $7, auto_provision = $8,
-            default_role = $9, allowed_domains = $10, enabled = $11, user_claim = $12
+            default_role = $9, allowed_domains = $10, enabled = $11, user_claim = $12, scopes = $13
             WHERE id = $1 AND source = 'admin'"#,
     )
     .bind(id)
@@ -94,6 +97,7 @@ pub async fn update_idp(
     .bind(allowed_domains)
     .bind(enabled)
     .bind(user_claim)
+    .bind(scopes)
     .execute(pool)
     .await?;
 

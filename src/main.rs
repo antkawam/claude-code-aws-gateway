@@ -658,6 +658,7 @@ async fn seed_env_idp(pool: &sqlx::PgPool, env_idp: &auth::oidc::IdpConfig) {
         &env_idp.default_role,
         None,
         env_idp.user_claim.as_deref(),
+        env_idp.scopes.as_deref(),
     )
     .await
     {

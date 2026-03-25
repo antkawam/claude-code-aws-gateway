@@ -2577,6 +2577,11 @@ input[type="date"].oa-filter-select { background-image: none; padding-right: 8px
           <option value="sub">sub (opaque identifier)</option>
         </select>
       </div>
+      <div class="form-group">
+        <label class="form-label">OIDC Scopes</label>
+        <input class="form-input" id="mi-scopes" placeholder="openid (default)">
+        <small style="color:var(--text-muted);font-size:11px">Space-separated. Use "openid email profile" for Entra/Okta if email claim is needed.</small>
+      </div>
     </div>
     <div class="modal-footer">
       <button class="btn btn-secondary" onclick="closeModal()">Cancel</button>
@@ -5437,6 +5442,7 @@ function showIdpModal(idp) {
   document.getElementById('mi-role').value = idp ? (idp.default_role || 'member') : 'member';
   document.getElementById('mi-auto-provision').checked = idp ? idp.auto_provision : true;
   document.getElementById('mi-user-claim').value = idp ? (idp.user_claim || '') : '';
+  document.getElementById('mi-scopes').value = idp ? (idp.scopes || '') : '';
   document.getElementById('modal-idp').style.display = 'flex';
   setTimeout(() => document.getElementById('mi-name').focus(), 100);
 }
@@ -5457,6 +5463,7 @@ async function saveIdp() {
     default_role: document.getElementById('mi-role').value,
     auto_provision: document.getElementById('mi-auto-provision').checked,
     user_claim: document.getElementById('mi-user-claim').value || undefined,
+    scopes: document.getElementById('mi-scopes').value.trim() || undefined,
   };
   if (!body.name || !body.issuer_url) { toast('Name and Issuer URL are required', 'error'); return; }
 

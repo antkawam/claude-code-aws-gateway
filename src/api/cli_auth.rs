@@ -239,8 +239,37 @@ async fn build_auth_url(
     // Cryptographically random nonce
     let nonce = format!("{:032x}", rand::random::<u128>());
 
+    // Determine OIDC scopes: explicit per-IDP config takes priority.
+    // If not set, infer from user_claim: claims like email/preferred_username/upn
+    // need the email+profile scopes on some IDPs (e.g. Entra).
+    // Default to just "openid" (safe for IDPs like Midway that reject extra scopes).
+    let scopes = idp
+        .scopes
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| {
+            match idp.user_claim.as_deref() {
+                Some("email") | Some("preferred_username") | Some("upn") | Some("name") | Some("auto") =>
+                    "openid email profile",
+                None => {
+                    // Auto-detect: if user_claim is unset (auto fallback chain starts with email),
+                    // only request broader scopes if the IDP looks like it needs them.
+                    // Heuristic: Entra/Okta/Google issuers benefit from email+profile scopes;
+                    // others (Midway, custom) may reject them.
+                    let issuer = idp.issuer.to_lowercase();
+                    if issuer.contains("microsoftonline") || issuer.contains("okta") || issuer.contains("accounts.google") {
+                        "openid email profile"
+                    } else {
+                        "openid"
+                    }
+                }
+                _ => "openid",
+            }
+        });
+    let encoded_scopes = scopes.replace(' ', "%20");
+
     Some(format!(
-        "{authorize_endpoint}{separator}response_type=id_token&client_id={audience}&redirect_uri={redirect_uri}&state={session_id}&nonce={nonce}&scope=openid%20email%20profile"
+        "{authorize_endpoint}{separator}response_type=id_token&client_id={audience}&redirect_uri={redirect_uri}&state={session_id}&nonce={nonce}&scope={encoded_scopes}"
     ))
 }
 
