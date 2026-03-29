@@ -66,6 +66,46 @@ impl SearchProvider {
         }
     }
 
+    /// Construct a `SearchProvider` from a global config JSON object (as stored in proxy_settings).
+    /// Expected fields: provider_type (required), api_key, api_url, max_results.
+    pub fn from_global_config(config: &serde_json::Value) -> anyhow::Result<Self> {
+        let provider_type = config
+            .get("provider_type")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow::anyhow!("provider_type is required"))?;
+
+        let api_key = config.get("api_key").and_then(|v| v.as_str()).map(|s| s.to_string());
+        let api_url = config.get("api_url").and_then(|v| v.as_str()).map(|s| s.to_string());
+        let max_results = config
+            .get("max_results")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(5) as usize;
+        let max_results = max_results.clamp(1, 20);
+
+        match provider_type {
+            "duckduckgo" => Ok(Self::DuckDuckGo { max_results }),
+            "tavily" => {
+                let api_key = api_key
+                    .filter(|k| !k.is_empty())
+                    .ok_or_else(|| anyhow::anyhow!("Tavily requires an API key"))?;
+                Ok(Self::Tavily { api_key, max_results })
+            }
+            "serper" => {
+                let api_key = api_key
+                    .filter(|k| !k.is_empty())
+                    .ok_or_else(|| anyhow::anyhow!("Serper requires an API key"))?;
+                Ok(Self::Serper { api_key, max_results })
+            }
+            "custom" => {
+                let api_url = api_url
+                    .filter(|u| !u.is_empty())
+                    .ok_or_else(|| anyhow::anyhow!("Custom provider requires an API URL"))?;
+                Ok(Self::Custom { api_url, api_key, max_results })
+            }
+            other => anyhow::bail!("Unknown search provider: {}", other),
+        }
+    }
+
     pub fn provider_name(&self) -> &str {
         match self {
             Self::DuckDuckGo { .. } => "duckduckgo",
@@ -402,5 +442,135 @@ mod tests {
             updated_at: chrono::Utc::now(),
         };
         assert!(SearchProvider::from_config(&config).is_err());
+    }
+
+    // ============================================================
+    // Round 3: Global provider construction from config JSON
+    // ============================================================
+    // These test SearchProvider::from_global_config() which doesn't exist yet.
+    // They will fail to compile until the method is implemented.
+
+    #[test]
+    fn test_search_provider_from_config_json_tavily() {
+        // Given a global config JSON (as stored in proxy_settings), construct a SearchProvider
+        let config = serde_json::json!({
+            "provider_type": "tavily",
+            "api_key": "tvly-test-key-123",
+            "max_results": 5
+        });
+        let provider = SearchProvider::from_global_config(&config)
+            .expect("Should construct Tavily provider from global config JSON");
+        assert_eq!(provider.provider_name(), "tavily");
+        // Verify max_results is respected
+        match provider {
+            SearchProvider::Tavily { api_key, max_results } => {
+                assert_eq!(api_key, "tvly-test-key-123");
+                assert_eq!(max_results, 5);
+            }
+            _ => panic!("Expected Tavily variant, got {:?}", provider),
+        }
+    }
+
+    #[test]
+    fn test_search_provider_from_config_json_duckduckgo() {
+        // DuckDuckGo doesn't need an API key
+        let config = serde_json::json!({
+            "provider_type": "duckduckgo",
+            "max_results": 10
+        });
+        let provider = SearchProvider::from_global_config(&config)
+            .expect("Should construct DuckDuckGo provider from global config JSON");
+        assert_eq!(provider.provider_name(), "duckduckgo");
+        match provider {
+            SearchProvider::DuckDuckGo { max_results } => {
+                assert_eq!(max_results, 10);
+            }
+            _ => panic!("Expected DuckDuckGo variant, got {:?}", provider),
+        }
+    }
+
+    #[test]
+    fn test_search_provider_from_config_json_serper() {
+        let config = serde_json::json!({
+            "provider_type": "serper",
+            "api_key": "serper-key-456",
+            "max_results": 7
+        });
+        let provider = SearchProvider::from_global_config(&config)
+            .expect("Should construct Serper provider from global config JSON");
+        assert_eq!(provider.provider_name(), "serper");
+        match provider {
+            SearchProvider::Serper { api_key, max_results } => {
+                assert_eq!(api_key, "serper-key-456");
+                assert_eq!(max_results, 7);
+            }
+            _ => panic!("Expected Serper variant, got {:?}", provider),
+        }
+    }
+
+    #[test]
+    fn test_search_provider_from_config_json_custom() {
+        let config = serde_json::json!({
+            "provider_type": "custom",
+            "api_url": "https://my-search.example.com/api",
+            "api_key": "custom-key",
+            "max_results": 3
+        });
+        let provider = SearchProvider::from_global_config(&config)
+            .expect("Should construct Custom provider from global config JSON");
+        assert_eq!(provider.provider_name(), "custom");
+        match provider {
+            SearchProvider::Custom { api_url, api_key, max_results } => {
+                assert_eq!(api_url, "https://my-search.example.com/api");
+                assert_eq!(api_key.as_deref(), Some("custom-key"));
+                assert_eq!(max_results, 3);
+            }
+            _ => panic!("Expected Custom variant, got {:?}", provider),
+        }
+    }
+
+    #[test]
+    fn test_search_provider_from_config_json_missing_type() {
+        // Config with no provider_type should fail
+        let config = serde_json::json!({
+            "api_key": "some-key",
+            "max_results": 5
+        });
+        let result = SearchProvider::from_global_config(&config);
+        assert!(
+            result.is_err(),
+            "from_global_config should fail when provider_type is missing"
+        );
+    }
+
+    #[test]
+    fn test_search_provider_from_config_json_tavily_no_key() {
+        // Tavily requires an API key -- should fail
+        let config = serde_json::json!({
+            "provider_type": "tavily",
+            "max_results": 5
+        });
+        let result = SearchProvider::from_global_config(&config);
+        assert!(
+            result.is_err(),
+            "from_global_config should fail for Tavily without api_key"
+        );
+    }
+
+    #[test]
+    fn test_search_provider_from_config_json_max_results_clamped() {
+        // max_results should be clamped to [1, 20]
+        let config = serde_json::json!({
+            "provider_type": "duckduckgo",
+            "max_results": 100
+        });
+        let provider = SearchProvider::from_global_config(&config)
+            .expect("Should construct provider even with out-of-range max_results");
+        match provider {
+            SearchProvider::DuckDuckGo { max_results } => {
+                assert_eq!(max_results, 20, "max_results should be clamped to 20");
+            }
+            _ => panic!("Expected DuckDuckGo variant"),
+        }
     }
 }

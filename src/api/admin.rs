@@ -3323,12 +3323,37 @@ pub async fn set_websearch_mode(
         }
     }
 
-    // When mode is "global", require provider config
-    if body.mode == "global" && body.provider.is_none() {
-        return error_response(
-            StatusCode::BAD_REQUEST,
-            "Provider configuration is required when mode is 'global'",
-        );
+    // When mode is "global", require provider config with a valid provider_type
+    if body.mode == "global" {
+        match &body.provider {
+            None => {
+                return error_response(
+                    StatusCode::BAD_REQUEST,
+                    "Provider configuration is required when mode is 'global'",
+                );
+            }
+            Some(provider) => {
+                let valid_types = ["duckduckgo", "tavily", "serper", "custom"];
+                match provider.get("provider_type").and_then(|v| v.as_str()) {
+                    Some(pt) if valid_types.contains(&pt) => {}
+                    Some(pt) => {
+                        return error_response(
+                            StatusCode::BAD_REQUEST,
+                            &format!(
+                                "Invalid provider_type '{}'. Must be one of: duckduckgo, tavily, serper, custom",
+                                pt
+                            ),
+                        );
+                    }
+                    None => {
+                        return error_response(
+                            StatusCode::BAD_REQUEST,
+                            "provider_type is required in the provider configuration. Must be one of: duckduckgo, tavily, serper, custom",
+                        );
+                    }
+                }
+            }
+        }
     }
 
     let pool = state.db().await;

@@ -528,3 +528,208 @@ async fn test_mode_change_to_enabled_clears_global_provider() {
         json
     );
 }
+
+// ============================================================
+// Round 3: Wiring websearch mode into handler + global provider
+// ============================================================
+
+// Test A: Websearch mode is stored in a way the handler can consume
+// (verifies the DB → settings → handler data path works end-to-end)
+#[tokio::test]
+async fn test_websearch_mode_available_in_state() {
+    let pool = helpers::setup_test_db().await;
+    let (app, token) = test_app(&pool).await;
+
+    // Set mode to "disabled"
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/admin/websearch-mode")
+                .header("authorization", format!("Bearer {token}"))
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"mode": "disabled"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // Verify the mode is readable from the DB settings table directly.
+    // This is the same path the handler would use to read the mode.
+    let mode = ccag::db::settings::get_setting(&pool, "websearch_mode")
+        .await
+        .unwrap()
+        .unwrap_or_else(|| "enabled".to_string());
+    assert_eq!(
+        mode, "disabled",
+        "Handler should be able to read websearch_mode='disabled' from settings"
+    );
+
+    // Now set mode to "global" and verify the handler can read both mode and provider
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/admin/websearch-mode")
+                .header("authorization", format!("Bearer {token}"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{
+                        "mode": "global",
+                        "provider": {
+                            "provider_type": "tavily",
+                            "api_key": "tvly-test-key",
+                            "max_results": 5
+                        }
+                    }"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let mode = ccag::db::settings::get_setting(&pool, "websearch_mode")
+        .await
+        .unwrap()
+        .unwrap_or_else(|| "enabled".to_string());
+    assert_eq!(mode, "global");
+
+    let provider_json = ccag::db::settings::get_setting(&pool, "websearch_global_provider")
+        .await
+        .unwrap()
+        .expect("Global provider config should be stored in settings");
+    let provider: serde_json::Value = serde_json::from_str(&provider_json).unwrap();
+    assert_eq!(provider["provider_type"], "tavily");
+    assert_eq!(provider["api_key"], "tvly-test-key");
+    assert_eq!(provider["max_results"], 5);
+}
+
+// Test B: Global provider config is complete and usable for SearchProvider construction
+#[tokio::test]
+async fn test_global_provider_config_complete() {
+    let pool = helpers::setup_test_db().await;
+    let (app, token) = test_app(&pool).await;
+
+    // PUT global mode with full provider config (type, api_key, api_url, max_results)
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/admin/websearch-mode")
+                .header("authorization", format!("Bearer {token}"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{
+                        "mode": "global",
+                        "provider": {
+                            "provider_type": "tavily",
+                            "api_key": "tvly-full-key-99",
+                            "api_url": "https://custom.tavily.com/search",
+                            "max_results": 8
+                        }
+                    }"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "PUT global with full provider config should succeed"
+    );
+
+    // GET it back and verify ALL fields needed to construct a SearchProvider are present
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri("/admin/websearch-mode")
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+    // Verify all fields needed for provider construction are present
+    let provider = &json["provider"];
+    assert_eq!(
+        provider["provider_type"], "tavily",
+        "provider_type must be present"
+    );
+    assert_eq!(
+        provider["has_api_key"], true,
+        "has_api_key must be true (api_key was provided)"
+    );
+    assert_eq!(
+        provider["api_url"], "https://custom.tavily.com/search",
+        "api_url must be preserved"
+    );
+    assert_eq!(
+        provider["max_results"], 8,
+        "max_results must be preserved"
+    );
+
+    // Also verify the raw DB value can construct a SearchProvider.
+    // This tests the new from_global_config method that doesn't exist yet.
+    let provider_json = ccag::db::settings::get_setting(&pool, "websearch_global_provider")
+        .await
+        .unwrap()
+        .expect("Global provider config should be in settings");
+    let config_value: serde_json::Value = serde_json::from_str(&provider_json).unwrap();
+
+    // This call will fail to compile until SearchProvider::from_global_config is implemented
+    let provider = ccag::websearch::SearchProvider::from_global_config(&config_value)
+        .expect("Should construct SearchProvider from stored global config");
+    assert_eq!(provider.provider_name(), "tavily");
+}
+
+// Test C: Global mode requires provider_type in the provider object (validation)
+#[tokio::test]
+async fn test_global_mode_requires_provider_type() {
+    let pool = helpers::setup_test_db().await;
+    let (app, token) = test_app(&pool).await;
+
+    // PUT global mode with provider object that has NO provider_type field
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/admin/websearch-mode")
+                .header("authorization", format!("Bearer {token}"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{
+                        "mode": "global",
+                        "provider": {
+                            "api_key": "some-key",
+                            "max_results": 5
+                        }
+                    }"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    // Currently the API just stores whatever JSON you give it without validating
+    // provider_type. This test expects 400 to enforce that the provider object
+    // must have at minimum a provider_type field.
+    assert_eq!(
+        resp.status(),
+        StatusCode::BAD_REQUEST,
+        "PUT global mode without provider_type should return 400. \
+         The API must validate that provider.provider_type is present."
+    );
+}
