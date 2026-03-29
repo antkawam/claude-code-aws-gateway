@@ -1687,10 +1687,17 @@ pub async fn get_settings(State(state): State<Arc<GatewayState>>, headers: Heade
     if let Err(resp) = check_admin_auth(&headers, &state).await {
         return resp;
     }
+    let pool = state.db().await;
+    let websearch_mode = db::settings::get_setting(&pool, "websearch_mode")
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| "enabled".to_string());
     Json(json!({
         "virtual_keys_enabled": state.virtual_keys_enabled(),
         "admin_login_enabled": state.admin_login_enabled(),
         "session_token_ttl_hours": state.session_token_ttl_hours.load(std::sync::atomic::Ordering::Relaxed),
+        "websearch_mode": websearch_mode,
     }))
     .into_response()
 }

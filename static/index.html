@@ -5008,6 +5008,12 @@ function renderSettings() {
     : '<span class="badge badge-yellow">None configured</span>';
 
   document.getElementById('session-ttl-input').value = data.settings.session_token_ttl_hours || 24;
+
+  // Hide Web Search nav item when websearch mode is disabled
+  const wsNav = document.querySelector('.nav-item[data-page="websearch"]');
+  if (wsNav) {
+    wsNav.style.display = data.settings.websearch_mode === 'disabled' ? 'none' : '';
+  }
 }
 
 async function saveSessionTtl() {

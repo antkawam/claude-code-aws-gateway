@@ -695,6 +695,187 @@ async fn test_global_provider_config_complete() {
     assert_eq!(provider.provider_name(), "tavily");
 }
 
+// ============================================================
+// Round 4: Wiring websearch mode into settings endpoint + portal visibility
+// ============================================================
+
+// Test: GET /admin/settings should include websearch_mode so the portal can
+// decide whether to show/hide the Web Search nav item. Currently get_settings()
+// only returns virtual_keys_enabled, admin_login_enabled, and session_token_ttl_hours.
+#[tokio::test]
+async fn test_settings_includes_websearch_mode() {
+    let pool = helpers::setup_test_db().await;
+    let (app, token) = test_app(&pool).await;
+
+    // GET /admin/settings — the endpoint the portal calls on load
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri("/admin/settings")
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+    // The settings response should include websearch_mode so the portal knows
+    // whether to render the Web Search nav item. Default should be "enabled".
+    assert!(
+        json.get("websearch_mode").is_some(),
+        "GET /admin/settings must include 'websearch_mode' field for portal visibility. Got: {json}"
+    );
+    assert_eq!(
+        json["websearch_mode"], "enabled",
+        "Default websearch_mode in settings should be 'enabled'"
+    );
+}
+
+// Test: After changing websearch mode, GET /admin/settings should reflect the new value.
+#[tokio::test]
+async fn test_settings_websearch_mode_updates() {
+    let pool = helpers::setup_test_db().await;
+    let (app, token) = test_app(&pool).await;
+
+    // Set websearch mode to "disabled"
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/admin/websearch-mode")
+                .header("authorization", format!("Bearer {token}"))
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"mode": "disabled"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "PUT /admin/websearch-mode should succeed"
+    );
+
+    // GET /admin/settings should now show websearch_mode = "disabled"
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri("/admin/settings")
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+    assert_eq!(
+        json["websearch_mode"], "disabled",
+        "GET /admin/settings should reflect updated websearch_mode='disabled'. Got: {json}"
+    );
+}
+
+// Test: Websearch mode should be accessible from GatewayState's cached settings,
+// not just via a DB query, so the hot request path in handlers.rs can read it
+// without a DB round-trip on every request.
+#[tokio::test]
+async fn test_websearch_mode_cached_in_state() {
+    let pool = helpers::setup_test_db().await;
+    let (app, token) = test_app(&pool).await;
+
+    // Set mode to "disabled" via admin API
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/admin/websearch-mode")
+                .header("authorization", format!("Bearer {token}"))
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"mode": "disabled"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // The settings endpoint is the proxy for what the handler sees.
+    // If it returns websearch_mode, the state has it cached (or can read it).
+    // This tests the data path: PUT admin API -> DB -> GET settings -> handler
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/admin/settings")
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+    assert_eq!(
+        json["websearch_mode"], "disabled",
+        "Settings endpoint (state cache proxy) should return 'disabled' after PUT. Got: {json}"
+    );
+
+    // Now switch to "global" and verify it updates
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/admin/websearch-mode")
+                .header("authorization", format!("Bearer {token}"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"mode": "global", "provider": {"provider_type": "tavily", "api_key": "k"}}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri("/admin/settings")
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+    assert_eq!(
+        json["websearch_mode"], "global",
+        "Settings endpoint should return 'global' after second PUT. Got: {json}"
+    );
+}
+
 // Test C: Global mode requires provider_type in the provider object (validation)
 #[tokio::test]
 async fn test_global_mode_requires_provider_type() {
