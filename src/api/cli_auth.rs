@@ -249,15 +249,21 @@ async fn build_auth_url(
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| {
             match idp.user_claim.as_deref() {
-                Some("email") | Some("preferred_username") | Some("upn") | Some("name") | Some("auto") =>
-                    "openid email profile",
+                Some("email")
+                | Some("preferred_username")
+                | Some("upn")
+                | Some("name")
+                | Some("auto") => "openid email profile",
                 None => {
                     // Auto-detect: if user_claim is unset (auto fallback chain starts with email),
                     // only request broader scopes if the IDP looks like it needs them.
                     // Heuristic: Entra/Okta/Google issuers benefit from email+profile scopes;
                     // others (Midway, custom) may reject them.
                     let issuer = idp.issuer.to_lowercase();
-                    if issuer.contains("microsoftonline") || issuer.contains("okta") || issuer.contains("accounts.google") {
+                    if issuer.contains("microsoftonline")
+                        || issuer.contains("okta")
+                        || issuer.contains("accounts.google")
+                    {
                         "openid email profile"
                     } else {
                         "openid"

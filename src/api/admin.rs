@@ -3248,3 +3248,108 @@ fn error_response(status: StatusCode, message: &str) -> Response {
     )
         .into_response()
 }
+
+// ============================================================
+// Websearch Admin Mode
+// ============================================================
+
+#[derive(Deserialize)]
+pub struct WebsearchModeRequest {
+    pub mode: String,
+    pub provider: Option<serde_json::Value>,
+}
+
+pub async fn get_websearch_mode(
+    State(state): State<Arc<GatewayState>>,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(resp) = check_admin_auth(&headers, &state).await {
+        return resp;
+    }
+
+    let pool = state.db().await;
+    let mode = db::settings::get_setting(&pool, "websearch_mode")
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| "enabled".to_string());
+
+    if mode == "global" {
+        let provider = db::settings::get_setting(&pool, "websearch_global_provider")
+            .await
+            .ok()
+            .flatten()
+            .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok());
+
+        let mut resp = json!({ "mode": mode });
+        if let Some(mut p) = provider {
+            // Mask the api_key: replace with has_api_key boolean
+            if let Some(obj) = p.as_object_mut() {
+                let has_key = obj
+                    .get("api_key")
+                    .map(|v| v.as_str().map_or(false, |s| !s.is_empty()))
+                    .unwrap_or(false);
+                obj.remove("api_key");
+                obj.insert("has_api_key".to_string(), serde_json::Value::Bool(has_key));
+            }
+            resp["provider"] = p;
+        }
+        Json(resp).into_response()
+    } else {
+        Json(json!({ "mode": mode })).into_response()
+    }
+}
+
+pub async fn set_websearch_mode(
+    State(state): State<Arc<GatewayState>>,
+    headers: HeaderMap,
+    Json(body): Json<WebsearchModeRequest>,
+) -> Response {
+    if let Err(resp) = check_admin_auth(&headers, &state).await {
+        return resp;
+    }
+
+    // Validate mode
+    match body.mode.as_str() {
+        "enabled" | "disabled" | "global" => {}
+        _ => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                &format!(
+                    "Invalid websearch mode '{}'. Must be one of: enabled, disabled, global",
+                    body.mode
+                ),
+            );
+        }
+    }
+
+    // When mode is "global", require provider config
+    if body.mode == "global" && body.provider.is_none() {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "Provider configuration is required when mode is 'global'",
+        );
+    }
+
+    let pool = state.db().await;
+
+    // Store the mode
+    if let Err(e) = db::settings::set_setting(&pool, "websearch_mode", &body.mode).await {
+        return admin_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string());
+    }
+
+    // Store provider config when mode is "global"
+    if body.mode == "global"
+        && let Some(provider) = &body.provider
+    {
+        let provider_json = serde_json::to_string(provider).unwrap_or_default();
+        if let Err(e) =
+            db::settings::set_setting(&pool, "websearch_global_provider", &provider_json).await
+        {
+            return admin_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string());
+        }
+    }
+
+    tracing::info!(mode = %body.mode, "Websearch mode updated");
+    Json(json!({ "updated": true })).into_response()
+}

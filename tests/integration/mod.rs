@@ -4,5 +4,6 @@ pub mod db_tests;
 pub mod endpoint_tests;
 pub mod notification_tests;
 pub mod spend_tests;
+pub mod websearch_admin_tests;
 
 pub mod helpers;

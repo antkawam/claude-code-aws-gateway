@@ -142,6 +142,11 @@ pub fn router(state: Arc<GatewayState>) -> Router {
             "/admin/search-providers/{provider_type}",
             delete(admin::delete_search_provider),
         )
+        // Admin API — Websearch Mode
+        .route(
+            "/admin/websearch-mode",
+            get(admin::get_websearch_mode).put(admin::set_websearch_mode),
+        )
         // Admin API — Settings
         .route("/admin/settings", get(admin::get_settings))
         .route(
@@ -993,7 +998,7 @@ async fn auth_setup(
         .unwrap_or_else(|| "86400000".to_string());
 
     let idp = resolve_primary_idp(&state).await;
-    let script = match idp {
+    let mut script = match idp {
         Some(_) => {
             // SSO setup: download token helper + merge settings
             let template = if is_windows {
@@ -1014,6 +1019,46 @@ async fn auth_setup(
                 .replace("__PROXY_URL__", &proxy_url)
         }
     };
+
+    // When websearch is disabled by admin, inject permission deny into setup script
+    let websearch_mode = crate::db::settings::get_setting(&state.db().await, "websearch_mode")
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| "enabled".to_string());
+
+    if websearch_mode == "disabled" {
+        if is_windows {
+            script.push_str(
+                r#"
+# Admin has disabled WebSearch - apply permission denial
+$DenySettings = '{"permissions":{"deny":["WebSearch"]}}'
+if (Test-Path $SettingsFile) {
+    $existing = Get-Content $SettingsFile -Raw | ConvertFrom-Json
+    $deny = $DenySettings | ConvertFrom-Json
+    $existing | Add-Member -NotePropertyName permissions -NotePropertyValue $deny.permissions -Force
+    $existing | ConvertTo-Json -Depth 10 | Set-Content $SettingsFile -Encoding UTF8
+    Write-Host '  Applied WebSearch deny permission (admin-configured)'
+}
+"#,
+            );
+        } else {
+            script.push_str(
+                r#"
+# Admin has disabled WebSearch - apply permission denial
+DENY_SETTINGS='{"permissions":{"deny":["WebSearch"]}}'
+if command -v jq &>/dev/null && [ -f "${SETTINGS_FILE:-}" ]; then
+  MERGED=$(jq --argjson deny "$DENY_SETTINGS" '. * $deny' "${SETTINGS_FILE}")
+  echo "${MERGED}" > "${SETTINGS_FILE}"
+  echo "  Applied WebSearch deny permission (admin-configured)"
+elif [ -n "${SETTINGS_FILE:-}" ] && [ -f "${SETTINGS_FILE}" ]; then
+  echo "  NOTE: WebSearch is disabled by admin. Manually add to ${SETTINGS_FILE}:"
+  echo "    $DENY_SETTINGS"
+fi
+"#,
+            );
+        }
+    }
 
     ([(axum::http::header::CONTENT_TYPE, "text/plain")], script).into_response()
 }

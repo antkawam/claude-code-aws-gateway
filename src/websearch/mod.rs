@@ -311,6 +311,36 @@ pub fn extract_web_search_tool(
     (tools, ctx)
 }
 
+/// Mode-aware variant of `extract_web_search_tool`.
+///
+/// - `"disabled"`: strips any `web_search_*` tools entirely, returns `None` context.
+/// - `"enabled"` / `"global"` (or any other value): delegates to `extract_web_search_tool`.
+pub fn extract_web_search_tool_with_mode(
+    tools: Option<Vec<Value>>,
+    mode: &str,
+) -> (Option<Vec<Value>>, Option<WebSearchContext>) {
+    if mode == "disabled" {
+        let Some(tools) = tools else {
+            return (None, None);
+        };
+        let filtered: Vec<Value> = tools
+            .into_iter()
+            .filter(|tool| {
+                let tool_type = tool.get("type").and_then(|t| t.as_str()).unwrap_or("");
+                !tool_type.starts_with("web_search_")
+            })
+            .collect();
+        let tools = if filtered.is_empty() {
+            None
+        } else {
+            Some(filtered)
+        };
+        (tools, None)
+    } else {
+        extract_web_search_tool(tools)
+    }
+}
+
 /// Check if a Bedrock response contains a web_search tool_use that we need to handle.
 /// Returns Vec of (tool_use_id, query) pairs.
 pub fn find_web_search_tool_uses(content: &[Value], tool_name: &str) -> Vec<(String, String)> {
@@ -482,6 +512,57 @@ mod tests {
                 }
             }
         }
+    }
+
+    // ============================================================
+    // extract_web_search_tool_with_mode — admin control round 2
+    // ============================================================
+
+    #[test]
+    fn test_extract_strips_tool_when_disabled() {
+        let tools = vec![
+            json!({"type": "web_search_20250305", "name": "web_search", "max_uses": 3}),
+            json!({"name": "read_file", "input_schema": {"type": "object"}}),
+        ];
+        let (filtered, ctx) = extract_web_search_tool_with_mode(Some(tools), "disabled");
+        // When mode is "disabled", web search context should be None (tool is stripped)
+        assert!(ctx.is_none(), "disabled mode should strip web_search context");
+        // Only the non-web-search tool should remain
+        let filtered = filtered.unwrap();
+        assert_eq!(filtered.len(), 1, "disabled mode should remove web_search tool");
+        assert_eq!(filtered[0]["name"], "read_file");
+    }
+
+    #[test]
+    fn test_extract_preserves_tool_when_enabled() {
+        let tools = vec![
+            json!({"type": "web_search_20250305", "name": "web_search", "max_uses": 5}),
+            json!({"name": "read_file", "input_schema": {"type": "object"}}),
+        ];
+        let (filtered, ctx) = extract_web_search_tool_with_mode(Some(tools), "enabled");
+        // When mode is "enabled", web search context should be present
+        assert!(ctx.is_some(), "enabled mode should preserve web_search context");
+        let ctx = ctx.unwrap();
+        assert_eq!(ctx.tool_name, "web_search");
+        assert_eq!(ctx.max_uses, 5);
+        let filtered = filtered.unwrap();
+        assert_eq!(filtered.len(), 2, "enabled mode should keep both tools");
+    }
+
+    #[test]
+    fn test_extract_preserves_tool_when_global() {
+        let tools = vec![
+            json!({"type": "web_search_20250305", "name": "web_search", "max_uses": 10}),
+            json!({"name": "bash", "input_schema": {"type": "object"}}),
+        ];
+        let (filtered, ctx) = extract_web_search_tool_with_mode(Some(tools), "global");
+        // When mode is "global", web search context should be present (global provider used)
+        assert!(ctx.is_some(), "global mode should preserve web_search context");
+        let ctx = ctx.unwrap();
+        assert_eq!(ctx.tool_name, "web_search");
+        assert_eq!(ctx.max_uses, 10);
+        let filtered = filtered.unwrap();
+        assert_eq!(filtered.len(), 2, "global mode should keep both tools");
     }
 
     #[test]

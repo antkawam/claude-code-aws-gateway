@@ -100,3 +100,13 @@ Full list: see `docs/configuration.md`
 - Inference profiles are mandatory for newer Claude models (4.5+)
 - Beta flags: ALLOWLIST approach (only forward betas Bedrock accepts)
 - Bedrock SDK `Display` impl is terse. Use `Debug` format for error messages.
+
+## Testing Rules
+
+- **Two-agent TDD workflow**: `@test` writes tests, `@builder` writes implementation. Both are defined in `.claude/agents/`.
+- **Default session is a coordinator**: Do not write production code or tests directly. Delegate to `@builder` for implementation and `@test` for test writing. The default session should focus on understanding requirements, planning, reviewing agent output, and orchestrating the TDD cycle.
+- The builder agent MUST NOT modify files in `tests/` or `#[cfg(test)]` blocks (enforced by PreToolUse hook).
+- The test agent MUST NOT modify production code outside `#[cfg(test)]` blocks (enforced by PreToolUse hook).
+- If tests fail during implementation, fix the production code — never the tests.
+- Run `make check` before marking any task complete.
+- New modules MUST include `#[cfg(test)]` with meaningful coverage.
