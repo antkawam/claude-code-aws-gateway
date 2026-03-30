@@ -74,8 +74,14 @@ impl SearchProvider {
             .and_then(|v| v.as_str())
             .ok_or_else(|| anyhow::anyhow!("provider_type is required"))?;
 
-        let api_key = config.get("api_key").and_then(|v| v.as_str()).map(|s| s.to_string());
-        let api_url = config.get("api_url").and_then(|v| v.as_str()).map(|s| s.to_string());
+        let api_key = config
+            .get("api_key")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        let api_url = config
+            .get("api_url")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
         let max_results = config
             .get("max_results")
             .and_then(|v| v.as_u64())
@@ -88,19 +94,29 @@ impl SearchProvider {
                 let api_key = api_key
                     .filter(|k| !k.is_empty())
                     .ok_or_else(|| anyhow::anyhow!("Tavily requires an API key"))?;
-                Ok(Self::Tavily { api_key, max_results })
+                Ok(Self::Tavily {
+                    api_key,
+                    max_results,
+                })
             }
             "serper" => {
                 let api_key = api_key
                     .filter(|k| !k.is_empty())
                     .ok_or_else(|| anyhow::anyhow!("Serper requires an API key"))?;
-                Ok(Self::Serper { api_key, max_results })
+                Ok(Self::Serper {
+                    api_key,
+                    max_results,
+                })
             }
             "custom" => {
                 let api_url = api_url
                     .filter(|u| !u.is_empty())
                     .ok_or_else(|| anyhow::anyhow!("Custom provider requires an API URL"))?;
-                Ok(Self::Custom { api_url, api_key, max_results })
+                Ok(Self::Custom {
+                    api_url,
+                    api_key,
+                    max_results,
+                })
             }
             other => anyhow::bail!("Unknown search provider: {}", other),
         }
@@ -463,7 +479,10 @@ mod tests {
         assert_eq!(provider.provider_name(), "tavily");
         // Verify max_results is respected
         match provider {
-            SearchProvider::Tavily { api_key, max_results } => {
+            SearchProvider::Tavily {
+                api_key,
+                max_results,
+            } => {
                 assert_eq!(api_key, "tvly-test-key-123");
                 assert_eq!(max_results, 5);
             }
@@ -500,7 +519,10 @@ mod tests {
             .expect("Should construct Serper provider from global config JSON");
         assert_eq!(provider.provider_name(), "serper");
         match provider {
-            SearchProvider::Serper { api_key, max_results } => {
+            SearchProvider::Serper {
+                api_key,
+                max_results,
+            } => {
                 assert_eq!(api_key, "serper-key-456");
                 assert_eq!(max_results, 7);
             }
@@ -520,7 +542,11 @@ mod tests {
             .expect("Should construct Custom provider from global config JSON");
         assert_eq!(provider.provider_name(), "custom");
         match provider {
-            SearchProvider::Custom { api_url, api_key, max_results } => {
+            SearchProvider::Custom {
+                api_url,
+                api_key,
+                max_results,
+            } => {
                 assert_eq!(api_url, "https://my-search.example.com/api");
                 assert_eq!(api_key.as_deref(), Some("custom-key"));
                 assert_eq!(max_results, 3);

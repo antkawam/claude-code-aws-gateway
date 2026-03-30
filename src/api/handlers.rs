@@ -381,8 +381,20 @@ pub async fn messages(
         .map(|ep| ep.config.routing_prefix.clone())
         .unwrap_or_else(|| state.config.bedrock_routing_prefix.clone());
 
-    let (mut bedrock_model, bedrock_body, web_search_ctx) =
-        request::translate(body, beta_header, &routing_prefix, Some(&state.model_cache));
+    // Read websearch mode from admin settings (disabled / enabled / global)
+    let websearch_mode = crate::db::settings::get_setting(&state.db().await, "websearch_mode")
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| "enabled".to_string());
+
+    let (mut bedrock_model, bedrock_body, web_search_ctx) = request::translate(
+        body,
+        beta_header,
+        &routing_prefix,
+        Some(&state.model_cache),
+        &websearch_mode,
+    );
 
     // If the endpoint has an application inference profile ARN configured, use it directly
     // as the model ID — overrides the prefix-based cross-region inference profile.
@@ -545,6 +557,7 @@ pub async fn messages(
             is_streaming,
             ws_ctx,
             endpoint_id,
+            &websearch_mode,
         )
         .await
     } else if is_streaming {
@@ -1233,9 +1246,15 @@ async fn handle_with_web_search(
     is_streaming: bool,
     ws_ctx: &websearch::WebSearchContext,
     endpoint_id: Option<Uuid>,
+    websearch_mode: &str,
 ) -> Response {
-    // Resolve user's configured search provider (falls back to DuckDuckGo)
-    let search_provider = resolve_search_provider(state, &identity).await;
+    // Resolve search provider: "global" mode uses admin-configured global provider,
+    // otherwise fall back to per-user provider (which defaults to DuckDuckGo).
+    let search_provider = if websearch_mode == "global" {
+        resolve_global_search_provider(state).await
+    } else {
+        resolve_search_provider(state, &identity).await
+    };
     tracing::debug!(
         request_id = %request_id,
         provider = %search_provider.provider_name(),
@@ -2082,6 +2101,42 @@ async fn resolve_search_provider(
             }
         },
         _ => default,
+    }
+}
+
+/// Resolve the global search provider from admin settings.
+/// Reads `websearch_global_provider` from proxy_settings as a JSON config object
+/// and constructs a SearchProvider. Falls back to DuckDuckGo if not configured.
+async fn resolve_global_search_provider(state: &GatewayState) -> websearch::SearchProvider {
+    let default = websearch::SearchProvider::DuckDuckGo { max_results: 5 };
+
+    let pool = state.db().await;
+    let config_str =
+        match crate::db::settings::get_setting(&pool, "websearch_global_provider").await {
+            Ok(Some(s)) => s,
+            _ => return default,
+        };
+
+    let config: serde_json::Value = match serde_json::from_str(&config_str) {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "Invalid websearch_global_provider JSON, falling back to DuckDuckGo"
+            );
+            return default;
+        }
+    };
+
+    match websearch::SearchProvider::from_global_config(&config) {
+        Ok(provider) => provider,
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "Failed to construct global search provider, falling back to DuckDuckGo"
+            );
+            default
+        }
     }
 }
 

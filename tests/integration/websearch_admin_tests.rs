@@ -676,10 +676,7 @@ async fn test_global_provider_config_complete() {
         provider["api_url"], "https://custom.tavily.com/search",
         "api_url must be preserved"
     );
-    assert_eq!(
-        provider["max_results"], 8,
-        "max_results must be preserved"
-    );
+    assert_eq!(provider["max_results"], 8, "max_results must be preserved");
 
     // Also verify the raw DB value can construct a SearchProvider.
     // This tests the new from_global_config method that doesn't exist yet.

@@ -3294,7 +3294,7 @@ pub async fn get_websearch_mode(
             if let Some(obj) = p.as_object_mut() {
                 let has_key = obj
                     .get("api_key")
-                    .map(|v| v.as_str().map_or(false, |s| !s.is_empty()))
+                    .map(|v| v.as_str().is_some_and(|s| !s.is_empty()))
                     .unwrap_or(false);
                 obj.remove("api_key");
                 obj.insert("has_api_key".to_string(), serde_json::Value::Bool(has_key));
