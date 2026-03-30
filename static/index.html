@@ -2441,6 +2441,58 @@ input[type="date"].oa-filter-select { background-image: none; padding-right: 8px
               </tbody>
             </table>
           </div>
+
+          <div class="card" style="margin-top:16px">
+            <div class="card-header"><h3>Web Search</h3></div>
+            <table class="settings-table">
+              <tbody>
+                <tr>
+                  <td style="width:200px"><strong>Mode</strong></td>
+                  <td>
+                    <div class="strategy-group" id="websearch-mode-group">
+                      <button class="strategy-btn" data-mode="enabled" onclick="setWebsearchMode('enabled')">Enabled</button>
+                      <button class="strategy-btn" data-mode="disabled" onclick="setWebsearchMode('disabled')">Disabled</button>
+                      <button class="strategy-btn" data-mode="global" onclick="setWebsearchMode('global')">Global</button>
+                    </div>
+                    <div id="websearch-mode-desc" class="form-hint" style="margin-top:6px"></div>
+                  </td>
+                </tr>
+                <tr id="websearch-global-config" style="display:none">
+                  <td style="vertical-align:top;padding-top:12px"><strong>Global Provider</strong></td>
+                  <td>
+                    <div id="websearch-global-provider-info" style="margin-bottom:8px"></div>
+                    <div id="websearch-global-provider-form" style="display:none">
+                      <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:flex-end">
+                        <div>
+                          <div class="form-label">Provider</div>
+                          <select id="ws-global-type" class="form-select" style="width:140px" onchange="wsGlobalTypeChanged()">
+                            <option value="duckduckgo">DuckDuckGo</option>
+                            <option value="tavily">Tavily</option>
+                            <option value="serper">Serper</option>
+                            <option value="custom">Custom</option>
+                          </select>
+                        </div>
+                        <div id="ws-global-key-group">
+                          <div class="form-label">API Key</div>
+                          <input class="form-input" id="ws-global-key" type="password" placeholder="API key" style="width:200px">
+                        </div>
+                        <div id="ws-global-url-group" style="display:none">
+                          <div class="form-label">API URL</div>
+                          <input class="form-input" id="ws-global-url" type="text" placeholder="https://..." style="width:200px">
+                        </div>
+                        <div>
+                          <div class="form-label">Max Results</div>
+                          <input class="form-input" id="ws-global-max" type="number" min="1" max="20" value="5" style="width:70px">
+                        </div>
+                        <button class="btn btn-primary btn-sm" onclick="saveGlobalProvider()">Save</button>
+                        <button class="btn btn-ghost btn-sm" onclick="cancelGlobalProvider()">Cancel</button>
+                      </div>
+                    </div>
+                  </td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
         </div>
 
         <div id="settings-status" style="display:none">
@@ -5013,6 +5065,102 @@ function renderSettings() {
   const wsNav = document.querySelector('.nav-item[data-page="websearch"]');
   if (wsNav) {
     wsNav.style.display = data.settings.websearch_mode === 'disabled' ? 'none' : '';
+  }
+  renderWebsearchMode();
+}
+
+const WS_MODE_DESCS = {
+  enabled: 'Per-user provider config. Each user can choose their own search provider.',
+  disabled: 'Web search disabled. Search requests are silently stripped server-side. Users who re-run the setup script will have web search fully disabled in their client.',
+  global: 'Admin-managed provider for all users. Users cannot configure their own.'
+};
+
+function renderWebsearchMode() {
+  const mode = data.settings.websearch_mode || 'enabled';
+  document.querySelectorAll('#websearch-mode-group .strategy-btn').forEach(btn => {
+    btn.classList.toggle('active', btn.dataset.mode === mode);
+  });
+  document.getElementById('websearch-mode-desc').textContent = WS_MODE_DESCS[mode] || '';
+
+  const globalRow = document.getElementById('websearch-global-config');
+  globalRow.style.display = mode === 'global' ? '' : 'none';
+
+  if (mode === 'global') {
+    loadGlobalProviderInfo();
+  }
+}
+
+async function loadGlobalProviderInfo() {
+  const res = await api('GET', '/admin/websearch-mode');
+  const infoEl = document.getElementById('websearch-global-provider-info');
+  const formEl = document.getElementById('websearch-global-provider-form');
+
+  if (res.provider) {
+    const p = res.provider;
+    const keyStatus = p.has_api_key ? '<span class="badge badge-green" style="font-size:10px">Key set</span>' : '<span class="badge badge-yellow" style="font-size:10px">No key</span>';
+    infoEl.innerHTML = `<span style="font-family:var(--font-mono);font-size:12px">${p.provider_type || 'unknown'}</span> &nbsp;${keyStatus} &nbsp;<span style="color:var(--text-muted);font-size:11px">max ${p.max_results || 5} results</span>`
+      + ` &nbsp;<button class="btn btn-ghost btn-sm" onclick="showGlobalProviderForm()">Edit</button>`;
+    formEl.style.display = 'none';
+  } else {
+    infoEl.innerHTML = '<span style="color:var(--text-muted);font-size:12px">No provider configured.</span>';
+    showGlobalProviderForm();
+  }
+}
+
+function showGlobalProviderForm() {
+  document.getElementById('websearch-global-provider-form').style.display = '';
+  wsGlobalTypeChanged();
+}
+
+function cancelGlobalProvider() {
+  document.getElementById('websearch-global-provider-form').style.display = 'none';
+}
+
+function wsGlobalTypeChanged() {
+  const type = document.getElementById('ws-global-type').value;
+  document.getElementById('ws-global-key-group').style.display = (type === 'duckduckgo') ? 'none' : '';
+  document.getElementById('ws-global-url-group').style.display = (type === 'custom') ? '' : 'none';
+}
+
+async function setWebsearchMode(mode) {
+  if (mode === 'global') {
+    // Switch to global — need provider config. Show the form, don't save mode yet.
+    const res = await api('GET', '/admin/websearch-mode');
+    if (!res.provider) {
+      // No provider configured yet — save mode with form submission
+      const r = await api('PUT', '/admin/websearch-mode', { mode: 'global', provider: { provider_type: 'duckduckgo', max_results: 5 } });
+      if (r.updated) { toast('Web search set to Global (DuckDuckGo default)', 'success'); loadAll(); }
+      else { toast(r.error?.message || 'Failed to set mode', 'error'); }
+      return;
+    }
+    // Provider exists — just switch mode
+    const r = await api('PUT', '/admin/websearch-mode', { mode: 'global', provider: res.provider });
+    if (r.updated) { toast('Web search set to Global', 'success'); loadAll(); }
+    else { toast(r.error?.message || 'Failed to set mode', 'error'); }
+  } else {
+    const r = await api('PUT', '/admin/websearch-mode', { mode });
+    if (r.updated) { toast(`Web search ${mode === 'disabled' ? 'disabled' : 'enabled'}`, 'success'); loadAll(); }
+    else { toast(r.error?.message || 'Failed to set mode', 'error'); }
+  }
+}
+
+async function saveGlobalProvider() {
+  const providerType = document.getElementById('ws-global-type').value;
+  const apiKey = document.getElementById('ws-global-key').value;
+  const apiUrl = document.getElementById('ws-global-url').value;
+  const maxResults = parseInt(document.getElementById('ws-global-max').value) || 5;
+
+  const provider = { provider_type: providerType, max_results: maxResults };
+  if (apiKey) provider.api_key = apiKey;
+  if (apiUrl) provider.api_url = apiUrl;
+
+  const res = await api('PUT', '/admin/websearch-mode', { mode: 'global', provider });
+  if (res.updated) {
+    toast('Global search provider saved', 'success');
+    document.getElementById('websearch-global-provider-form').style.display = 'none';
+    loadAll();
+  } else {
+    toast(res.error?.message || 'Failed to save provider', 'error');
   }
 }
 

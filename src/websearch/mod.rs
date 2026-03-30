@@ -526,10 +526,17 @@ mod tests {
         ];
         let (filtered, ctx) = extract_web_search_tool_with_mode(Some(tools), "disabled");
         // When mode is "disabled", web search context should be None (tool is stripped)
-        assert!(ctx.is_none(), "disabled mode should strip web_search context");
+        assert!(
+            ctx.is_none(),
+            "disabled mode should strip web_search context"
+        );
         // Only the non-web-search tool should remain
         let filtered = filtered.unwrap();
-        assert_eq!(filtered.len(), 1, "disabled mode should remove web_search tool");
+        assert_eq!(
+            filtered.len(),
+            1,
+            "disabled mode should remove web_search tool"
+        );
         assert_eq!(filtered[0]["name"], "read_file");
     }
 
@@ -541,7 +548,10 @@ mod tests {
         ];
         let (filtered, ctx) = extract_web_search_tool_with_mode(Some(tools), "enabled");
         // When mode is "enabled", web search context should be present
-        assert!(ctx.is_some(), "enabled mode should preserve web_search context");
+        assert!(
+            ctx.is_some(),
+            "enabled mode should preserve web_search context"
+        );
         let ctx = ctx.unwrap();
         assert_eq!(ctx.tool_name, "web_search");
         assert_eq!(ctx.max_uses, 5);
@@ -557,7 +567,10 @@ mod tests {
         ];
         let (filtered, ctx) = extract_web_search_tool_with_mode(Some(tools), "global");
         // When mode is "global", web search context should be present (global provider used)
-        assert!(ctx.is_some(), "global mode should preserve web_search context");
+        assert!(
+            ctx.is_some(),
+            "global mode should preserve web_search context"
+        );
         let ctx = ctx.unwrap();
         assert_eq!(ctx.tool_name, "web_search");
         assert_eq!(ctx.max_uses, 10);

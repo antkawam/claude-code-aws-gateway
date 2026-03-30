@@ -943,7 +943,7 @@ async fn auth_setup(
             }
         };
 
-        let script = match raw_key {
+        let mut script = match raw_key {
             Some(key) => {
                 let scope = uri
                     .query()
@@ -974,6 +974,9 @@ async fn auth_setup(
                 }
             }
         };
+
+        // Inject WebSearch deny for VK setup path too
+        append_websearch_deny(&mut script, &state, is_windows).await;
 
         return ([(axum::http::header::CONTENT_TYPE, "text/plain")], script).into_response();
     }
@@ -1021,6 +1024,17 @@ async fn auth_setup(
     };
 
     // When websearch is disabled by admin, inject permission deny into setup script
+    append_websearch_deny(&mut script, &state, is_windows).await;
+
+    ([(axum::http::header::CONTENT_TYPE, "text/plain")], script).into_response()
+}
+
+/// Append WebSearch permission denial to a setup script when websearch mode is disabled.
+async fn append_websearch_deny(
+    script: &mut String,
+    state: &std::sync::Arc<crate::proxy::GatewayState>,
+    is_windows: bool,
+) {
     let websearch_mode = crate::db::settings::get_setting(&state.db().await, "websearch_mode")
         .await
         .ok()
@@ -1059,8 +1073,6 @@ fi
             );
         }
     }
-
-    ([(axum::http::header::CONTENT_TYPE, "text/plain")], script).into_response()
 }
 
 /// Check if an origin is allowed for CORS.
