@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.2.0] - 2026-03-30
+
+### Added
+
+- **Websearch admin control**: three configurable modes for web search behavior:
+  - **Enabled** (default): per-user provider configuration, each user chooses their own search provider
+  - **Disabled**: web search tool silently stripped from requests server-side; setup script pushes `permissions.deny: ["WebSearch"]` to Claude Code clients
+  - **Global**: admin configures a single search provider (DuckDuckGo, Tavily, Serper, or Custom) used for all users; per-user provider config is overridden
+- Admin API: `GET/PUT /admin/websearch-mode` for reading and setting the mode, with provider config for global mode
+- Websearch mode exposed in `GET /admin/settings` so the portal and clients can read it
+- Portal Settings page: three-button mode selector with global provider config form (type, API key, URL, max results)
+- Portal nav: Web Search menu item hidden when mode is disabled
+- API key masking: global provider API key never returned in GET responses (replaced with `has_api_key` boolean)
+- `SearchProvider::from_global_config()`: constructs a search provider from admin-configured JSON with validation (provider_type required, api_key required for Tavily/Serper, api_url required for Custom, max_results clamped to 1-20)
+- `extract_web_search_tool_with_mode()`: mode-aware tool extraction that strips web_search tools when mode is disabled
+- Setup script WebSearch deny injection covers both SSO and virtual key setup paths
+- 33 new tests (14 integration, 19 unit) covering all websearch admin control behavior
+
+### Changed
+
+- `translate()` now accepts a `websearch_mode` parameter; handler reads mode from DB settings on each request
+- Deploy script now uses GHCR (GitHub Container Registry) instead of ECR for image storage
+
 ## [1.1.0] - 2026-03-25
 
 ### Added

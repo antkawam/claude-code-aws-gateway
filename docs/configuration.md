@@ -117,6 +117,49 @@ These settings are stored in the database and can be changed at any time through
 | `virtual_keys_enabled` | `true` | Enable/disable virtual key authentication. When disabled, only OIDC and admin password auth work. |
 | `admin_login_enabled` | `true` | Enable/disable the admin username/password login form. Useful to disable once OIDC is configured. |
 | `session_token_ttl_hours` | `24` | How long session tokens (from portal login) remain valid. |
+| `websearch_mode` | `enabled` | Web search behavior: `enabled` (per-user provider config), `disabled` (tool stripped, clients configured to skip), or `global` (admin-managed provider for all users). See [Web Search Mode](#web-search-mode). |
+
+### Web Search Mode
+
+Controls how the gateway handles Claude Code's `web_search` tool. Configurable via the portal (Settings > Web Search) or the admin API.
+
+**Modes:**
+
+| Mode | Behavior |
+|---|---|
+| `enabled` | Default. Each user configures their own search provider (DuckDuckGo, Tavily, Serper, or Custom) via the portal's Web Search page. |
+| `disabled` | Web search tool is silently stripped from requests before reaching Bedrock. The setup script pushes `permissions.deny: ["WebSearch"]` to Claude Code clients so they stop requesting it. Users must re-run the setup script to pick up the client-side change. |
+| `global` | Admin configures a single search provider used for all users. Per-user provider settings are ignored. The provider config (type, API key, URL, max results) is set alongside the mode. |
+
+**API:**
+
+```bash
+# Get current mode
+curl https://ccag.example.com/admin/websearch-mode \
+  -H "authorization: Bearer $TOKEN"
+# {"mode": "enabled"}
+
+# Disable web search
+curl -X PUT https://ccag.example.com/admin/websearch-mode \
+  -H "authorization: Bearer $TOKEN" \
+  -H "content-type: application/json" \
+  -d '{"mode": "disabled"}'
+
+# Set global mode with Tavily provider
+curl -X PUT https://ccag.example.com/admin/websearch-mode \
+  -H "authorization: Bearer $TOKEN" \
+  -H "content-type: application/json" \
+  -d '{
+    "mode": "global",
+    "provider": {
+      "provider_type": "tavily",
+      "api_key": "tvly-...",
+      "max_results": 5
+    }
+  }'
+```
+
+When mode is `global`, the GET response includes the provider config with the API key masked (`has_api_key: true` instead of the raw key).
 
 ### Identity Providers (IDPs)
 
