@@ -1,74 +1,66 @@
-/// Integration tests for SCIM Phase 3 Group CRUD — DB layer.
+/// Integration tests for SCIM Groups — role-mapping model.
 ///
-/// These tests exercise `db::teams` SCIM functions introduced in Phase 3:
-///   create_scim_team, get_team_by_external_id, update_scim_team,
-///   get_team_members, set_team_members, add_team_member,
-///   remove_team_member, list_teams_for_idp, delete_team.
+/// These tests exercise `db::scim_groups` functions introduced in the
+/// decoupled-groups model:
+///   create_scim_group, get_scim_group, get_scim_group_by_external_id,
+///   update_scim_group, delete_scim_group, list_scim_groups_for_idp,
+///   get_scim_group_members, set_scim_group_members, add_scim_group_member,
+///   remove_scim_group_member, evaluate_user_role, sync_user_role.
 ///
 /// Run with: `make test-integration`
 use uuid::Uuid;
 
 use ccag::db;
-use ccag::db::teams;
+use ccag::db::scim_groups;
 use ccag::db::users;
 use ccag::scim::filter::ScimFilter;
 
 use crate::helpers;
 
 // ============================================================
-// test_create_scim_team
+// test_create_scim_group
 // ============================================================
 
-/// Create a SCIM team and verify every field is populated correctly.
+/// Create a SCIM group and verify every field is populated correctly.
 #[tokio::test]
-async fn test_create_scim_team() {
+async fn test_create_scim_group() {
     let pool = helpers::setup_test_db().await;
     let idp = helpers::create_test_idp(&pool, "scim-group-create-idp").await;
 
-    let team = teams::create_scim_team(
-        &pool,
-        "Engineering",
-        Some("okta-group-eng-001"),
-        Some("Engineering"),
-        idp.id,
-    )
-    .await
-    .expect("create_scim_team failed");
+    let group =
+        scim_groups::create_scim_group(&pool, "Engineering", Some("okta-group-eng-001"), idp.id)
+            .await
+            .expect("create_scim_group failed");
 
-    assert_eq!(team.name, "Engineering");
-    assert_eq!(team.external_id.as_deref(), Some("okta-group-eng-001"));
-    assert_eq!(team.display_name.as_deref(), Some("Engineering"));
-    assert_eq!(team.idp_id, Some(idp.id));
-    assert!(team.scim_managed, "SCIM team must have scim_managed=true");
+    assert_eq!(group.display_name, "Engineering");
+    assert_eq!(group.external_id.as_deref(), Some("okta-group-eng-001"));
+    assert_eq!(group.idp_id, idp.id);
+    assert!(group.id != Uuid::nil(), "group must have a non-nil UUID");
 }
 
 // ============================================================
-// test_get_team_by_external_id
+// test_get_scim_group_by_external_id
 // ============================================================
 
-/// Create a team with an external_id, then fetch it by (external_id, idp_id).
+/// Create a group with an external_id, then fetch it by (external_id, idp_id).
 #[tokio::test]
-async fn test_get_team_by_external_id() {
+async fn test_get_scim_group_by_external_id() {
     let pool = helpers::setup_test_db().await;
     let idp = helpers::create_test_idp(&pool, "scim-group-ext-id-idp").await;
 
-    let created = teams::create_scim_team(
-        &pool,
-        "Finance",
-        Some("ext-group-finance-001"),
-        Some("Finance"),
-        idp.id,
-    )
-    .await
-    .expect("create_scim_team failed");
+    let created =
+        scim_groups::create_scim_group(&pool, "Finance", Some("ext-group-finance-001"), idp.id)
+            .await
+            .expect("create_scim_group failed");
 
-    let fetched = teams::get_team_by_external_id(&pool, "ext-group-finance-001", idp.id)
-        .await
-        .expect("get_team_by_external_id failed")
-        .expect("Team should be found");
+    let fetched =
+        scim_groups::get_scim_group_by_external_id(&pool, "ext-group-finance-001", idp.id)
+            .await
+            .expect("get_scim_group_by_external_id failed")
+            .expect("Group should be found");
 
     assert_eq!(fetched.id, created.id);
-    assert_eq!(fetched.name, "Finance");
+    assert_eq!(fetched.display_name, "Finance");
     assert_eq!(
         fetched.external_id.as_deref(),
         Some("ext-group-finance-001")
@@ -76,90 +68,185 @@ async fn test_get_team_by_external_id() {
 }
 
 // ============================================================
-// test_get_team_by_external_id_wrong_idp
+// test_get_scim_group_by_external_id_wrong_idp
 // ============================================================
 
-/// Fetching a team using a different IDP's id should return None.
+/// Fetching a group using a different IDP's id should return None.
 #[tokio::test]
-async fn test_get_team_by_external_id_wrong_idp() {
+async fn test_get_scim_group_by_external_id_wrong_idp() {
     let pool = helpers::setup_test_db().await;
     let idp_a = helpers::create_test_idp(&pool, "scim-group-wrong-idp-a").await;
     let idp_b = helpers::create_test_idp(&pool, "scim-group-wrong-idp-b").await;
 
-    teams::create_scim_team(
-        &pool,
-        "Marketing",
-        Some("ext-group-mkt-001"),
-        Some("Marketing"),
-        idp_a.id,
-    )
-    .await
-    .expect("create_scim_team failed");
+    scim_groups::create_scim_group(&pool, "Marketing", Some("ext-group-mkt-001"), idp_a.id)
+        .await
+        .expect("create_scim_group failed");
 
     // Fetch using IDP-B's ID — must return None
-    let result = teams::get_team_by_external_id(&pool, "ext-group-mkt-001", idp_b.id)
+    let result = scim_groups::get_scim_group_by_external_id(&pool, "ext-group-mkt-001", idp_b.id)
         .await
-        .expect("get_team_by_external_id failed");
+        .expect("get_scim_group_by_external_id failed");
 
     assert!(
         result.is_none(),
-        "Fetching a team with the wrong IDP id must return None"
+        "Fetching a group with the wrong IDP id must return None"
     );
 }
 
 // ============================================================
-// test_update_scim_team
+// test_update_scim_group
 // ============================================================
 
-/// Create a team, then update its name, external_id, and display_name.
+/// Create a group, then update its display_name and external_id.
 #[tokio::test]
-async fn test_update_scim_team() {
+async fn test_update_scim_group() {
     let pool = helpers::setup_test_db().await;
     let idp = helpers::create_test_idp(&pool, "scim-group-update-idp").await;
 
-    let team = teams::create_scim_team(
-        &pool,
-        "OriginalName",
-        Some("ext-update-001"),
-        Some("OriginalName"),
-        idp.id,
-    )
-    .await
-    .expect("create_scim_team failed");
+    let group =
+        scim_groups::create_scim_group(&pool, "OriginalName", Some("ext-update-001"), idp.id)
+            .await
+            .expect("create_scim_group failed");
 
-    let updated = teams::update_scim_team(
-        &pool,
-        team.id,
-        "UpdatedName",
-        Some("ext-update-002"),
-        Some("Updated Display Name"),
-    )
-    .await
-    .expect("update_scim_team failed")
-    .expect("update_scim_team should return the updated team");
+    let updated =
+        scim_groups::update_scim_group(&pool, group.id, "UpdatedName", Some("ext-update-002"))
+            .await
+            .expect("update_scim_group failed")
+            .expect("update_scim_group should return the updated group");
 
-    assert_eq!(updated.name, "UpdatedName");
+    assert_eq!(updated.display_name, "UpdatedName");
     assert_eq!(updated.external_id.as_deref(), Some("ext-update-002"));
-    assert_eq!(
-        updated.display_name.as_deref(),
-        Some("Updated Display Name")
-    );
-    assert_eq!(updated.id, team.id, "ID must not change on update");
+    assert_eq!(updated.id, group.id, "ID must not change on update");
+    assert_eq!(updated.idp_id, idp.id, "idp_id must not change on update");
 }
 
 // ============================================================
-// test_get_team_members
+// test_delete_scim_group
 // ============================================================
 
-/// Create a team and two users assigned to it; get_team_members should return both.
+/// Delete a group and verify it can no longer be fetched.
 #[tokio::test]
-async fn test_get_team_members() {
+async fn test_delete_scim_group() {
     let pool = helpers::setup_test_db().await;
-    let idp = helpers::create_test_idp(&pool, "scim-group-members-idp").await;
+    let idp = helpers::create_test_idp(&pool, "scim-group-delete-idp").await;
 
-    let team = teams::create_scim_team(&pool, "Members Team", None, None, idp.id)
+    let group = scim_groups::create_scim_group(&pool, "ToDelete", Some("ext-del-001"), idp.id)
         .await
-        .expect("create_scim_team failed");
+        .expect("create_scim_group failed");
+
+    let deleted = scim_groups::delete_scim_group(&pool, group.id)
+        .await
+        .expect("delete_scim_group failed");
+
+    assert!(
+        deleted,
+        "delete_scim_group should return true for an existing group"
+    );
+
+    let fetched = scim_groups::get_scim_group(&pool, group.id)
+        .await
+        .expect("get_scim_group failed");
+
+    assert!(fetched.is_none(), "Group should not exist after deletion");
+}
+
+// ============================================================
+// test_delete_scim_group_cascades_members
+// ============================================================
+
+/// Delete a group that has members; the scim_group_members rows should be gone
+/// but the user rows themselves must still exist.
+#[tokio::test]
+async fn test_delete_scim_group_cascades_members() {
+    let pool = helpers::setup_test_db().await;
+    let idp = helpers::create_test_idp(&pool, "scim-group-cascade-idp").await;
+
+    let group = scim_groups::create_scim_group(&pool, "CascadeGroup", None, idp.id)
+        .await
+        .expect("create_scim_group failed");
+
+    let user1 = users::create_scim_user(
+        &pool,
+        "cascade-u1@example.com",
+        Some("ext-cascade-u1"),
+        None,
+        None,
+        None,
+        "member",
+        idp.id,
+    )
+    .await
+    .expect("create_scim_user failed");
+
+    let user2 = users::create_scim_user(
+        &pool,
+        "cascade-u2@example.com",
+        Some("ext-cascade-u2"),
+        None,
+        None,
+        None,
+        "member",
+        idp.id,
+    )
+    .await
+    .expect("create_scim_user failed");
+
+    scim_groups::set_scim_group_members(&pool, group.id, &[user1.id, user2.id])
+        .await
+        .expect("set_scim_group_members failed");
+
+    // Verify members are present before deletion
+    let before = scim_groups::get_scim_group_members(&pool, group.id)
+        .await
+        .expect("get_scim_group_members failed");
+    assert_eq!(before.len(), 2, "Should have 2 members before delete");
+
+    // Delete the group
+    scim_groups::delete_scim_group(&pool, group.id)
+        .await
+        .expect("delete_scim_group failed");
+
+    // Users must still exist
+    let fetched_u1 = users::get_user_by_email(&pool, "cascade-u1@example.com")
+        .await
+        .expect("get_user_by_email failed")
+        .expect("user1 should still exist after group deletion");
+    assert_eq!(fetched_u1.id, user1.id);
+
+    let fetched_u2 = users::get_user_by_email(&pool, "cascade-u2@example.com")
+        .await
+        .expect("get_user_by_email failed")
+        .expect("user2 should still exist after group deletion");
+    assert_eq!(fetched_u2.id, user2.id);
+
+    // The scim_group_members rows should be gone (verified via DB query)
+    let orphaned_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM scim_group_members WHERE group_id = $1")
+            .bind(group.id)
+            .fetch_one(&pool)
+            .await
+            .expect("orphan count query failed");
+
+    assert_eq!(
+        orphaned_count, 0,
+        "All scim_group_members rows for the deleted group should be CASCADE deleted"
+    );
+}
+
+// ============================================================
+// test_add_and_get_scim_group_members
+// ============================================================
+
+/// Add two users to a group via add_scim_group_member; get_scim_group_members
+/// should return both.
+#[tokio::test]
+async fn test_add_and_get_scim_group_members() {
+    let pool = helpers::setup_test_db().await;
+    let idp = helpers::create_test_idp(&pool, "scim-group-add-get-members-idp").await;
+
+    let group = scim_groups::create_scim_group(&pool, "MembersGroup", None, idp.id)
+        .await
+        .expect("create_scim_group failed");
 
     let user1 = users::create_scim_user(
         &pool,
@@ -187,69 +274,69 @@ async fn test_get_team_members() {
     .await
     .expect("create_scim_user failed");
 
-    // Assign both users to the team
-    teams::add_team_member(&pool, team.id, user1.id)
+    let added1 = scim_groups::add_scim_group_member(&pool, group.id, user1.id)
         .await
-        .expect("add_team_member failed");
-    teams::add_team_member(&pool, team.id, user2.id)
+        .expect("add_scim_group_member user1 failed");
+    assert!(added1, "First add should return true");
+
+    let added2 = scim_groups::add_scim_group_member(&pool, group.id, user2.id)
         .await
-        .expect("add_team_member failed");
+        .expect("add_scim_group_member user2 failed");
+    assert!(added2, "Second add should return true");
 
-    let members = teams::get_team_members(&pool, team.id)
+    let members = scim_groups::get_scim_group_members(&pool, group.id)
         .await
-        .expect("get_team_members failed");
+        .expect("get_scim_group_members failed");
 
-    assert_eq!(members.len(), 2, "Team should have 2 members");
-
+    assert_eq!(members.len(), 2, "Group should have 2 members");
     let member_ids: Vec<Uuid> = members.iter().map(|u| u.id).collect();
-    assert!(member_ids.contains(&user1.id), "member1 should be in team");
-    assert!(member_ids.contains(&user2.id), "member2 should be in team");
+    assert!(member_ids.contains(&user1.id), "user1 should be a member");
+    assert!(member_ids.contains(&user2.id), "user2 should be a member");
 }
 
 // ============================================================
-// test_get_team_members_empty
+// test_get_scim_group_members_empty
 // ============================================================
 
-/// A team with no users should return an empty vec.
+/// A newly created group with no members returns an empty vec.
 #[tokio::test]
-async fn test_get_team_members_empty() {
+async fn test_get_scim_group_members_empty() {
     let pool = helpers::setup_test_db().await;
     let idp = helpers::create_test_idp(&pool, "scim-group-empty-members-idp").await;
 
-    let team = teams::create_scim_team(&pool, "Empty Team", None, None, idp.id)
+    let group = scim_groups::create_scim_group(&pool, "EmptyGroup", None, idp.id)
         .await
-        .expect("create_scim_team failed");
+        .expect("create_scim_group failed");
 
-    let members = teams::get_team_members(&pool, team.id)
+    let members = scim_groups::get_scim_group_members(&pool, group.id)
         .await
-        .expect("get_team_members failed");
+        .expect("get_scim_group_members failed");
 
     assert!(
         members.is_empty(),
-        "Team with no users should return empty vec"
+        "Group with no members should return empty vec"
     );
 }
 
 // ============================================================
-// test_set_team_members
+// test_set_scim_group_members_replaces
 // ============================================================
 
-/// set_team_members atomically replaces the full member list.
-/// Old members are removed; new members are assigned.
+/// set_scim_group_members atomically replaces the full member list.
+/// Set [A, B], then set [C, D] — only C and D should remain.
 #[tokio::test]
-async fn test_set_team_members() {
+async fn test_set_scim_group_members_replaces() {
     let pool = helpers::setup_test_db().await;
     let idp = helpers::create_test_idp(&pool, "scim-group-set-members-idp").await;
 
-    let team = teams::create_scim_team(&pool, "Set Members Team", None, None, idp.id)
+    let group = scim_groups::create_scim_group(&pool, "SetMembersGroup", None, idp.id)
         .await
-        .expect("create_scim_team failed");
+        .expect("create_scim_group failed");
 
-    // Create 4 users
-    let user1 = users::create_scim_user(
+    let user_a = users::create_scim_user(
         &pool,
-        "set-u1@example.com",
-        Some("ext-set-u1"),
+        "set-ua@example.com",
+        Some("ext-set-ua"),
         None,
         None,
         None,
@@ -257,12 +344,12 @@ async fn test_set_team_members() {
         idp.id,
     )
     .await
-    .expect("create_scim_user failed");
+    .expect("create_scim_user user_a failed");
 
-    let user2 = users::create_scim_user(
+    let user_b = users::create_scim_user(
         &pool,
-        "set-u2@example.com",
-        Some("ext-set-u2"),
+        "set-ub@example.com",
+        Some("ext-set-ub"),
         None,
         None,
         None,
@@ -270,12 +357,12 @@ async fn test_set_team_members() {
         idp.id,
     )
     .await
-    .expect("create_scim_user failed");
+    .expect("create_scim_user user_b failed");
 
-    let user3 = users::create_scim_user(
+    let user_c = users::create_scim_user(
         &pool,
-        "set-u3@example.com",
-        Some("ext-set-u3"),
+        "set-uc@example.com",
+        Some("ext-set-uc"),
         None,
         None,
         None,
@@ -283,12 +370,12 @@ async fn test_set_team_members() {
         idp.id,
     )
     .await
-    .expect("create_scim_user failed");
+    .expect("create_scim_user user_c failed");
 
-    let user4 = users::create_scim_user(
+    let user_d = users::create_scim_user(
         &pool,
-        "set-u4@example.com",
-        Some("ext-set-u4"),
+        "set-ud@example.com",
+        Some("ext-set-ud"),
         None,
         None,
         None,
@@ -296,126 +383,61 @@ async fn test_set_team_members() {
         idp.id,
     )
     .await
-    .expect("create_scim_user failed");
+    .expect("create_scim_user user_d failed");
 
-    // Assign user1 and user2 as initial members
-    teams::set_team_members(&pool, team.id, &[user1.id, user2.id])
+    // Initial set: A and B
+    scim_groups::set_scim_group_members(&pool, group.id, &[user_a.id, user_b.id])
         .await
-        .expect("set_team_members (initial) failed");
+        .expect("set_scim_group_members (initial) failed");
 
-    // Verify initial state
-    let initial_members = teams::get_team_members(&pool, team.id)
+    let initial = scim_groups::get_scim_group_members(&pool, group.id)
         .await
-        .expect("get_team_members failed");
-    assert_eq!(initial_members.len(), 2, "Initial member count should be 2");
+        .expect("get_scim_group_members after initial set failed");
+    assert_eq!(initial.len(), 2, "Initial member count should be 2");
 
-    // Replace with user3 and user4
-    teams::set_team_members(&pool, team.id, &[user3.id, user4.id])
+    // Replace with C and D
+    scim_groups::set_scim_group_members(&pool, group.id, &[user_c.id, user_d.id])
         .await
-        .expect("set_team_members (replace) failed");
+        .expect("set_scim_group_members (replace) failed");
 
-    let new_members = teams::get_team_members(&pool, team.id)
+    let after = scim_groups::get_scim_group_members(&pool, group.id)
         .await
-        .expect("get_team_members after replacement failed");
+        .expect("get_scim_group_members after replacement failed");
 
-    let new_member_ids: Vec<Uuid> = new_members.iter().map(|u| u.id).collect();
+    let after_ids: Vec<Uuid> = after.iter().map(|u| u.id).collect();
 
-    assert_eq!(
-        new_members.len(),
-        2,
-        "Member count after replacement should be 2"
+    assert_eq!(after.len(), 2, "Member count after replacement should be 2");
+    assert!(
+        !after_ids.contains(&user_a.id),
+        "user_a should be removed after set_scim_group_members"
     );
     assert!(
-        !new_member_ids.contains(&user1.id),
-        "user1 should be removed after set_team_members"
+        !after_ids.contains(&user_b.id),
+        "user_b should be removed after set_scim_group_members"
     );
     assert!(
-        !new_member_ids.contains(&user2.id),
-        "user2 should be removed after set_team_members"
+        after_ids.contains(&user_c.id),
+        "user_c should be in the new member list"
     );
     assert!(
-        new_member_ids.contains(&user3.id),
-        "user3 should be a new member"
-    );
-    assert!(
-        new_member_ids.contains(&user4.id),
-        "user4 should be a new member"
-    );
-
-    // Verify old members no longer have this team_id
-    let fetched_u1 = db::users::get_user_by_email(&pool, "set-u1@example.com")
-        .await
-        .expect("get_user_by_email failed")
-        .expect("user1 should still exist");
-    assert!(
-        fetched_u1.team_id.is_none(),
-        "user1 team_id should be NULL after being removed from team"
+        after_ids.contains(&user_d.id),
+        "user_d should be in the new member list"
     );
 }
 
 // ============================================================
-// test_add_team_member
+// test_remove_scim_group_member
 // ============================================================
 
-/// add_team_member sets the user's team_id to the given team.
+/// Add a user to a group, remove them, verify empty member list.
 #[tokio::test]
-async fn test_add_team_member() {
-    let pool = helpers::setup_test_db().await;
-    let idp = helpers::create_test_idp(&pool, "scim-group-add-member-idp").await;
-
-    let team = teams::create_scim_team(&pool, "Add Member Team", None, None, idp.id)
-        .await
-        .expect("create_scim_team failed");
-
-    let user = users::create_scim_user(
-        &pool,
-        "add-member@example.com",
-        Some("ext-add-member"),
-        None,
-        None,
-        None,
-        "member",
-        idp.id,
-    )
-    .await
-    .expect("create_scim_user failed");
-
-    assert!(user.team_id.is_none(), "User should start without a team");
-
-    let updated = teams::add_team_member(&pool, team.id, user.id)
-        .await
-        .expect("add_team_member failed");
-
-    assert!(
-        updated,
-        "add_team_member should return true when user was found"
-    );
-
-    let fetched = db::users::get_user_by_email(&pool, "add-member@example.com")
-        .await
-        .expect("get_user_by_email failed")
-        .expect("User should still exist");
-
-    assert_eq!(
-        fetched.team_id,
-        Some(team.id),
-        "User team_id should be set to the team after add_team_member"
-    );
-}
-
-// ============================================================
-// test_remove_team_member
-// ============================================================
-
-/// remove_team_member sets the user's team_id to NULL.
-#[tokio::test]
-async fn test_remove_team_member() {
+async fn test_remove_scim_group_member() {
     let pool = helpers::setup_test_db().await;
     let idp = helpers::create_test_idp(&pool, "scim-group-remove-member-idp").await;
 
-    let team = teams::create_scim_team(&pool, "Remove Member Team", None, None, idp.id)
+    let group = scim_groups::create_scim_group(&pool, "RemoveMemberGroup", None, idp.id)
         .await
-        .expect("create_scim_team failed");
+        .expect("create_scim_group failed");
 
     let user = users::create_scim_user(
         &pool,
@@ -430,255 +452,206 @@ async fn test_remove_team_member() {
     .await
     .expect("create_scim_user failed");
 
-    // First add the user
-    teams::add_team_member(&pool, team.id, user.id)
+    scim_groups::add_scim_group_member(&pool, group.id, user.id)
         .await
-        .expect("add_team_member failed");
+        .expect("add_scim_group_member failed");
 
-    // Verify they are assigned
-    let after_add = db::users::get_user_by_email(&pool, "remove-member@example.com")
+    let removed = scim_groups::remove_scim_group_member(&pool, group.id, user.id)
         .await
-        .expect("get_user_by_email failed")
-        .expect("User should exist");
-    assert_eq!(
-        after_add.team_id,
-        Some(team.id),
-        "User should be in team before removal"
-    );
-
-    // Remove the user
-    let removed = teams::remove_team_member(&pool, team.id, user.id)
-        .await
-        .expect("remove_team_member failed");
+        .expect("remove_scim_group_member failed");
 
     assert!(
         removed,
-        "remove_team_member should return true when user was a member"
+        "remove_scim_group_member should return true when the member existed"
     );
 
-    let after_remove = db::users::get_user_by_email(&pool, "remove-member@example.com")
+    let members = scim_groups::get_scim_group_members(&pool, group.id)
         .await
-        .expect("get_user_by_email failed")
-        .expect("User should still exist after removal");
+        .expect("get_scim_group_members failed");
 
     assert!(
-        after_remove.team_id.is_none(),
-        "User team_id should be NULL after remove_team_member"
+        members.is_empty(),
+        "Group should be empty after removing the only member"
     );
 }
 
 // ============================================================
-// test_list_teams_for_idp
+// test_add_scim_group_member_idempotent
 // ============================================================
 
-/// Create teams for two IDPs; listing for IDP-A returns only IDP-A teams.
+/// Adding the same user to a group twice must not error (ON CONFLICT DO NOTHING).
+/// The second insert returns false (no rows affected) but does not panic.
 #[tokio::test]
-async fn test_list_teams_for_idp() {
+async fn test_add_scim_group_member_idempotent() {
+    let pool = helpers::setup_test_db().await;
+    let idp = helpers::create_test_idp(&pool, "scim-group-idempotent-idp").await;
+
+    let group = scim_groups::create_scim_group(&pool, "IdempotentGroup", None, idp.id)
+        .await
+        .expect("create_scim_group failed");
+
+    let user = users::create_scim_user(
+        &pool,
+        "idempotent-user@example.com",
+        Some("ext-idempotent"),
+        None,
+        None,
+        None,
+        "member",
+        idp.id,
+    )
+    .await
+    .expect("create_scim_user failed");
+
+    let first = scim_groups::add_scim_group_member(&pool, group.id, user.id)
+        .await
+        .expect("first add_scim_group_member failed");
+    assert!(first, "First add should return true");
+
+    // Second add — should not error; rows_affected = 0
+    let second = scim_groups::add_scim_group_member(&pool, group.id, user.id)
+        .await
+        .expect("second add_scim_group_member must not return an error");
+    assert!(
+        !second,
+        "Second add should return false (ON CONFLICT DO NOTHING)"
+    );
+
+    // Member count must still be 1
+    let members = scim_groups::get_scim_group_members(&pool, group.id)
+        .await
+        .expect("get_scim_group_members failed");
+    assert_eq!(
+        members.len(),
+        1,
+        "Duplicate add must not create duplicate row"
+    );
+}
+
+// ============================================================
+// test_list_scim_groups_for_idp
+// ============================================================
+
+/// Create groups for two IDPs; listing for IDP-A returns only IDP-A groups.
+#[tokio::test]
+async fn test_list_scim_groups_for_idp() {
     let pool = helpers::setup_test_db().await;
     let idp_a = helpers::create_test_idp(&pool, "scim-group-list-idp-a").await;
     let idp_b = helpers::create_test_idp(&pool, "scim-group-list-idp-b").await;
 
-    // Create 2 teams for IDP-A and 1 for IDP-B
-    teams::create_scim_team(&pool, "Alpha Team", Some("ext-alpha"), None, idp_a.id)
+    scim_groups::create_scim_group(&pool, "Alpha Group", Some("ext-alpha"), idp_a.id)
         .await
-        .expect("create_scim_team IDP-A #1 failed");
+        .expect("create_scim_group IDP-A #1 failed");
 
-    teams::create_scim_team(&pool, "Beta Team", Some("ext-beta"), None, idp_a.id)
+    scim_groups::create_scim_group(&pool, "Beta Group", Some("ext-beta"), idp_a.id)
         .await
-        .expect("create_scim_team IDP-A #2 failed");
+        .expect("create_scim_group IDP-A #2 failed");
 
-    teams::create_scim_team(&pool, "Gamma Team", Some("ext-gamma"), None, idp_b.id)
+    scim_groups::create_scim_group(&pool, "Gamma Group", Some("ext-gamma"), idp_b.id)
         .await
-        .expect("create_scim_team IDP-B failed");
+        .expect("create_scim_group IDP-B failed");
 
-    let (teams_a, total_a) = teams::list_teams_for_idp(&pool, idp_a.id, None, 0, 100)
+    let (groups_a, total_a) = scim_groups::list_scim_groups_for_idp(&pool, idp_a.id, None, 0, 100)
         .await
-        .expect("list_teams_for_idp failed");
+        .expect("list_scim_groups_for_idp IDP-A failed");
 
-    assert_eq!(teams_a.len(), 2, "Should return exactly 2 teams for IDP-A");
+    assert_eq!(
+        groups_a.len(),
+        2,
+        "Should return exactly 2 groups for IDP-A"
+    );
     assert_eq!(total_a, 2, "Total count should be 2 for IDP-A");
 
-    for t in &teams_a {
-        assert_eq!(
-            t.idp_id,
-            Some(idp_a.id),
-            "All listed teams must belong to IDP-A"
-        );
+    for g in &groups_a {
+        assert_eq!(g.idp_id, idp_a.id, "All listed groups must belong to IDP-A");
     }
 
-    let (teams_b, total_b) = teams::list_teams_for_idp(&pool, idp_b.id, None, 0, 100)
+    let (groups_b, total_b) = scim_groups::list_scim_groups_for_idp(&pool, idp_b.id, None, 0, 100)
         .await
-        .expect("list_teams_for_idp for IDP-B failed");
+        .expect("list_scim_groups_for_idp IDP-B failed");
 
-    assert_eq!(teams_b.len(), 1, "Should return exactly 1 team for IDP-B");
+    assert_eq!(groups_b.len(), 1, "Should return exactly 1 group for IDP-B");
     assert_eq!(total_b, 1);
 }
 
 // ============================================================
-// test_list_teams_for_idp_with_filter
+// test_list_scim_groups_filter_display_name
 // ============================================================
 
-/// Filtering by displayName eq "Engineering" returns only the matching team.
+/// Filtering by displayName eq "Engineering" returns only the matching group.
 #[tokio::test]
-async fn test_list_teams_for_idp_with_filter() {
+async fn test_list_scim_groups_filter_display_name() {
     let pool = helpers::setup_test_db().await;
     let idp = helpers::create_test_idp(&pool, "scim-group-filter-idp").await;
 
-    teams::create_scim_team(&pool, "Engineering", Some("ext-eng"), None, idp.id)
+    scim_groups::create_scim_group(&pool, "Engineering", Some("ext-eng"), idp.id)
         .await
-        .expect("create_scim_team Engineering failed");
+        .expect("create_scim_group Engineering failed");
 
-    teams::create_scim_team(&pool, "Design", Some("ext-design"), None, idp.id)
+    scim_groups::create_scim_group(&pool, "Design", Some("ext-design"), idp.id)
         .await
-        .expect("create_scim_team Design failed");
+        .expect("create_scim_group Design failed");
 
-    teams::create_scim_team(&pool, "Product", Some("ext-product"), None, idp.id)
+    scim_groups::create_scim_group(&pool, "Product", Some("ext-product"), idp.id)
         .await
-        .expect("create_scim_team Product failed");
+        .expect("create_scim_group Product failed");
 
     let filter = ScimFilter::Eq("displayName".to_string(), "Engineering".to_string());
 
-    let (result, total) = teams::list_teams_for_idp(&pool, idp.id, Some(&filter), 0, 100)
-        .await
-        .expect("list_teams_for_idp with filter failed");
+    let (result, total) =
+        scim_groups::list_scim_groups_for_idp(&pool, idp.id, Some(&filter), 0, 100)
+            .await
+            .expect("list_scim_groups_for_idp with filter failed");
 
     assert_eq!(result.len(), 1, "Filter should return only Engineering");
     assert_eq!(total, 1);
-    assert_eq!(result[0].name, "Engineering");
-}
-
-/// displayName eq filter is case-insensitive.
-#[tokio::test]
-async fn test_list_teams_for_idp_filter_case_insensitive() {
-    let pool = helpers::setup_test_db().await;
-    let idp = helpers::create_test_idp(&pool, "scim-group-filter-case-idp").await;
-
-    teams::create_scim_team(&pool, "SalesTeam", Some("ext-sales"), None, idp.id)
-        .await
-        .expect("create_scim_team failed");
-
-    // Match with different casing
-    let filter = ScimFilter::Eq("displayName".to_string(), "salesteam".to_string());
-
-    let (result, total) = teams::list_teams_for_idp(&pool, idp.id, Some(&filter), 0, 100)
-        .await
-        .expect("list_teams_for_idp with case-insensitive filter failed");
-
-    assert_eq!(result.len(), 1, "Case-insensitive eq filter should match");
-    assert_eq!(total, 1);
+    assert_eq!(result[0].display_name, "Engineering");
 }
 
 // ============================================================
-// test_list_teams_for_idp_pagination
+// test_list_scim_groups_pagination
 // ============================================================
 
-/// Create 5 teams, list with offset=2, limit=2; verify correct slice and total_count=5.
+/// Create 5 groups, paginate with offset=2 limit=2; verify correct slice and total=5.
 #[tokio::test]
-async fn test_list_teams_for_idp_pagination() {
+async fn test_list_scim_groups_pagination() {
     let pool = helpers::setup_test_db().await;
     let idp = helpers::create_test_idp(&pool, "scim-group-pagination-idp").await;
 
     for i in 1..=5 {
-        teams::create_scim_team(
+        scim_groups::create_scim_group(
             &pool,
-            &format!("Page Team {:02}", i),
+            &format!("Page Group {:02}", i),
             Some(&format!("ext-page-{i:02}")),
-            None,
             idp.id,
         )
         .await
-        .expect("create_scim_team failed");
+        .expect("create_scim_group failed");
     }
 
-    // offset=2 (0-based), limit=2 → should return teams 3 and 4 (sorted by name)
-    let (page, total) = teams::list_teams_for_idp(&pool, idp.id, None, 2, 2)
+    // offset=2 (0-based), limit=2 → should return groups 3 and 4 (sorted by display_name)
+    let (page, total) = scim_groups::list_scim_groups_for_idp(&pool, idp.id, None, 2, 2)
         .await
-        .expect("list_teams_for_idp pagination failed");
+        .expect("list_scim_groups_for_idp pagination failed");
 
     assert_eq!(page.len(), 2, "Should return exactly 2 results per page");
     assert_eq!(total, 5, "Total count must be 5 regardless of pagination");
 }
 
-/// Pagination beyond the last team returns empty results with correct total.
-#[tokio::test]
-async fn test_list_teams_for_idp_pagination_beyond_end() {
-    let pool = helpers::setup_test_db().await;
-    let idp = helpers::create_test_idp(&pool, "scim-group-pagination-beyond-idp").await;
-
-    for i in 1..=3 {
-        teams::create_scim_team(
-            &pool,
-            &format!("Beyond Team {i}"),
-            Some(&format!("ext-beyond-{i}")),
-            None,
-            idp.id,
-        )
-        .await
-        .expect("create_scim_team failed");
-    }
-
-    // offset=10 is beyond all 3 teams
-    let (page, total) = teams::list_teams_for_idp(&pool, idp.id, None, 10, 2)
-        .await
-        .expect("list_teams_for_idp beyond end failed");
-
-    assert!(
-        page.is_empty(),
-        "Page beyond end should return empty results"
-    );
-    assert_eq!(total, 3, "Total count should still be 3");
-}
-
 // ============================================================
-// test_create_scim_team_duplicate_name
+// test_evaluate_user_role_no_groups
 // ============================================================
 
-/// Creating two SCIM teams with the same name should fail (DB unique constraint).
+/// A user who belongs to no SCIM groups gets the IDP's default_role ("member").
 #[tokio::test]
-async fn test_create_scim_team_duplicate_name() {
+async fn test_evaluate_user_role_no_groups() {
     let pool = helpers::setup_test_db().await;
-    let idp = helpers::create_test_idp(&pool, "scim-group-dup-name-idp").await;
+    let idp = helpers::create_test_idp(&pool, "scim-role-no-groups-idp").await;
 
-    teams::create_scim_team(&pool, "Duplicate Team", Some("ext-dup-001"), None, idp.id)
-        .await
-        .expect("First create_scim_team should succeed");
-
-    // Second team with the same name (teams.name has a unique constraint)
-    let result = teams::create_scim_team(
+    let user = users::create_scim_user(
         &pool,
-        "Duplicate Team",
-        Some("ext-dup-002"), // different external_id
-        None,
-        idp.id,
-    )
-    .await;
-
-    assert!(
-        result.is_err(),
-        "Creating a second team with the same name must fail due to unique constraint"
-    );
-}
-
-// ============================================================
-// test_delete_scim_team_unassigns_members
-// ============================================================
-
-/// Hard-delete a team after unassigning its members.
-/// After set_team_members([]) followed by delete_team, users' team_id is NULL
-/// and the team row no longer exists.
-#[tokio::test]
-async fn test_delete_scim_team_unassigns_members() {
-    let pool = helpers::setup_test_db().await;
-    let idp = helpers::create_test_idp(&pool, "scim-group-delete-idp").await;
-
-    let team = teams::create_scim_team(&pool, "Delete Me Team", None, None, idp.id)
-        .await
-        .expect("create_scim_team failed");
-
-    let user1 = users::create_scim_user(
-        &pool,
-        "del-u1@example.com",
-        Some("ext-del-u1"),
+        "no-groups@example.com",
+        Some("ext-no-groups"),
         None,
         None,
         None,
@@ -688,70 +661,298 @@ async fn test_delete_scim_team_unassigns_members() {
     .await
     .expect("create_scim_user failed");
 
-    let user2 = users::create_scim_user(
-        &pool,
-        "del-u2@example.com",
-        Some("ext-del-u2"),
-        None,
-        None,
-        None,
-        "member",
-        idp.id,
-    )
-    .await
-    .expect("create_scim_user failed");
-
-    // Assign both users
-    teams::set_team_members(&pool, team.id, &[user1.id, user2.id])
+    let role = scim_groups::evaluate_user_role(&pool, user.id, idp.id)
         .await
-        .expect("set_team_members failed");
+        .expect("evaluate_user_role failed");
 
-    // Verify members are assigned
-    let before_delete = teams::get_team_members(&pool, team.id)
-        .await
-        .expect("get_team_members failed");
+    // IDP default_role is "member" (from create_test_idp)
     assert_eq!(
-        before_delete.len(),
-        2,
-        "Should have 2 members before delete"
+        role, "member",
+        "User with no groups should get default_role"
     );
+}
 
-    // Unassign all members (as delete_group handler does)
-    teams::set_team_members(&pool, team.id, &[])
-        .await
-        .expect("set_team_members (unassign all) failed");
+// ============================================================
+// test_evaluate_user_role_admin_group
+// ============================================================
 
-    // Hard-delete the team
-    let deleted = teams::delete_team(&pool, team.id)
-        .await
-        .expect("delete_team failed");
-    assert!(deleted, "delete_team should return true for existing team");
+/// User in a group whose display_name is in scim_admin_groups → role = "admin".
+#[tokio::test]
+async fn test_evaluate_user_role_admin_group() {
+    let pool = helpers::setup_test_db().await;
+    let idp = helpers::create_test_idp(&pool, "scim-role-admin-group-idp").await;
 
-    // Team row must no longer exist
-    let fetched_team = teams::get_team(&pool, team.id)
+    // Set scim_admin_groups = ["admins"] on the IDP
+    sqlx::query("UPDATE identity_providers SET scim_admin_groups = $1::jsonb WHERE id = $2")
+        .bind(serde_json::json!(["admins"]).to_string())
+        .bind(idp.id)
+        .execute(&pool)
         .await
-        .expect("get_team failed");
-    assert!(
-        fetched_team.is_none(),
-        "Team should not exist after hard delete"
+        .expect("set scim_admin_groups failed");
+
+    let admin_group = scim_groups::create_scim_group(&pool, "admins", Some("ext-admins"), idp.id)
+        .await
+        .expect("create_scim_group failed");
+
+    let user = users::create_scim_user(
+        &pool,
+        "admin-user@example.com",
+        Some("ext-admin-user"),
+        None,
+        None,
+        None,
+        "member",
+        idp.id,
+    )
+    .await
+    .expect("create_scim_user failed");
+
+    scim_groups::add_scim_group_member(&pool, admin_group.id, user.id)
+        .await
+        .expect("add_scim_group_member failed");
+
+    let role = scim_groups::evaluate_user_role(&pool, user.id, idp.id)
+        .await
+        .expect("evaluate_user_role failed");
+
+    assert_eq!(
+        role, "admin",
+        "User in scim_admin_groups group should get role=admin"
     );
+}
 
-    // Users must still exist with team_id = NULL
-    let fetched_u1 = db::users::get_user_by_email(&pool, "del-u1@example.com")
+// ============================================================
+// test_evaluate_user_role_non_admin_group
+// ============================================================
+
+/// User in a group NOT in scim_admin_groups → default_role ("member").
+#[tokio::test]
+async fn test_evaluate_user_role_non_admin_group() {
+    let pool = helpers::setup_test_db().await;
+    let idp = helpers::create_test_idp(&pool, "scim-role-non-admin-group-idp").await;
+
+    // Set scim_admin_groups = ["admin-only"] — the user's group is "developers"
+    sqlx::query("UPDATE identity_providers SET scim_admin_groups = $1::jsonb WHERE id = $2")
+        .bind(serde_json::json!(["admin-only"]).to_string())
+        .bind(idp.id)
+        .execute(&pool)
+        .await
+        .expect("set scim_admin_groups failed");
+
+    let dev_group = scim_groups::create_scim_group(&pool, "developers", Some("ext-devs"), idp.id)
+        .await
+        .expect("create_scim_group failed");
+
+    let user = users::create_scim_user(
+        &pool,
+        "dev-user@example.com",
+        Some("ext-dev-user"),
+        None,
+        None,
+        None,
+        "member",
+        idp.id,
+    )
+    .await
+    .expect("create_scim_user failed");
+
+    scim_groups::add_scim_group_member(&pool, dev_group.id, user.id)
+        .await
+        .expect("add_scim_group_member failed");
+
+    let role = scim_groups::evaluate_user_role(&pool, user.id, idp.id)
+        .await
+        .expect("evaluate_user_role failed");
+
+    assert_eq!(
+        role, "member",
+        "User in a non-admin group should get default_role"
+    );
+}
+
+// ============================================================
+// test_sync_user_role_promotes_to_admin
+// ============================================================
+
+/// Add user to admin group, sync_user_role → user.role = "admin" in DB.
+#[tokio::test]
+async fn test_sync_user_role_promotes_to_admin() {
+    let pool = helpers::setup_test_db().await;
+    let idp = helpers::create_test_idp(&pool, "scim-sync-promote-idp").await;
+
+    sqlx::query("UPDATE identity_providers SET scim_admin_groups = $1::jsonb WHERE id = $2")
+        .bind(serde_json::json!(["superadmins"]).to_string())
+        .bind(idp.id)
+        .execute(&pool)
+        .await
+        .expect("set scim_admin_groups failed");
+
+    let admin_group =
+        scim_groups::create_scim_group(&pool, "superadmins", Some("ext-superadmins"), idp.id)
+            .await
+            .expect("create_scim_group failed");
+
+    let user = users::create_scim_user(
+        &pool,
+        "promote-user@example.com",
+        Some("ext-promote-user"),
+        None,
+        None,
+        None,
+        "member", // starts as member
+        idp.id,
+    )
+    .await
+    .expect("create_scim_user failed");
+
+    scim_groups::add_scim_group_member(&pool, admin_group.id, user.id)
+        .await
+        .expect("add_scim_group_member failed");
+
+    scim_groups::sync_user_role(&pool, user.id, idp.id)
+        .await
+        .expect("sync_user_role failed");
+
+    let updated = users::get_user_by_email(&pool, "promote-user@example.com")
         .await
         .expect("get_user_by_email failed")
-        .expect("user1 should still exist after team deletion");
-    assert!(
-        fetched_u1.team_id.is_none(),
-        "user1 team_id should be NULL after team was deleted"
-    );
+        .expect("user should still exist");
 
-    let fetched_u2 = db::users::get_user_by_email(&pool, "del-u2@example.com")
+    assert_eq!(
+        updated.role, "admin",
+        "sync_user_role should promote user to admin when they are in an admin group"
+    );
+}
+
+// ============================================================
+// test_sync_user_role_demotes_to_member
+// ============================================================
+
+/// Remove user from admin group, sync_user_role → user.role = "member" in DB.
+#[tokio::test]
+async fn test_sync_user_role_demotes_to_member() {
+    let pool = helpers::setup_test_db().await;
+    let idp = helpers::create_test_idp(&pool, "scim-sync-demote-idp").await;
+
+    sqlx::query("UPDATE identity_providers SET scim_admin_groups = $1::jsonb WHERE id = $2")
+        .bind(serde_json::json!(["ops-admins"]).to_string())
+        .bind(idp.id)
+        .execute(&pool)
+        .await
+        .expect("set scim_admin_groups failed");
+
+    let admin_group =
+        scim_groups::create_scim_group(&pool, "ops-admins", Some("ext-ops-admins"), idp.id)
+            .await
+            .expect("create_scim_group failed");
+
+    let user = users::create_scim_user(
+        &pool,
+        "demote-user@example.com",
+        Some("ext-demote-user"),
+        None,
+        None,
+        None,
+        "admin", // starts as admin
+        idp.id,
+    )
+    .await
+    .expect("create_scim_user failed");
+
+    // Add to admin group
+    scim_groups::add_scim_group_member(&pool, admin_group.id, user.id)
+        .await
+        .expect("add_scim_group_member failed");
+
+    // Verify they are admin after sync
+    scim_groups::sync_user_role(&pool, user.id, idp.id)
+        .await
+        .expect("sync_user_role (initial) failed");
+
+    let after_add = users::get_user_by_email(&pool, "demote-user@example.com")
         .await
         .expect("get_user_by_email failed")
-        .expect("user2 should still exist after team deletion");
-    assert!(
-        fetched_u2.team_id.is_none(),
-        "user2 team_id should be NULL after team was deleted"
+        .expect("user should exist");
+    assert_eq!(
+        after_add.role, "admin",
+        "Should be admin while in admin group"
+    );
+
+    // Remove from admin group
+    scim_groups::remove_scim_group_member(&pool, admin_group.id, user.id)
+        .await
+        .expect("remove_scim_group_member failed");
+
+    // Sync again
+    scim_groups::sync_user_role(&pool, user.id, idp.id)
+        .await
+        .expect("sync_user_role (after remove) failed");
+
+    let after_remove = users::get_user_by_email(&pool, "demote-user@example.com")
+        .await
+        .expect("get_user_by_email failed")
+        .expect("user should still exist");
+
+    assert_eq!(
+        after_remove.role, "member",
+        "sync_user_role should demote user to member when removed from all admin groups"
+    );
+}
+
+// ============================================================
+// test_evaluate_user_role_multiple_groups
+// ============================================================
+
+/// User in both an admin group and a non-admin group → "admin" (any match wins).
+#[tokio::test]
+async fn test_evaluate_user_role_multiple_groups() {
+    let pool = helpers::setup_test_db().await;
+    let idp = helpers::create_test_idp(&pool, "scim-role-multi-group-idp").await;
+
+    // Only "sre-admins" is in scim_admin_groups; "developers" is not
+    sqlx::query("UPDATE identity_providers SET scim_admin_groups = $1::jsonb WHERE id = $2")
+        .bind(serde_json::json!(["sre-admins"]).to_string())
+        .bind(idp.id)
+        .execute(&pool)
+        .await
+        .expect("set scim_admin_groups failed");
+
+    let admin_group =
+        scim_groups::create_scim_group(&pool, "sre-admins", Some("ext-sre-admins"), idp.id)
+            .await
+            .expect("create admin group failed");
+
+    let dev_group = scim_groups::create_scim_group(&pool, "developers", Some("ext-devs2"), idp.id)
+        .await
+        .expect("create dev group failed");
+
+    let user = users::create_scim_user(
+        &pool,
+        "multi-group-user@example.com",
+        Some("ext-multi-group"),
+        None,
+        None,
+        None,
+        "member",
+        idp.id,
+    )
+    .await
+    .expect("create_scim_user failed");
+
+    // Add user to both groups
+    scim_groups::add_scim_group_member(&pool, admin_group.id, user.id)
+        .await
+        .expect("add to admin group failed");
+    scim_groups::add_scim_group_member(&pool, dev_group.id, user.id)
+        .await
+        .expect("add to dev group failed");
+
+    let role = scim_groups::evaluate_user_role(&pool, user.id, idp.id)
+        .await
+        .expect("evaluate_user_role failed");
+
+    assert_eq!(
+        role, "admin",
+        "User in both admin and non-admin groups should be 'admin' (any-match wins)"
     );
 }

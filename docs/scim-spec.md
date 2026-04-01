@@ -1,12 +1,14 @@
 # SCIM 2.0 API Specification for CCAG
 
-> **Status**: Phase 2 (Users) complete, Phase 3 (Groups) in progress. This spec covers all phases for upfront architecture review.
+> **Status**: Complete (Users + Groups + Admin API + CLI + Portal UI).
 >
 > **Standards**: [RFC 7644](https://datatracker.ietf.org/doc/html/rfc7644) (Protocol), [RFC 7643](https://datatracker.ietf.org/doc/html/rfc7643) (Core Schema)
 
 ## Overview
 
-CCAG implements a SCIM 2.0 service provider that enables identity providers (Okta, Entra ID, OneLogin, etc.) to automatically provision and deprovision users and groups (teams). All SCIM endpoints are mounted under `/scim/v2/`.
+CCAG implements a SCIM 2.0 service provider that enables identity providers (Okta, Entra ID, OneLogin, etc.) to automatically provision and deprovision users and manage role assignments via groups. All SCIM endpoints are mounted under `/scim/v2/`.
+
+**Key design decision**: SCIM Groups map to **roles** (admin/member), not CCAG teams. CCAG teams are budget/routing units managed manually via portal or CLI. This separation keeps budget attribution unambiguous (one team per user) while allowing IdPs to control user lifecycle and role assignment.
 
 ### Design Principles
 
@@ -338,15 +340,28 @@ Soft-delete: sets `active = false`. Returns `204 No Content`.
 
 | SCIM Attribute | CCAG Column | Notes |
 |----------------|-------------|-------|
-| `id` | `teams.id` | UUID, server-assigned |
-| `externalId` | `teams.external_id` | IdP's unique ID |
-| `displayName` | `teams.name` | Required |
-| `members[].value` | `users.id` where `team_id = teams.id` | |
-| `meta.created` | `teams.created_at` | |
+| `id` | `scim_groups.id` | UUID, server-assigned |
+| `externalId` | `scim_groups.external_id` | IdP's unique ID |
+| `displayName` | `scim_groups.display_name` | Required |
+| `members[].value` | `scim_group_members.user_id` | Many-to-many join |
+| `meta.created` | `scim_groups.created_at` | |
+
+**Important**: SCIM Groups are **not** CCAG teams. They are lightweight role-mapping groups stored in a separate `scim_groups` table. When group membership changes, CCAG re-evaluates each affected user's role based on the IDP's `scim_admin_groups` configuration.
+
+#### Role Evaluation
+
+When group membership changes (add/remove/replace members, delete group):
+
+1. Get all `scim_groups` the user belongs to (for this IDP)
+2. Get the IDP's `scim_admin_groups` list (JSON array of group displayNames)
+3. If any of the user's groups match → set `users.role = "admin"`
+4. Else → set `users.role` to IDP's `default_role` (usually `"member"`)
+
+Configure via: `PUT /admin/idps/{id}/scim-admin-groups` or `ccag scim set-admin-groups --idp <name> --groups "group1,group2"`
 
 ### POST /scim/v2/Groups
 
-Create a group (CCAG team). Returns `201 Created`.
+Create a group. Returns `201 Created`.
 
 **Request**:
 ```json
@@ -362,9 +377,10 @@ Create a group (CCAG team). Returns `201 Created`.
 ```
 
 **Behavior**:
-1. Create team with `name = displayName`, `scim_managed = true`, `idp_id`
-2. Assign members: set `users.team_id` for each member UUID
-3. Return ScimGroup with `Location` header
+1. Create row in `scim_groups` with `display_name`, `external_id`, `idp_id`
+2. Insert members into `scim_group_members` join table
+3. Re-evaluate role for each member (may promote to admin)
+4. Return ScimGroup with `Location` header
 
 ### GET /scim/v2/Groups
 
@@ -376,7 +392,7 @@ Get group with member list. Supports `excludedAttributes=members` query paramete
 
 ### PUT /scim/v2/Groups/{id}
 
-Full replacement including member list. Atomically replaces all members.
+Full replacement including member list. Atomically replaces all members. Re-evaluates roles for both old and new members.
 
 ### PATCH /scim/v2/Groups/{id}
 
@@ -394,10 +410,10 @@ Full replacement including member list. Atomically replaces all members.
 
 | op | path | Effect |
 |----|------|--------|
-| `replace` | `displayName` | Rename team |
-| `add` | `members` | Add users to team |
-| `remove` | `members[value eq "uuid"]` | Remove user from team |
-| `replace` | `members` | Replace full member list |
+| `replace` | `displayName` | Rename group |
+| `add` | `members` | Add users to group, re-evaluate roles |
+| `remove` | `members[value eq "uuid"]` | Remove user from group, re-evaluate role |
+| `replace` | `members` | Replace full member list, re-evaluate all roles |
 
 **Entra ID**: Path-less format for rename: `{"op": "Replace", "value": {"displayName": "..."}}`. Expects `204 No Content` response.
 
@@ -407,7 +423,7 @@ Returns `204 No Content` (Entra ID requirement; other IdPs accept both 200 and 2
 
 ### DELETE /scim/v2/Groups/{id}
 
-Unassigns all members and deletes the team. Returns `204 No Content`.
+Deletes the group (CASCADE removes join table entries). Re-evaluates roles for former members (may demote from admin). Returns `204 No Content`.
 
 ---
 
@@ -453,17 +469,35 @@ CREATE TABLE scim_tokens (
 
 New columns: `active` (BOOL, default true), `external_id` (TEXT, unique where not null), `display_name` (TEXT), `given_name` (TEXT), `family_name` (TEXT), `scim_managed` (BOOL, default false), `idp_id` (UUID FK to identity_providers)
 
-### Extended: teams
+### New Table: scim_groups
 
-New columns: `external_id` (TEXT, unique where not null), `display_name` (TEXT), `scim_managed` (BOOL, default false), `idp_id` (UUID FK to identity_providers)
+```sql
+CREATE TABLE scim_groups (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    external_id TEXT,
+    display_name TEXT NOT NULL,
+    idp_id UUID NOT NULL REFERENCES identity_providers(id) ON DELETE CASCADE,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+```
+
+### New Table: scim_group_members
+
+```sql
+CREATE TABLE scim_group_members (
+    group_id UUID NOT NULL REFERENCES scim_groups(id) ON DELETE CASCADE,
+    user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    PRIMARY KEY (group_id, user_id)
+);
+```
 
 ### Extended: identity_providers
 
-New column: `scim_enabled` (BOOL, default false)
+New columns: `scim_enabled` (BOOL, default false), `scim_admin_groups` (JSONB, default `[]` — array of group displayNames that grant admin role)
 
 ---
 
-## Admin API for SCIM Management (Phase 4)
+## Admin API for SCIM Management
 
 | Method | Path | Description |
 |--------|------|-------------|
@@ -471,6 +505,26 @@ New column: `scim_enabled` (BOOL, default false)
 | GET | `/admin/idps/{idp_id}/scim-tokens` | List tokens |
 | DELETE | `/admin/idps/{idp_id}/scim-tokens/{id}` | Revoke token |
 | PUT | `/admin/idps/{idp_id}/scim` | Enable/disable SCIM |
+| GET | `/admin/idps/{idp_id}/scim-admin-groups` | Get admin group mappings |
+| PUT | `/admin/idps/{idp_id}/scim-admin-groups` | Set admin group mappings |
+| GET | `/admin/teams/{team_id}/members` | List team members |
+| POST | `/admin/teams/{team_id}/members` | Add member to team |
+| DELETE | `/admin/teams/{team_id}/members/{user_id}` | Remove member from team |
+
+## CLI Commands
+
+```bash
+ccag scim enable --idp <name-or-id>              # Enable SCIM for an IDP
+ccag scim disable --idp <name-or-id>             # Disable SCIM
+ccag scim create-token --idp <name> [--name lbl] # Generate bearer token (stdout)
+ccag scim list-tokens --idp <name>               # List tokens
+ccag scim revoke-token --idp <name> --token-id X # Revoke a token
+ccag scim set-admin-groups --idp <name> --groups "g1,g2"  # Set admin groups
+ccag scim status --idp <name>                    # Show SCIM config status
+ccag teams add-member --team <name> --user <email>    # Manual team assignment
+ccag teams remove-member --team <name> --user <email> # Remove from team
+ccag teams members <team-id>                          # List team members
+```
 
 ---
 

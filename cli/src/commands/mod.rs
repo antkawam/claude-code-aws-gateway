@@ -3,6 +3,7 @@ pub mod endpoints;
 pub mod idps;
 pub mod keys;
 pub mod logs;
+pub mod scim;
 pub mod status;
 pub mod teams;
 pub mod update;

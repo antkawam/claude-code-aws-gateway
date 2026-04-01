@@ -91,6 +91,7 @@ pub struct IdentityProvider {
     pub user_claim: Option<String>,
     pub scopes: Option<String>,
     pub scim_enabled: bool,
+    pub scim_admin_groups: serde_json::Value,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
@@ -103,5 +104,14 @@ pub struct ScimToken {
     pub created_by: String,
     pub enabled: bool,
     pub last_used_at: Option<DateTime<Utc>>,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+pub struct ScimGroupRow {
+    pub id: Uuid,
+    pub external_id: Option<String>,
+    pub display_name: String,
+    pub idp_id: Uuid,
     pub created_at: DateTime<Utc>,
 }

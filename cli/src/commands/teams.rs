@@ -69,6 +69,34 @@ pub enum TeamsCommands {
         #[arg(long)]
         strategy: Option<String>,
     },
+
+    /// List team members
+    Members {
+        /// Team ID
+        team_id: String,
+    },
+
+    /// Add a member to a team
+    AddMember {
+        /// Team ID or name
+        #[arg(long)]
+        team: String,
+
+        /// User email or ID
+        #[arg(long)]
+        user: String,
+    },
+
+    /// Remove a member from a team
+    RemoveMember {
+        /// Team ID or name
+        #[arg(long)]
+        team: String,
+
+        /// User email or ID
+        #[arg(long)]
+        user: String,
+    },
 }
 
 pub async fn run(cmd: TeamsCommands, url: Option<String>, token: Option<String>) -> Result<()> {
@@ -220,6 +248,80 @@ pub async fn run(cmd: TeamsCommands, url: Option<String>, token: Option<String>)
                 .await?;
             util::success(&format!("Endpoints updated for team {team_id}"));
         }
+
+        TeamsCommands::Members { team_id } => {
+            let resp = client
+                .get(&format!("/admin/teams/{team_id}/members"))
+                .await?;
+            if let Some(members) = resp["members"].as_array() {
+                if members.is_empty() {
+                    eprintln!("No members in this team.");
+                    return Ok(());
+                }
+                eprintln!("{:<36}  {:<30}  {:<10}  ACTIVE", "ID", "EMAIL", "ROLE");
+                eprintln!("{}", "-".repeat(86));
+                for m in members {
+                    println!(
+                        "{:<36}  {:<30}  {:<10}  {}",
+                        m["id"].as_str().unwrap_or("-"),
+                        m["email"].as_str().unwrap_or("-"),
+                        m["role"].as_str().unwrap_or("-"),
+                        if m["active"].as_bool().unwrap_or(true) {
+                            "yes"
+                        } else {
+                            "no"
+                        },
+                    );
+                }
+            }
+        }
+
+        TeamsCommands::AddMember { team, user } => {
+            // Resolve user: if it looks like a UUID, use as user_id directly.
+            // Otherwise, list users and find by email.
+            let user_id = resolve_user_id(&client, &user).await?;
+            let resp = client
+                .post(
+                    &format!("/admin/teams/{team}/members"),
+                    &serde_json::json!({ "user_id": user_id }),
+                )
+                .await?;
+            if resp.get("added").is_some() {
+                util::success(&format!("User {user} added to team {team}"));
+            } else {
+                let msg = resp["error"]["message"]
+                    .as_str()
+                    .unwrap_or("Failed to add member");
+                util::error(msg);
+            }
+        }
+
+        TeamsCommands::RemoveMember { team, user } => {
+            let user_id = resolve_user_id(&client, &user).await?;
+            client
+                .delete(&format!("/admin/teams/{team}/members/{user_id}"))
+                .await?;
+            util::success(&format!("User {user} removed from team {team}"));
+        }
     }
     Ok(())
+}
+
+/// Resolve a user identifier (UUID or email) to a UUID string.
+async fn resolve_user_id(client: &AdminClient, user: &str) -> anyhow::Result<String> {
+    if uuid::Uuid::parse_str(user).is_ok() {
+        return Ok(user.to_string());
+    }
+
+    let resp = client.get("/admin/users").await?;
+    if let Some(users) = resp["users"].as_array() {
+        for u in users {
+            if u["email"].as_str() == Some(user)
+                && let Some(id) = u["id"].as_str()
+            {
+                return Ok(id.to_string());
+            }
+        }
+    }
+    anyhow::bail!("User not found: {user}")
 }

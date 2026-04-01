@@ -1,7 +1,7 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::db::schema::{Team, User};
+use crate::db::schema::User;
 
 const USER_SCHEMA: &str = "urn:ietf:params:scim:schemas:core:2.0:User";
 const GROUP_SCHEMA: &str = "urn:ietf:params:scim:schemas:core:2.0:Group";
@@ -150,21 +150,18 @@ impl ScimUser {
 }
 
 impl ScimGroup {
-    /// Convert a DB `Team` row to a SCIM Group resource (without members).
+    /// Convert a DB `ScimGroupRow` to a SCIM Group resource (without members).
     ///
     /// Members require a separate query; callers must populate `members` themselves.
-    pub fn from_db_team(team: &Team) -> Self {
-        let id_str = team.id.to_string();
-        let created = format_datetime(&team.created_at);
+    pub fn from_db_scim_group(group: &crate::db::schema::ScimGroupRow) -> Self {
+        let id_str = group.id.to_string();
+        let created = format_datetime(&group.created_at);
 
         ScimGroup {
             schemas: vec![GROUP_SCHEMA.to_string()],
             id: id_str.clone(),
-            external_id: team.external_id.clone(),
-            display_name: team
-                .display_name
-                .clone()
-                .unwrap_or_else(|| team.name.clone()),
+            external_id: group.external_id.clone(),
+            display_name: group.display_name.clone(),
             members: None,
             meta: ScimMeta {
                 resource_type: "Group".to_string(),
@@ -201,21 +198,13 @@ mod tests {
         }
     }
 
-    fn sample_team() -> Team {
-        Team {
+    fn sample_scim_group() -> crate::db::schema::ScimGroupRow {
+        crate::db::schema::ScimGroupRow {
             id: Uuid::new_v4(),
-            name: "engineering".to_string(),
-            budget_amount_usd: None,
-            budget_period: "monthly".to_string(),
-            budget_policy: None,
-            default_user_budget_usd: None,
-            notify_recipients: "[]".to_string(),
-            routing_strategy: "default".to_string(),
-            created_at: Utc::now(),
             external_id: Some("okta-group-456".to_string()),
-            display_name: Some("Engineering".to_string()),
-            scim_managed: true,
-            idp_id: None,
+            display_name: "Engineering".to_string(),
+            idp_id: Uuid::new_v4(),
+            created_at: Utc::now(),
         }
     }
 
@@ -253,24 +242,16 @@ mod tests {
     }
 
     #[test]
-    fn scim_group_from_db_team() {
-        let team = sample_team();
-        let scim = ScimGroup::from_db_team(&team);
+    fn scim_group_from_db_scim_group() {
+        let group = sample_scim_group();
+        let scim = ScimGroup::from_db_scim_group(&group);
 
         assert_eq!(scim.schemas, vec![GROUP_SCHEMA]);
-        assert_eq!(scim.id, team.id.to_string());
+        assert_eq!(scim.id, group.id.to_string());
         assert_eq!(scim.display_name, "Engineering");
         assert_eq!(scim.external_id.as_deref(), Some("okta-group-456"));
         assert!(scim.members.is_none());
-        assert!(scim.meta.location.contains(&team.id.to_string()));
-    }
-
-    #[test]
-    fn scim_group_falls_back_to_name_when_no_display_name() {
-        let mut team = sample_team();
-        team.display_name = None;
-        let scim = ScimGroup::from_db_team(&team);
-        assert_eq!(scim.display_name, "engineering");
+        assert!(scim.meta.location.contains(&group.id.to_string()));
     }
 
     #[test]
@@ -343,11 +324,11 @@ mod tests {
     /// Meta location for a group follows the `/scim/v2/Groups/{id}` pattern.
     #[test]
     fn scim_meta_location_format_group() {
-        let team = sample_team();
-        let scim = ScimGroup::from_db_team(&team);
+        let group = sample_scim_group();
+        let scim = ScimGroup::from_db_scim_group(&group);
         assert_eq!(
             scim.meta.location,
-            format!("/scim/v2/Groups/{}", team.id),
+            format!("/scim/v2/Groups/{}", group.id),
             "Group meta location must be /scim/v2/Groups/{{id}}"
         );
     }
@@ -395,9 +376,9 @@ mod tests {
     /// ScimGroup with no external_id omits `externalId` from JSON.
     #[test]
     fn scim_group_skips_none_external_id() {
-        let mut team = sample_team();
-        team.external_id = None;
-        let scim = ScimGroup::from_db_team(&team);
+        let mut group = sample_scim_group();
+        group.external_id = None;
+        let scim = ScimGroup::from_db_scim_group(&group);
 
         let json = serde_json::to_value(&scim).unwrap();
         let obj = json.as_object().unwrap();

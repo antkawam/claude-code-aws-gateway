@@ -42,3 +42,6 @@ coverage/
 
 # Load test results
 tests/load/results/
+
+# Local docker-compose overrides
+docker-compose.local.yml

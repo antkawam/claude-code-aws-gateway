@@ -7,6 +7,7 @@ pub mod notification_config;
 pub mod org_analytics;
 
 pub mod schema;
+pub mod scim_groups;
 pub mod scim_tokens;
 pub mod search_providers;
 pub mod sessions;

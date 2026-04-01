@@ -64,6 +64,10 @@ enum Commands {
     #[command(subcommand)]
     Idps(commands::idps::IdpsCommands),
 
+    /// Manage SCIM provisioning
+    #[command(subcommand)]
+    Scim(commands::scim::ScimCommands),
+
     /// Check deployment status and health
     Status(commands::status::StatusArgs),
 
@@ -118,6 +122,7 @@ async fn main() -> anyhow::Result<()> {
         Commands::Teams(cmd) => commands::teams::run(cmd, cli.url, cli.token).await,
         Commands::Endpoints(cmd) => commands::endpoints::run(cmd, cli.url, cli.token).await,
         Commands::Idps(cmd) => commands::idps::run(cmd, cli.url, cli.token).await,
+        Commands::Scim(cmd) => commands::scim::run(cmd, cli.url, cli.token).await,
         Commands::Status(args) => commands::status::run(args, cli.url).await,
         Commands::Logs(args) => commands::logs::run(args).await,
         Commands::Update => commands::update::run().await,

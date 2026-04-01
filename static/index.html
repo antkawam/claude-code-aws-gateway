@@ -2089,7 +2089,7 @@ input[type="date"].oa-filter-select { background-image: none; padding-right: 8px
       <div class="main-content">
         <div class="card">
           <table>
-            <thead><tr><th>User</th><th>Team</th><th>Budget</th><th>Role</th><th>Created</th><th></th></tr></thead>
+            <thead><tr><th>User</th><th>Status</th><th>Team</th><th>Budget</th><th>Role</th><th>Created</th><th></th></tr></thead>
             <tbody id="members-table"></tbody>
           </table>
           <div id="members-empty" class="empty-state" style="display:none">
@@ -2412,7 +2412,7 @@ input[type="date"].oa-filter-select { background-image: none; padding-right: 8px
               </button>
             </div>
             <table id="idps-table-wrapper">
-              <thead><tr><th>Name</th><th>Issuer</th><th>Status</th><th></th></tr></thead>
+              <thead><tr><th>Name</th><th>Issuer</th><th>Status</th><th>SCIM</th><th></th></tr></thead>
               <tbody id="idps-table"></tbody>
             </table>
             <div id="idps-empty" class="empty-state" style="display:none">
@@ -2633,6 +2633,41 @@ input[type="date"].oa-filter-select { background-image: none; padding-right: 8px
         <label class="form-label">OIDC Scopes</label>
         <input class="form-input" id="mi-scopes" placeholder="openid (default)">
         <small style="color:var(--text-muted);font-size:11px">Space-separated. Use "openid email profile" for Entra/Okta if email claim is needed.</small>
+      </div>
+
+      <!-- SCIM Provisioning section (only visible when editing, not creating) -->
+      <div id="scim-section" style="display:none;border-top:1px solid var(--border);padding-top:16px;margin-top:16px">
+        <h4 style="margin:0 0 12px;font-size:13px;text-transform:uppercase;letter-spacing:1px;color:var(--text-muted)">SCIM Provisioning</h4>
+
+        <div class="form-group">
+          <label class="form-label" style="display:flex;align-items:center;gap:8px;text-transform:none;letter-spacing:0;font-size:13px;font-family:var(--font-sans)">
+            <input type="checkbox" id="mi-scim-enabled"> Enable SCIM provisioning
+          </label>
+          <div class="form-hint">When enabled, users must be provisioned via SCIM before they can log in. Auto-provisioning is disabled.</div>
+        </div>
+
+        <div id="scim-config" style="display:none">
+          <div class="form-group">
+            <label class="form-label">Base URL</label>
+            <div style="display:flex;gap:8px;align-items:center">
+              <code id="scim-base-url" style="flex:1;font-size:12px;padding:6px 10px;background:var(--bg-surface);border:1px solid var(--border);border-radius:4px;user-select:all"></code>
+              <button class="btn btn-secondary btn-sm" onclick="copyText(document.getElementById('scim-base-url').textContent)">Copy</button>
+            </div>
+            <div class="form-hint">Paste this URL into your identity provider's SCIM configuration.</div>
+          </div>
+
+          <div class="form-group">
+            <label class="form-label">Admin Groups</label>
+            <input class="form-input" id="mi-scim-admin-groups" placeholder="e.g. ccag-admins, platform-team">
+            <div class="form-hint">Comma-separated. Users in these SCIM groups get admin role. Others get the default role.</div>
+          </div>
+
+          <div class="form-group">
+            <label class="form-label">Bearer Tokens</label>
+            <div id="scim-tokens-list" style="margin-bottom:8px"></div>
+            <button class="btn btn-secondary btn-sm" onclick="generateScimToken()">+ Generate Token</button>
+          </div>
+        </div>
       </div>
     </div>
     <div class="modal-footer">
@@ -3389,7 +3424,8 @@ function renderMembers() {
       budgetSource = '';
     }
     return `<tr>
-      <td>${escHtml(u.email)}</td>
+      <td>${escHtml(u.email)} ${u.scim_managed ? '<span class="badge badge-purple" style="font-size:9px;padding:1px 4px">SCIM</span>' : ''}</td>
+      <td>${u.active !== false ? '<span style="color:var(--green);font-size:10px">&#9679; Active</span>' : '<span style="color:var(--red);font-size:10px">&#9679; Inactive</span>'}</td>
       <td>
         <select class="form-select form-select-sm" onchange="updateMemberTeam('${u.id}', this.value)" style="width:auto;display:inline-block;padding:2px 8px;font-size:0.85em">
           <option value="" ${!userTeam ? 'selected' : ''}>—</option>
@@ -5566,6 +5602,7 @@ function renderIdps() {
       <td><strong>${escHtml(idp.name)}</strong></td>
       <td style="max-width:280px;overflow:hidden;text-overflow:ellipsis"><code style="font-size:10px">${escHtml(idp.issuer_url)}</code></td>
       <td>${idp.enabled !== false ? '<span class="badge badge-green"><span class="badge-dot"></span>Active</span>' : '<span class="badge badge-red"><span class="badge-dot"></span>Disabled</span>'}</td>
+      <td>${idp.scim_enabled ? '<span class="badge badge-purple"><span class="badge-dot"></span>SCIM</span>' : '<span style="color:var(--text-muted);font-size:11px">—</span>'}</td>
       <td style="white-space:nowrap">
         <button class="btn btn-secondary btn-sm" onclick="editIdp('${idp.id}')" style="margin-right:4px">Edit</button>
         <button class="btn btn-danger btn-sm" onclick="deleteIdp('${idp.id}')">Delete</button>
@@ -5598,6 +5635,7 @@ function showIdpModal(idp) {
   document.getElementById('mi-user-claim').value = idp ? (idp.user_claim || '') : '';
   document.getElementById('mi-scopes').value = idp ? (idp.scopes || '') : '';
   document.getElementById('modal-idp').style.display = 'flex';
+  updateScimSection();
   setTimeout(() => document.getElementById('mi-name').focus(), 100);
 }
 
@@ -5624,13 +5662,125 @@ async function saveIdp() {
   let res;
   if (editingIdpId) {
     res = await api('PUT', `/admin/idps/${editingIdpId}`, body);
-    if (res.id || res.updated) { closeModal(); toast('Provider updated', 'success'); loadAll(); }
-    else toast(res.error?.message || 'Failed to update provider', 'error');
+    if (res.id || res.updated) {
+      // Save SCIM settings if editing
+      const scimEnabled = document.getElementById('mi-scim-enabled').checked;
+      await api('PUT', `/admin/idps/${editingIdpId}/scim`, { enabled: scimEnabled });
+
+      if (scimEnabled) {
+        const adminGroupsStr = document.getElementById('mi-scim-admin-groups').value;
+        const adminGroups = adminGroupsStr.split(',').map(s => s.trim()).filter(s => s);
+        await api('PUT', `/admin/idps/${editingIdpId}/scim-admin-groups`, { groups: adminGroups });
+      }
+
+      closeModal();
+      toast('Provider updated', 'success');
+      loadAll();
+    } else {
+      toast(res.error?.message || 'Failed to update provider', 'error');
+    }
   } else {
     res = await api('POST', '/admin/idps', body);
     if (res.id) { closeModal(); toast('Provider added', 'success'); loadAll(); }
     else toast(res.error?.message || 'Failed to add provider', 'error');
   }
+}
+
+// ---- SCIM ----
+function updateScimSection() {
+  const isEdit = !!editingIdpId;
+  const scimSection = document.getElementById('scim-section');
+  scimSection.style.display = isEdit ? 'block' : 'none';
+  if (!isEdit) return;
+
+  const idp = data.idps.find(i => i.id === editingIdpId);
+  if (!idp) return;
+
+  document.getElementById('mi-scim-enabled').checked = !!idp.scim_enabled;
+  document.getElementById('scim-base-url').textContent = window.location.origin + '/scim/v2';
+
+  const scimConfig = document.getElementById('scim-config');
+  scimConfig.style.display = idp.scim_enabled ? 'block' : 'none';
+
+  // Load admin groups
+  loadScimAdminGroups(editingIdpId);
+
+  // Load tokens
+  loadScimTokens(editingIdpId);
+}
+
+document.addEventListener('change', e => {
+  if (e.target.id === 'mi-scim-enabled') {
+    document.getElementById('scim-config').style.display = e.target.checked ? 'block' : 'none';
+  }
+});
+
+async function loadScimAdminGroups(idpId) {
+  try {
+    const resp = await api('GET', `/admin/idps/${idpId}/scim-admin-groups`);
+    const groups = resp.groups || [];
+    document.getElementById('mi-scim-admin-groups').value = Array.isArray(groups) ? groups.join(', ') : '';
+  } catch(e) {}
+}
+
+async function loadScimTokens(idpId) {
+  const container = document.getElementById('scim-tokens-list');
+  try {
+    const resp = await api('GET', `/admin/idps/${idpId}/scim-tokens`);
+    const tokens = resp.tokens || [];
+    if (tokens.length === 0) {
+      container.innerHTML = '<div style="color:var(--text-muted);font-size:12px;padding:8px 0">No tokens generated yet.</div>';
+      return;
+    }
+    container.innerHTML = `<table class="data-table" style="width:100%;font-size:12px">
+      <thead><tr><th>Prefix</th><th>Name</th><th>Status</th><th>Last Used</th><th></th></tr></thead>
+      <tbody>${tokens.map(t => `<tr>
+        <td><code style="font-size:11px">${escHtml(t.token_prefix)}</code></td>
+        <td>${escHtml(t.name || '—')}</td>
+        <td>${t.enabled ? '<span class="badge badge-green" style="font-size:10px">Active</span>' : '<span class="badge badge-red" style="font-size:10px">Revoked</span>'}</td>
+        <td style="color:var(--text-muted)">${t.last_used_at ? fmtDate(t.last_used_at) : 'never'}</td>
+        <td>${t.enabled ? `<button class="btn btn-danger btn-sm" style="font-size:10px;padding:1px 6px" onclick="revokeScimToken('${t.id}')">Revoke</button>` : ''}</td>
+      </tr>`).join('')}</tbody>
+    </table>`;
+  } catch(e) {
+    container.innerHTML = '<div style="color:var(--red)">Failed to load tokens</div>';
+  }
+}
+
+async function generateScimToken() {
+  const name = prompt('Token name (optional):');
+  const body = {};
+  if (name) body.name = name;
+  const resp = await api('POST', `/admin/idps/${editingIdpId}/scim-tokens`, body);
+  if (resp.token) {
+    // Show one-time token banner above the token list
+    let banner = document.getElementById('scim-token-banner');
+    if (!banner) {
+      banner = document.createElement('div');
+      banner.id = 'scim-token-banner';
+      const container = document.getElementById('scim-tokens-list');
+      container.parentNode.insertBefore(banner, container);
+    }
+    banner.innerHTML = `<div style="background:var(--bg-surface);border:1px solid var(--accent);border-radius:6px;padding:12px;margin-bottom:12px">
+      <div style="font-size:11px;color:var(--accent);margin-bottom:6px;font-weight:600">New SCIM Token — copy now, it won't be shown again</div>
+      <div style="display:flex;gap:8px;align-items:center">
+        <code style="flex:1;font-size:11px;word-break:break-all;user-select:all">${escHtml(resp.token)}</code>
+        <button class="btn btn-secondary btn-sm" onclick="copyText('${resp.token}')">Copy</button>
+        <button class="btn btn-ghost btn-sm" onclick="document.getElementById('scim-token-banner').remove()">Done</button>
+      </div>
+    </div>`;
+    // Refresh token list below the banner
+    loadScimTokens(editingIdpId);
+  } else {
+    toast(resp.error?.message || 'Failed to generate token', 'error');
+  }
+}
+
+async function revokeScimToken(tokenId) {
+  if (!confirm('Revoke this SCIM token? IdP connections using it will stop working.')) return;
+  await api('DELETE', `/admin/idps/${editingIdpId}/scim-tokens/${tokenId}`);
+  toast('Token revoked', 'success');
+  loadScimTokens(editingIdpId);
 }
 
 // ---- Actions ----

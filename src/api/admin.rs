@@ -3492,6 +3492,144 @@ pub async fn revoke_scim_token(
     }
 }
 
+/// GET /admin/idps/{idp_id}/scim-admin-groups — Get admin group mappings
+pub async fn get_scim_admin_groups(
+    State(state): State<Arc<GatewayState>>,
+    headers: HeaderMap,
+    Path(idp_id): Path<Uuid>,
+) -> Response {
+    if let Err(resp) = check_admin_auth(&headers, &state).await {
+        return resp;
+    }
+    let pool = state.db().await;
+    match sqlx::query_scalar::<_, serde_json::Value>(
+        "SELECT scim_admin_groups FROM identity_providers WHERE id = $1",
+    )
+    .bind(idp_id)
+    .fetch_optional(&pool)
+    .await
+    {
+        Ok(Some(groups)) => Json(json!({ "groups": groups })).into_response(),
+        Ok(None) => admin_error(StatusCode::NOT_FOUND, "IDP not found"),
+        Err(e) => admin_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    }
+}
+
+/// PUT /admin/idps/{idp_id}/scim-admin-groups — Set admin group mappings
+pub async fn set_scim_admin_groups(
+    State(state): State<Arc<GatewayState>>,
+    headers: HeaderMap,
+    Path(idp_id): Path<Uuid>,
+    Json(body): Json<serde_json::Value>,
+) -> Response {
+    if let Err(resp) = check_admin_auth(&headers, &state).await {
+        return resp;
+    }
+    let pool = state.db().await;
+    let groups = body.get("groups").cloned().unwrap_or(json!([]));
+
+    // Validate it's an array of strings
+    if !groups.is_array() || groups.as_array().unwrap().iter().any(|v| !v.is_string()) {
+        return admin_error(
+            StatusCode::BAD_REQUEST,
+            "groups must be an array of strings",
+        );
+    }
+
+    match sqlx::query("UPDATE identity_providers SET scim_admin_groups = $1 WHERE id = $2")
+        .bind(&groups)
+        .bind(idp_id)
+        .execute(&pool)
+        .await
+    {
+        Ok(result) if result.rows_affected() > 0 => {
+            crate::db::settings::bump_cache_version(&pool).await.ok();
+            Json(json!({ "groups": groups })).into_response()
+        }
+        Ok(_) => admin_error(StatusCode::NOT_FOUND, "IDP not found"),
+        Err(e) => admin_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    }
+}
+
+/// GET /admin/teams/{team_id}/members — List team members
+pub async fn list_team_members(
+    State(state): State<Arc<GatewayState>>,
+    headers: HeaderMap,
+    Path(team_id): Path<Uuid>,
+) -> Response {
+    if let Err(resp) = check_admin_auth(&headers, &state).await {
+        return resp;
+    }
+    let pool = state.db().await;
+    match crate::db::teams::get_team_members(&pool, team_id).await {
+        Ok(members) => {
+            let items: Vec<serde_json::Value> = members
+                .iter()
+                .map(|u| {
+                    json!({
+                        "id": u.id,
+                        "email": u.email,
+                        "role": u.role,
+                        "active": u.active,
+                        "created_at": u.created_at.to_rfc3339(),
+                    })
+                })
+                .collect();
+            Json(json!({ "members": items })).into_response()
+        }
+        Err(e) => admin_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    }
+}
+
+/// POST /admin/teams/{team_id}/members — Add a member to a team
+pub async fn add_team_member(
+    State(state): State<Arc<GatewayState>>,
+    headers: HeaderMap,
+    Path(team_id): Path<Uuid>,
+    Json(body): Json<serde_json::Value>,
+) -> Response {
+    if let Err(resp) = check_admin_auth(&headers, &state).await {
+        return resp;
+    }
+    let pool = state.db().await;
+    let user_id = match body
+        .get("user_id")
+        .and_then(|v| v.as_str())
+        .and_then(|s| Uuid::parse_str(s).ok())
+    {
+        Some(id) => id,
+        None => return admin_error(StatusCode::BAD_REQUEST, "user_id is required"),
+    };
+    match crate::db::teams::add_team_member(&pool, team_id, user_id).await {
+        Ok(true) => {
+            crate::db::settings::bump_cache_version(&pool).await.ok();
+            Json(json!({ "added": true })).into_response()
+        }
+        Ok(false) => admin_error(StatusCode::NOT_FOUND, "User not found"),
+        Err(e) => admin_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    }
+}
+
+/// DELETE /admin/teams/{team_id}/members/{user_id} — Remove a member from a team
+pub async fn remove_team_member(
+    State(state): State<Arc<GatewayState>>,
+    headers: HeaderMap,
+    Path((team_id, user_id)): Path<(Uuid, Uuid)>,
+) -> Response {
+    if let Err(resp) = check_admin_auth(&headers, &state).await {
+        return resp;
+    }
+    let pool = state.db().await;
+    match crate::db::teams::remove_team_member(&pool, team_id, user_id).await {
+        Ok(true) => {
+            crate::db::settings::bump_cache_version(&pool).await.ok();
+            StatusCode::NO_CONTENT.into_response()
+        }
+        Ok(false) => admin_error(StatusCode::NOT_FOUND, "Member not found in team"),
+        Err(e) => admin_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    }
+}
+
 /// PUT /admin/idps/{idp_id}/scim — Enable/disable SCIM for an IDP
 pub async fn update_idp_scim(
     State(state): State<Arc<GatewayState>>,
