@@ -9,6 +9,7 @@ pub mod endpoint;
 pub mod proxy;
 pub mod quota;
 pub mod ratelimit;
+pub mod scim;
 pub mod spend;
 pub mod telemetry;
 pub mod translate;

@@ -1577,6 +1577,7 @@ pub async fn create_idp(
     {
         Ok(idp) => {
             tracing::info!(id = %idp.id, name = %idp.name, "Created IDP");
+            let _ = db::settings::bump_cache_version(pool).await;
             (StatusCode::CREATED, Json(json!(idp))).into_response()
         }
         Err(e) => admin_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
@@ -1653,7 +1654,10 @@ pub async fn update_idp(
     )
     .await
     {
-        Ok(true) => Json(json!({ "updated": true })).into_response(),
+        Ok(true) => {
+            let _ = db::settings::bump_cache_version(pool).await;
+            Json(json!({ "updated": true })).into_response()
+        }
         Ok(false) => error_response(StatusCode::NOT_FOUND, "IDP not found or is system-managed"),
         Err(e) => admin_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
     }
@@ -1670,7 +1674,10 @@ pub async fn delete_idp(
     let pool = state.db().await;
     let pool = &pool;
     match db::idp::delete_idp(pool, idp_id).await {
-        Ok(true) => Json(json!({ "deleted": true })).into_response(),
+        Ok(true) => {
+            let _ = db::settings::bump_cache_version(pool).await;
+            Json(json!({ "deleted": true })).into_response()
+        }
         Ok(false) => error_response(StatusCode::NOT_FOUND, "IDP not found or is system-managed"),
         Err(e) => admin_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
     }
@@ -1796,7 +1803,12 @@ pub async fn check_auth_identity(
 
     // Try gateway session token first (cheap HMAC check)
     if let Ok(identity) = crate::auth::session::validate(&state.session_signing_key, key) {
-        let role = super::handlers::resolve_oidc_role(state, &identity).await;
+        let role = match super::handlers::resolve_oidc_role(state, &identity).await {
+            Ok(r) => r,
+            Err(msg) => {
+                return Err(error_response(StatusCode::FORBIDDEN, &msg));
+            }
+        };
         let pool = state.db().await;
         let user_id = crate::db::users::get_user_by_email(&pool, identity.user_id())
             .await
@@ -1810,7 +1822,12 @@ pub async fn check_auth_identity(
     if state.idp_validator.idp_count().await > 0
         && let Ok(identity) = state.idp_validator.validate_token(key).await
     {
-        let role = super::handlers::resolve_oidc_role(state, &identity).await;
+        let role = match super::handlers::resolve_oidc_role(state, &identity).await {
+            Ok(r) => r,
+            Err(msg) => {
+                return Err(error_response(StatusCode::FORBIDDEN, &msg));
+            }
+        };
         let pool = state.db().await;
         let user_id = crate::db::users::get_user_by_email(&pool, identity.user_id())
             .await
@@ -3384,4 +3401,74 @@ pub async fn set_websearch_mode(
 
     tracing::info!(mode = %body.mode, "Websearch mode updated");
     Json(json!({ "updated": true })).into_response()
+}
+
+// ============================================================
+// SCIM Token Admin Endpoints
+// ============================================================
+
+/// POST /admin/idps/{idp_id}/scim-tokens — Generate a SCIM token for an IDP
+pub async fn create_scim_token(
+    State(state): State<Arc<GatewayState>>,
+    headers: HeaderMap,
+    Path(idp_id): Path<Uuid>,
+    Json(body): Json<serde_json::Value>,
+) -> Response {
+    if let Err(resp) = check_admin_auth(&headers, &state).await {
+        return resp;
+    }
+    let pool = state.db().await;
+    let name = body.get("name").and_then(|v| v.as_str());
+
+    // Get admin identity for created_by field
+    let created_by = check_admin_auth_identity(&headers, &state)
+        .await
+        .unwrap_or_else(|_| "admin".to_string());
+
+    match crate::db::scim_tokens::create_scim_token(&pool, idp_id, name, &created_by).await {
+        Ok((raw_token, record)) => (
+            StatusCode::CREATED,
+            Json(json!({
+                "id": record.id,
+                "token": raw_token,
+                "token_prefix": record.token_prefix,
+                "idp_id": record.idp_id,
+                "name": record.name,
+                "created_at": record.created_at.to_rfc3339(),
+            })),
+        )
+            .into_response(),
+        Err(e) => admin_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    }
+}
+
+/// PUT /admin/idps/{idp_id}/scim — Enable/disable SCIM for an IDP
+pub async fn update_idp_scim(
+    State(state): State<Arc<GatewayState>>,
+    headers: HeaderMap,
+    Path(idp_id): Path<Uuid>,
+    Json(body): Json<serde_json::Value>,
+) -> Response {
+    if let Err(resp) = check_admin_auth(&headers, &state).await {
+        return resp;
+    }
+    let pool = state.db().await;
+    let enabled = body
+        .get("enabled")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    match sqlx::query("UPDATE identity_providers SET scim_enabled = $1 WHERE id = $2")
+        .bind(enabled)
+        .bind(idp_id)
+        .execute(&pool)
+        .await
+    {
+        Ok(result) if result.rows_affected() > 0 => {
+            let _ = crate::db::settings::bump_cache_version(&pool).await;
+            Json(json!({ "updated": true })).into_response()
+        }
+        Ok(_) => error_response(StatusCode::NOT_FOUND, "IDP not found"),
+        Err(e) => admin_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    }
 }

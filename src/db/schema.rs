@@ -13,6 +13,10 @@ pub struct Team {
     pub notify_recipients: String,
     pub routing_strategy: String,
     pub created_at: DateTime<Utc>,
+    pub external_id: Option<String>,
+    pub display_name: Option<String>,
+    pub scim_managed: bool,
+    pub idp_id: Option<Uuid>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
@@ -24,6 +28,13 @@ pub struct User {
     pub spend_limit_monthly_usd: Option<f64>,
     pub budget_period: String,
     pub created_at: DateTime<Utc>,
+    pub active: bool,
+    pub external_id: Option<String>,
+    pub display_name: Option<String>,
+    pub given_name: Option<String>,
+    pub family_name: Option<String>,
+    pub scim_managed: bool,
+    pub idp_id: Option<Uuid>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
@@ -79,4 +90,18 @@ pub struct IdentityProvider {
     pub created_at: DateTime<Utc>,
     pub user_claim: Option<String>,
     pub scopes: Option<String>,
+    pub scim_enabled: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+pub struct ScimToken {
+    pub id: Uuid,
+    pub idp_id: Uuid,
+    pub token_hash: String,
+    pub token_prefix: String,
+    pub name: Option<String>,
+    pub created_by: String,
+    pub enabled: bool,
+    pub last_used_at: Option<DateTime<Utc>>,
+    pub created_at: DateTime<Utc>,
 }

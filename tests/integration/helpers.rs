@@ -2,7 +2,7 @@ use sqlx::PgPool;
 use uuid::Uuid;
 
 use ccag::db;
-use ccag::db::schema::{Team, User, VirtualKey};
+use ccag::db::schema::{IdentityProvider, Team, User, VirtualKey};
 use ccag::db::spend::RequestLogEntry;
 
 /// Default test database URL (matches docker-compose.test.yml).
@@ -116,6 +116,63 @@ pub async fn create_test_key(
     db::keys::create_key(pool, name, user_id, team_id, None)
         .await
         .expect("create_test_key failed")
+}
+
+/// Create a test identity provider with sensible defaults.
+pub async fn create_test_idp(pool: &PgPool, name: &str) -> IdentityProvider {
+    db::idp::create_idp(
+        pool,
+        name,
+        &format!("https://idp-{}.example.com", Uuid::new_v4().simple()),
+        Some("client-id"),
+        Some("audience"),
+        None,
+        "authorization_code",
+        false,
+        "member",
+        None,
+        None,
+        None,
+    )
+    .await
+    .expect("create_test_idp failed")
+}
+
+/// Create a test identity provider with `scim_enabled = true`.
+///
+/// Used by active-user enforcement tests to verify that resolve_oidc_role
+/// rejects unprovisioned users when the IDP has SCIM enabled.
+pub async fn create_test_idp_scim_enabled(pool: &PgPool, name: &str) -> IdentityProvider {
+    let idp = db::idp::create_idp(
+        pool,
+        name,
+        &format!("https://scim-idp-{}.example.com", Uuid::new_v4().simple()),
+        Some("client-id"),
+        Some("audience"),
+        None,
+        "authorization_code",
+        false,
+        "member",
+        None,
+        None,
+        None,
+    )
+    .await
+    .expect("create_test_idp_scim_enabled: create_idp failed");
+
+    // Enable SCIM on the IDP directly via SQL (create_idp doesn't expose scim_enabled)
+    sqlx::query("UPDATE identity_providers SET scim_enabled = true WHERE id = $1")
+        .bind(idp.id)
+        .execute(pool)
+        .await
+        .expect("create_test_idp_scim_enabled: update failed");
+
+    // Re-fetch to get the updated row
+    sqlx::query_as::<_, IdentityProvider>("SELECT * FROM identity_providers WHERE id = $1")
+        .bind(idp.id)
+        .fetch_one(pool)
+        .await
+        .expect("create_test_idp_scim_enabled: re-fetch failed")
 }
 
 pub fn make_spend_entry(model: &str, user_identity: Option<&str>) -> RequestLogEntry {

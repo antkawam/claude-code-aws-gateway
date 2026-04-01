@@ -88,6 +88,11 @@ pub fn router(state: Arc<GatewayState>) -> Router {
         .route("/admin/idps", get(admin::list_idps))
         .route("/admin/idps/{idp_id}", put(admin::update_idp))
         .route("/admin/idps/{idp_id}", delete(admin::delete_idp))
+        .route(
+            "/admin/idps/{idp_id}/scim-tokens",
+            post(admin::create_scim_token),
+        )
+        .route("/admin/idps/{idp_id}/scim", put(admin::update_idp_scim))
         // Admin API — Endpoints
         .route("/admin/endpoints", get(admin::list_endpoints))
         .route("/admin/endpoints", post(admin::create_endpoint))
@@ -185,6 +190,40 @@ pub fn router(state: Arc<GatewayState>) -> Router {
         .route("/auth/cli/callback", get(cli_auth::cli_callback))
         .route("/auth/cli/complete", post(cli_auth::cli_complete))
         .route("/auth/cli/poll", get(cli_auth::cli_poll))
+        // SCIM 2.0 Discovery (public, no auth required)
+        .route(
+            "/scim/v2/ServiceProviderConfig",
+            get(crate::scim::discovery::service_provider_config),
+        )
+        .route(
+            "/scim/v2/ResourceTypes",
+            get(crate::scim::discovery::resource_types),
+        )
+        .route("/scim/v2/Schemas", get(crate::scim::discovery::schemas))
+        // SCIM 2.0 User endpoints (authenticated)
+        .route(
+            "/scim/v2/Users",
+            post(crate::scim::users::create_user).get(crate::scim::users::list_users),
+        )
+        .route(
+            "/scim/v2/Users/{id}",
+            get(crate::scim::users::get_user)
+                .put(crate::scim::users::replace_user)
+                .patch(crate::scim::users::patch_user)
+                .delete(crate::scim::users::delete_user),
+        )
+        // SCIM 2.0 Group endpoints (authenticated)
+        .route(
+            "/scim/v2/Groups",
+            post(crate::scim::groups::create_group).get(crate::scim::groups::list_groups),
+        )
+        .route(
+            "/scim/v2/Groups/{id}",
+            get(crate::scim::groups::get_group)
+                .put(crate::scim::groups::replace_group)
+                .patch(crate::scim::groups::patch_group)
+                .delete(crate::scim::groups::delete_group),
+        )
         // Portal & Metrics
         .route("/portal", get(portal))
         .route("/metrics", get(prometheus_metrics))

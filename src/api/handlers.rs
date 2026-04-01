@@ -198,7 +198,16 @@ pub async fn health_deep(State(state): State<Arc<GatewayState>>) -> Response {
 pub async fn auth_me(State(state): State<Arc<GatewayState>>, headers: HeaderMap) -> Response {
     match check_auth(&headers, &state).await {
         Ok(AuthResult::Oidc(identity)) => {
-            let role = resolve_oidc_role(&state, &identity).await;
+            let role = match resolve_oidc_role(&state, &identity).await {
+                Ok(r) => r,
+                Err(msg) => {
+                    return (
+                        StatusCode::FORBIDDEN,
+                        Json(json!({ "error": { "message": msg } })),
+                    )
+                        .into_response();
+                }
+            };
             // Look up user DB id for portal features (e.g. filtering keys)
             let user_id =
                 crate::db::users::get_user_by_email(&state.db().await, identity.user_id())
@@ -230,24 +239,42 @@ pub async fn auth_me(State(state): State<Arc<GatewayState>>, headers: HeaderMap)
 /// Resolve the role for an authenticated user. Auto-provisions if not in DB.
 /// Admin users (bootstrap admin + ADMIN_USERS) are seeded to DB at startup,
 /// so this just checks the DB role. New SSO users are auto-provisioned as "member".
-pub async fn resolve_oidc_role(state: &GatewayState, identity: &OidcIdentity) -> String {
+///
+/// Returns `Err(message)` when the user should be denied access (inactive account,
+/// or not yet provisioned when SCIM is enabled for the IDP).
+pub async fn resolve_oidc_role(
+    state: &GatewayState,
+    identity: &OidcIdentity,
+) -> Result<String, String> {
     let pool = state.db().await;
     let pool = &pool;
 
     // Check if user exists in DB (keyed by email, falling back to sub)
     if let Ok(Some(user)) = crate::db::users::get_user_by_email(pool, identity.user_id()).await {
-        return user.role;
+        if !user.active {
+            return Err("Your account has been deactivated".to_string());
+        }
+        return Ok(user.role);
+    }
+
+    // Check if the user's IDP has SCIM enabled — if so, reject auto-provisioning
+    if let Ok(idps) = crate::db::idp::get_enabled_idps(pool).await {
+        for idp in &idps {
+            if idp.name == identity.idp_name && idp.scim_enabled {
+                return Err("User not provisioned. Contact your administrator.".to_string());
+            }
+        }
     }
 
     // Auto-provision new user as member
     match crate::db::users::create_user(pool, identity.user_id(), None, "member").await {
         Ok(user) => {
             tracing::info!(sub = %identity.sub, user_id = %identity.user_id(), role = %user.role, "Auto-provisioned OIDC user");
-            user.role
+            Ok(user.role)
         }
         Err(e) => {
             tracing::warn!(%e, sub = %identity.sub, user_id = %identity.user_id(), "Failed to auto-provision user");
-            "member".to_string()
+            Ok("member".to_string())
         }
     }
 }
