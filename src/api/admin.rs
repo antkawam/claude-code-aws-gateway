@@ -3442,6 +3442,56 @@ pub async fn create_scim_token(
     }
 }
 
+/// GET /admin/idps/{idp_id}/scim-tokens — List SCIM tokens for an IDP
+pub async fn list_scim_tokens(
+    State(state): State<Arc<GatewayState>>,
+    headers: HeaderMap,
+    Path(idp_id): Path<Uuid>,
+) -> Response {
+    if let Err(resp) = check_admin_auth(&headers, &state).await {
+        return resp;
+    }
+    let pool = state.db().await;
+    match crate::db::scim_tokens::list_scim_tokens(&pool, Some(idp_id)).await {
+        Ok(tokens) => {
+            let items: Vec<serde_json::Value> = tokens
+                .iter()
+                .map(|t| {
+                    json!({
+                        "id": t.id,
+                        "idp_id": t.idp_id,
+                        "token_prefix": t.token_prefix,
+                        "name": t.name,
+                        "created_by": t.created_by,
+                        "enabled": t.enabled,
+                        "last_used_at": t.last_used_at.map(|ts| ts.to_rfc3339()),
+                        "created_at": t.created_at.to_rfc3339(),
+                    })
+                })
+                .collect();
+            Json(json!({ "tokens": items })).into_response()
+        }
+        Err(e) => admin_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    }
+}
+
+/// DELETE /admin/idps/{idp_id}/scim-tokens/{token_id} — Revoke a SCIM token
+pub async fn revoke_scim_token(
+    State(state): State<Arc<GatewayState>>,
+    headers: HeaderMap,
+    Path((_idp_id, token_id)): Path<(Uuid, Uuid)>,
+) -> Response {
+    if let Err(resp) = check_admin_auth(&headers, &state).await {
+        return resp;
+    }
+    let pool = state.db().await;
+    match crate::db::scim_tokens::revoke_scim_token(&pool, token_id).await {
+        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        Ok(false) => admin_error(StatusCode::NOT_FOUND, "Token not found"),
+        Err(e) => admin_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    }
+}
+
 /// PUT /admin/idps/{idp_id}/scim — Enable/disable SCIM for an IDP
 pub async fn update_idp_scim(
     State(state): State<Arc<GatewayState>>,

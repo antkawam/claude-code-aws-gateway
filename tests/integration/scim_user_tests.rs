@@ -916,3 +916,66 @@ async fn test_create_scim_user_duplicate_email() {
         "Creating a second user with the same email must fail"
     );
 }
+
+// ============================================================
+// Inactive user keys excluded from cache
+// ============================================================
+
+/// Verify that get_active_keys excludes virtual keys owned by inactive users,
+/// while still returning keys owned by active users and keys with no user (team-level keys).
+///
+/// This backs the SCIM deactivation feature: when a user is deactivated via SCIM,
+/// their keys must be filtered out of the auth cache so requests are rejected.
+#[tokio::test]
+async fn test_inactive_user_keys_excluded_from_get_active_keys() {
+    let pool = helpers::setup_test_db().await;
+    let team = helpers::create_test_team(&pool, "key-filter-team").await;
+
+    // Create two users
+    let active_user =
+        helpers::create_test_user(&pool, "active@example.com", Some(team.id), "member").await;
+    let inactive_user =
+        helpers::create_test_user(&pool, "inactive@example.com", Some(team.id), "member").await;
+
+    // Create keys for both users and a team-level key (no user)
+    let (_, active_key) = helpers::create_test_key(
+        &pool,
+        Some("active-key"),
+        Some(active_user.id),
+        Some(team.id),
+    )
+    .await;
+    let (_, inactive_key) = helpers::create_test_key(
+        &pool,
+        Some("inactive-key"),
+        Some(inactive_user.id),
+        Some(team.id),
+    )
+    .await;
+    let (_, team_key) =
+        helpers::create_test_key(&pool, Some("team-key"), None, Some(team.id)).await;
+
+    // Deactivate the second user
+    db::users::set_user_active(&pool, inactive_user.id, false)
+        .await
+        .expect("set_user_active failed");
+
+    // get_active_keys should return the active user's key and the team key, but NOT the inactive user's key
+    let keys = db::keys::get_active_keys(&pool)
+        .await
+        .expect("get_active_keys failed");
+    let key_ids: Vec<Uuid> = keys.iter().map(|k| k.id).collect();
+
+    assert!(
+        key_ids.contains(&active_key.id),
+        "Active user's key should be included"
+    );
+    assert!(
+        key_ids.contains(&team_key.id),
+        "Team key (no user) should be included"
+    );
+    assert!(
+        !key_ids.contains(&inactive_key.id),
+        "Inactive user's key should be excluded"
+    );
+}

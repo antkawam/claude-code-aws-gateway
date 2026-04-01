@@ -90,7 +90,11 @@ pub fn router(state: Arc<GatewayState>) -> Router {
         .route("/admin/idps/{idp_id}", delete(admin::delete_idp))
         .route(
             "/admin/idps/{idp_id}/scim-tokens",
-            post(admin::create_scim_token),
+            post(admin::create_scim_token).get(admin::list_scim_tokens),
+        )
+        .route(
+            "/admin/idps/{idp_id}/scim-tokens/{token_id}",
+            delete(admin::revoke_scim_token),
         )
         .route("/admin/idps/{idp_id}/scim", put(admin::update_idp_scim))
         // Admin API — Endpoints

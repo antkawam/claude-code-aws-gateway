@@ -64,7 +64,11 @@ pub async fn list_keys(pool: &PgPool) -> anyhow::Result<Vec<VirtualKey>> {
 
 pub async fn get_active_keys(pool: &PgPool) -> anyhow::Result<Vec<VirtualKey>> {
     let keys = sqlx::query_as::<_, VirtualKey>(
-        "SELECT * FROM virtual_keys WHERE is_active = true AND (expires_at IS NULL OR expires_at > now())",
+        "SELECT v.* FROM virtual_keys v \
+         LEFT JOIN users u ON v.user_id = u.id \
+         WHERE v.is_active = true \
+         AND (v.expires_at IS NULL OR v.expires_at > now()) \
+         AND (v.user_id IS NULL OR u.active = true)",
     )
     .fetch_all(pool)
     .await?;
