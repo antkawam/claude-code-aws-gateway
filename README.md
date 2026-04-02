@@ -309,6 +309,10 @@ Anthropic's `web_search` tool is a server-side feature that Bedrock does not imp
 
 See [GitHub Discussions](https://github.com/antkawam/claude-code-aws-gateway/discussions) to suggest features or vote on priorities.
 
+## Used By
+
+Using CCAG in your team? [Open a PR](https://github.com/antkawam/claude-code-aws-gateway/pulls) to add yourself here.
+
 ## License
 
 [MIT](LICENSE)

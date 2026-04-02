@@ -1,4 +1,5 @@
 title: Claude Code AWS Gateway
+tagline: Self-Hosted Bedrock Gateway with Team Budgets & SSO
 description: Self-hosted API gateway for Claude Code on Amazon Bedrock. Team API keys, per-user budgets, OIDC SSO, rate limiting, and an admin portal.
 url: "https://antkawam.github.io"
 baseurl: "/claude-code-aws-gateway"
