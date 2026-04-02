@@ -1,3 +1,8 @@
+---
+title: "Office Integration (Excel & PowerPoint)"
+description: "Connect Claude for Excel and Claude for PowerPoint to CCAG for Bedrock-powered Office Add-in access without a Claude subscription."
+---
+
 # Office Integration (Excel & PowerPoint)
 
 Claude for Excel and Claude for PowerPoint are Microsoft Office Add-ins that bring Claude into spreadsheets and presentations. When connected via **Enterprise gateway**, they route requests through CCAG to Bedrock — no Claude subscription required.

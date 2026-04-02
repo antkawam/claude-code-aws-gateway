@@ -1,3 +1,8 @@
+---
+title: "Prometheus Metrics & OTLP Export"
+description: "Monitor CCAG with Prometheus scraping and OpenTelemetry OTLP export. Metric reference, Grafana examples, and alerting setup."
+---
+
 # Metrics
 
 CCAG exposes operational metrics via two channels:

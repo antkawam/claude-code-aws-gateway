@@ -1,3 +1,8 @@
+---
+title: "Web Search for Claude Code on Bedrock"
+description: "Enable web search for Claude Code via CCAG — DuckDuckGo, Tavily, Serper, or custom providers. Works around Bedrock's lack of native web search support."
+---
+
 # Web Search
 
 Amazon Bedrock does not support Anthropic's `web_search` server tool. When Claude Code sends a request containing a web search tool use, CCAG intercepts the request, executes the search using your configured provider, and returns results in the format Claude Code expects.

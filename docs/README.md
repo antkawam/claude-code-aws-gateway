@@ -1,3 +1,8 @@
+---
+title: "Documentation"
+description: "Claude Code AWS Gateway documentation — deployment, configuration, authentication, budgets, CLI, and API reference."
+---
+
 # Claude Code AWS Gateway
 
 A purpose-built gateway for running Claude Code through Amazon Bedrock. One-command developer onboarding, real-time budget controls, multi-account routing for latency optimization and data sovereignty, and a full admin portal.

@@ -1,3 +1,8 @@
+---
+title: "CCAG CLI Reference"
+description: "Complete reference for the ccag management CLI — manage keys, users, teams, endpoints, and gateway settings from the command line."
+---
+
 # CLI Reference
 
 ## Overview

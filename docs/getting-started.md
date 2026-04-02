@@ -1,3 +1,8 @@
+---
+title: "Getting Started with Claude Code AWS Gateway"
+description: "Deploy CCAG with Docker Compose or AWS CDK and connect Claude Code in under 5 minutes."
+---
+
 # Getting Started
 
 This guide walks you through deploying Claude Code AWS Gateway (CCAG) and connecting Claude Code to it.

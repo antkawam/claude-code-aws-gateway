@@ -1,3 +1,8 @@
+---
+title: "Budget Management for Claude Code Teams"
+description: "Set per-user and per-team spending limits with daily, weekly, or monthly resets. Enforce via notifications, throttling, or blocking."
+---
+
 # Budgets
 
 CCAG enforces spending limits per user and per team. Budgets reset on a configurable period (daily, weekly, or monthly) and support three enforcement modes: notify, shape (throttle), and block.

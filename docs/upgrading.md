@@ -1,3 +1,8 @@
+---
+title: "Upgrading CCAG"
+description: "How to upgrade Claude Code AWS Gateway to a new version, handle database migrations, and roll back if needed."
+---
+
 # Upgrading
 
 This guide covers how to upgrade CCAG to a new version, handle database migrations, and roll back if needed.

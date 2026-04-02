@@ -1,3 +1,8 @@
+---
+title: "SCIM 2.0 Provisioning API"
+description: "SCIM 2.0 user and group provisioning for CCAG — automate user lifecycle with Okta, Entra ID, authentik, or any SCIM-compliant identity provider."
+---
+
 # SCIM 2.0 API Specification for CCAG
 
 > **Status**: Complete (Users + Groups + Admin API + CLI + Portal UI).

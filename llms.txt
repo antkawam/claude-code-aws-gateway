@@ -15,14 +15,14 @@ CCAG presents as the Anthropic Messages API while routing inference through your
 
 ## Documentation
 
-- [README](https://github.com/antkawam/claude-code-aws-gateway/blob/main/README.md): Overview, quick start, feature list
-- [Getting Started](https://github.com/antkawam/claude-code-aws-gateway/blob/main/docs/getting-started.md): Docker Compose and CDK setup
-- [Configuration](https://github.com/antkawam/claude-code-aws-gateway/blob/main/docs/configuration.md): Environment variables reference
-- [Authentication](https://github.com/antkawam/claude-code-aws-gateway/blob/main/docs/authentication.md): OIDC SSO setup
-- [CLI Reference](https://github.com/antkawam/claude-code-aws-gateway/blob/main/docs/cli-reference.md): Management CLI commands
+- [README](https://antkawam.github.io/claude-code-aws-gateway/): Overview, quick start, feature list
+- [Getting Started](https://antkawam.github.io/claude-code-aws-gateway/docs/getting-started): Docker Compose and CDK setup
+- [Configuration](https://antkawam.github.io/claude-code-aws-gateway/docs/configuration): Environment variables reference
+- [Authentication](https://antkawam.github.io/claude-code-aws-gateway/docs/authentication): OIDC SSO setup
+- [CLI Reference](https://antkawam.github.io/claude-code-aws-gateway/docs/cli-reference): Management CLI commands
 - [CDK Deployment](https://github.com/antkawam/claude-code-aws-gateway/blob/main/infra/README.md): Production AWS deployment guide
-- [FAQ](https://github.com/antkawam/claude-code-aws-gateway/blob/main/docs/faq.md): Common questions
-- [Upgrading](https://github.com/antkawam/claude-code-aws-gateway/blob/main/docs/upgrading.md): Version updates and rollback
+- [FAQ](https://antkawam.github.io/claude-code-aws-gateway/docs/faq): Common questions
+- [Upgrading](https://antkawam.github.io/claude-code-aws-gateway/docs/upgrading): Version updates and rollback
 
 ## Quick Start
 

@@ -1,3 +1,8 @@
+---
+title: "Multi-Account Endpoint Routing"
+description: "Route Claude Code requests across multiple AWS accounts and regions for quota pooling, workload isolation, and regional failover."
+---
+
 # Endpoint Routing
 
 CCAG can route requests across multiple AWS accounts and regions through endpoint configuration. Each endpoint is a Bedrock runtime client with its own credentials, region, and routing prefix. Adding multiple endpoints lets you pool quota, isolate workloads, or provide regional failover.

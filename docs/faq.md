@@ -1,3 +1,8 @@
+---
+title: "Frequently Asked Questions"
+description: "Common questions about Claude Code AWS Gateway — setup, troubleshooting, features, and compatibility."
+---
+
 # Frequently Asked Questions
 
 ## General

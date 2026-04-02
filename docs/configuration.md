@@ -1,3 +1,8 @@
+---
+title: "CCAG Configuration Reference"
+description: "Complete reference for Claude Code AWS Gateway environment variables, runtime settings, and deployment configuration."
+---
+
 # Configuration
 
 CCAG has three layers of configuration, each serving a different purpose:

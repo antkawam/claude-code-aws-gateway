@@ -1,3 +1,8 @@
+---
+title: "Authentication & OIDC SSO Setup"
+description: "Configure CCAG authentication: admin login, virtual API keys, and OIDC SSO with Okta, Azure AD, Google, or any compliant provider."
+---
+
 # Authentication
 
 CCAG supports a three-tier authentication system. Start with simple admin login, add virtual keys for teams, then integrate OIDC for enterprise SSO.
