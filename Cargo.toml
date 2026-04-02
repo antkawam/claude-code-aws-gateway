@@ -66,7 +66,7 @@ sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "postgres", "uuid"
 sha2 = "0.10"
 rand = "0.9"
 hex = "0.4"
-jsonwebtoken = "9"
+jsonwebtoken = "10"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
 
 # TLS (self-signed for local dev)
