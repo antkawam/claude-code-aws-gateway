@@ -25,9 +25,6 @@ allow = [
     "Zlib",
 ]
 confidence-threshold = 0.8
-exceptions = [
-    { allow = ["LGPL-2.1-or-later"], crate = "r-efi" },
-]
 
 [bans]
 multiple-versions = "warn"
