@@ -2403,6 +2403,55 @@ input[type="date"].oa-filter-select { background-image: none; padding-right: 8px
             </table>
           </div>
 
+          <div class="info-callout">
+            <div class="info-callout-header" onclick="toggleIdpExplainer()">
+              <h3>
+                <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>
+                How SSO &amp; SCIM Provisioning Work
+              </h3>
+              <svg id="idp-explainer-chevron" width="13" height="13" style="opacity:0.4;transition:transform 0.2s;transform:rotate(-90deg)" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg>
+            </div>
+            <div id="idp-explainer-body" class="info-callout-body" style="display:none">
+              <p style="margin:0 0 12px">
+                CCAG supports two complementary mechanisms for managing user access from your identity provider (Okta, Entra ID, authentik, etc.):
+              </p>
+
+              <p style="margin:0 0 4px;color:var(--text);font-weight:500;font-size:11px">OIDC Single Sign-On (Authentication)</p>
+              <p style="margin:0 0 8px">
+                Users authenticate via your IdP using standard OpenID Connect. CCAG validates JWT tokens against the IdP's JWKS endpoint.
+                Supports device code, authorization code, and implicit flows. Multiple IdPs can be active simultaneously.
+              </p>
+              <ul style="margin:0 0 12px;padding-left:18px;font-size:12px">
+                <li>By default, any valid OIDC token auto-provisions the user as a <strong>member</strong></li>
+                <li>Enable SCIM on an IdP to require pre-provisioning (auto-provisioning is disabled for that IdP)</li>
+              </ul>
+
+              <p style="margin:0 0 4px;color:var(--text);font-weight:500;font-size:11px">SCIM 2.0 Provisioning (User Lifecycle)</p>
+              <p style="margin:0 0 8px">
+                Your IdP pushes user creates, updates, and deactivations to CCAG's SCIM endpoint (<code>/scim/v2</code>).
+                This gives you centralized control over who has access &mdash; deactivating a user in your IdP immediately blocks their CCAG access.
+              </p>
+              <ul style="margin:0 0 12px;padding-left:18px;font-size:12px">
+                <li>SCIM groups control <strong>roles</strong> (admin/member), not team assignment. Teams are managed separately in CCAG.</li>
+                <li>Configure which SCIM group names map to admin role via the "Admin Groups" setting per IdP</li>
+                <li>Deactivated users' virtual keys are automatically blocked on the next cache cycle (~5s)</li>
+              </ul>
+
+              <p style="margin:0 0 4px;color:var(--text);font-weight:500;font-size:11px">Setup Steps</p>
+              <ol style="margin:0 0 8px;padding-left:18px;font-size:12px">
+                <li>Add your IdP here with its OIDC issuer URL and client ID</li>
+                <li>Enable SCIM on the IdP and generate a bearer token</li>
+                <li>In your IdP, configure a SCIM application pointing to <code>&lt;your-gateway-url&gt;/scim/v2</code> with the bearer token</li>
+                <li>Assign users/groups in your IdP &mdash; they will be provisioned to CCAG automatically</li>
+                <li>Optionally set admin groups to control which SCIM groups grant admin role</li>
+              </ol>
+              <p style="margin:0;font-size:12px">
+                <strong>CLI alternative:</strong> All SCIM configuration can be automated via <code>ccag scim enable</code>,
+                <code>ccag scim create-token</code>, and <code>ccag scim set-admin-groups</code>.
+              </p>
+            </div>
+          </div>
+
           <div class="card">
             <div class="card-header">
               <h3>Identity Providers</h3>
@@ -2412,7 +2461,7 @@ input[type="date"].oa-filter-select { background-image: none; padding-right: 8px
               </button>
             </div>
             <table id="idps-table-wrapper">
-              <thead><tr><th>Name</th><th>Issuer</th><th>Status</th><th>SCIM</th><th></th></tr></thead>
+              <thead><tr><th>Name</th><th>Issuer</th><th>Status</th><th style="text-align:center;width:60px">SCIM</th><th></th></tr></thead>
               <tbody id="idps-table"></tbody>
             </table>
             <div id="idps-empty" class="empty-state" style="display:none">
@@ -2635,8 +2684,8 @@ input[type="date"].oa-filter-select { background-image: none; padding-right: 8px
         <small style="color:var(--text-muted);font-size:11px">Space-separated. Use "openid email profile" for Entra/Okta if email claim is needed.</small>
       </div>
 
-      <!-- SCIM Provisioning section (only visible when editing, not creating) -->
-      <div id="scim-section" style="display:none;border-top:1px solid var(--border);padding-top:16px;margin-top:16px">
+      <!-- SCIM Provisioning section -->
+      <div id="scim-section" style="border-top:1px solid var(--border);padding-top:16px;margin-top:16px">
         <h4 style="margin:0 0 12px;font-size:13px;text-transform:uppercase;letter-spacing:1px;color:var(--text-muted)">SCIM Provisioning</h4>
 
         <div class="form-group">
@@ -2662,10 +2711,13 @@ input[type="date"].oa-filter-select { background-image: none; padding-right: 8px
             <div class="form-hint">Comma-separated. Users in these SCIM groups get admin role. Others get the default role.</div>
           </div>
 
-          <div class="form-group">
+          <div class="form-group" id="scim-tokens-section">
             <label class="form-label">Bearer Tokens</label>
             <div id="scim-tokens-list" style="margin-bottom:8px"></div>
             <button class="btn btn-secondary btn-sm" onclick="generateScimToken()">+ Generate Token</button>
+          </div>
+          <div id="scim-tokens-save-hint" style="display:none;color:var(--text-muted);font-size:12px;font-style:italic">
+            Save the provider first, then edit it to generate SCIM tokens and configure admin groups.
           </div>
         </div>
       </div>
@@ -4813,6 +4865,18 @@ let wsEditingProvider = null;
 // Cache of saved provider configs from the API
 let wsProviderConfigs = {};
 
+function toggleIdpExplainer() {
+  const body = document.getElementById('idp-explainer-body');
+  const chevron = document.getElementById('idp-explainer-chevron');
+  if (body.style.display === 'none') {
+    body.style.display = '';
+    chevron.style.transform = '';
+  } else {
+    body.style.display = 'none';
+    chevron.style.transform = 'rotate(-90deg)';
+  }
+}
+
 function toggleWsExplainer() {
   const body = document.getElementById('ws-explainer-body');
   const chevron = document.getElementById('ws-explainer-chevron');
@@ -5602,7 +5666,7 @@ function renderIdps() {
       <td><strong>${escHtml(idp.name)}</strong></td>
       <td style="max-width:280px;overflow:hidden;text-overflow:ellipsis"><code style="font-size:10px">${escHtml(idp.issuer_url)}</code></td>
       <td>${idp.enabled !== false ? '<span class="badge badge-green"><span class="badge-dot"></span>Active</span>' : '<span class="badge badge-red"><span class="badge-dot"></span>Disabled</span>'}</td>
-      <td>${idp.scim_enabled ? '<span class="badge badge-purple"><span class="badge-dot"></span>SCIM</span>' : '<span style="color:var(--text-muted);font-size:11px">—</span>'}</td>
+      <td style="text-align:center">${idp.scim_enabled ? '<span class="badge badge-purple"><span class="badge-dot"></span>SCIM</span>' : '<span style="color:var(--text-muted);font-size:11px">—</span>'}</td>
       <td style="white-space:nowrap">
         <button class="btn btn-secondary btn-sm" onclick="editIdp('${idp.id}')" style="margin-right:4px">Edit</button>
         <button class="btn btn-danger btn-sm" onclick="deleteIdp('${idp.id}')">Delete</button>
@@ -5681,7 +5745,44 @@ async function saveIdp() {
     }
   } else {
     res = await api('POST', '/admin/idps', body);
-    if (res.id) { closeModal(); toast('Provider added', 'success'); loadAll(); }
+    if (res.id) {
+      const scimEnabled = document.getElementById('mi-scim-enabled').checked;
+      if (scimEnabled) {
+        await api('PUT', `/admin/idps/${res.id}/scim`, { enabled: true });
+        // Auto-generate a token so the user can copy it immediately
+        const tokenRes = await api('POST', `/admin/idps/${res.id}/scim-tokens`, { name: 'default' });
+        await loadAll();
+        const newIdp = data.idps.find(i => i.id === res.id);
+        if (newIdp) {
+          showIdpModal(newIdp);
+          // Show the one-time token banner
+          if (tokenRes.token) {
+            let banner = document.getElementById('scim-token-banner');
+            if (!banner) {
+              banner = document.createElement('div');
+              banner.id = 'scim-token-banner';
+              const container = document.getElementById('scim-tokens-list');
+              container.parentNode.insertBefore(banner, container);
+            }
+            banner.innerHTML = `<div style="background:var(--bg-surface);border:1px solid var(--accent);border-radius:6px;padding:12px;margin-bottom:12px">
+              <div style="font-size:11px;color:var(--accent);margin-bottom:6px;font-weight:600">SCIM Token — copy now, it won't be shown again</div>
+              <div style="display:flex;gap:8px;align-items:center">
+                <code style="flex:1;font-size:11px;word-break:break-all;user-select:all">${escHtml(tokenRes.token)}</code>
+                <button class="btn btn-secondary btn-sm" onclick="copyText('${tokenRes.token}')">Copy</button>
+                <button class="btn btn-ghost btn-sm" onclick="document.getElementById('scim-token-banner').remove()">Done</button>
+              </div>
+            </div>`;
+          }
+          toast('Provider created with SCIM enabled', 'success');
+          setTimeout(() => {
+            const scimEl = document.getElementById('scim-section');
+            if (scimEl) scimEl.scrollIntoView({ behavior: 'smooth', block: 'center' });
+          }, 200);
+        }
+      } else {
+        closeModal(); toast('Provider added', 'success'); loadAll();
+      }
+    }
     else toast(res.error?.message || 'Failed to add provider', 'error');
   }
 }
@@ -5689,24 +5790,23 @@ async function saveIdp() {
 // ---- SCIM ----
 function updateScimSection() {
   const isEdit = !!editingIdpId;
-  const scimSection = document.getElementById('scim-section');
-  scimSection.style.display = isEdit ? 'block' : 'none';
-  if (!isEdit) return;
+  const idp = isEdit ? data.idps.find(i => i.id === editingIdpId) : null;
 
-  const idp = data.idps.find(i => i.id === editingIdpId);
-  if (!idp) return;
-
-  document.getElementById('mi-scim-enabled').checked = !!idp.scim_enabled;
+  document.getElementById('mi-scim-enabled').checked = idp ? !!idp.scim_enabled : false;
   document.getElementById('scim-base-url').textContent = window.location.origin + '/scim/v2';
 
   const scimConfig = document.getElementById('scim-config');
-  scimConfig.style.display = idp.scim_enabled ? 'block' : 'none';
+  const scimEnabled = idp ? !!idp.scim_enabled : document.getElementById('mi-scim-enabled').checked;
+  scimConfig.style.display = scimEnabled ? 'block' : 'none';
 
-  // Load admin groups
-  loadScimAdminGroups(editingIdpId);
+  // Show tokens/admin-groups when editing, hint when creating
+  document.getElementById('scim-tokens-section').style.display = isEdit ? '' : 'none';
+  document.getElementById('scim-tokens-save-hint').style.display = isEdit ? 'none' : 'block';
 
-  // Load tokens
-  loadScimTokens(editingIdpId);
+  if (isEdit && idp) {
+    loadScimAdminGroups(editingIdpId);
+    loadScimTokens(editingIdpId);
+  }
 }
 
 document.addEventListener('change', e => {
@@ -5748,7 +5848,9 @@ async function loadScimTokens(idpId) {
 }
 
 async function generateScimToken() {
+  if (!editingIdpId) { toast('Save the provider first', 'error'); return; }
   const name = prompt('Token name (optional):');
+  if (name === null) return; // cancelled
   const body = {};
   if (name) body.name = name;
   const resp = await api('POST', `/admin/idps/${editingIdpId}/scim-tokens`, body);

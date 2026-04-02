@@ -22,7 +22,7 @@ src/
   cli/                 - CLI operations tool (ccag binary)
     main.rs            - CLI entry point (clap)
     config.rs          - Admin API client, token management
-    commands/          - Subcommands: config, keys, users, status, logs
+    commands/          - Subcommands: config, keys, users, teams, scim, status, logs
   api/
     mod.rs             - Router, auth endpoints, setup script serving
     handlers.rs        - HTTP handlers (messages, count_tokens, health)
@@ -48,6 +48,7 @@ src/
     request.rs         - Request translation
     response.rs        - Response normalization
     streaming.rs       - SSE event formatting
+  scim/               - SCIM 2.0 provisioning (auth, discovery, users, groups, filter, types)
   websearch/mod.rs     - DuckDuckGo web search interception
 static/index.html     - Embedded admin portal SPA (dashboard, analytics, config)
 infra/                 - AWS CDK (TypeScript) for ECS Fargate + RDS + CW Dashboard
@@ -62,7 +63,7 @@ docs/
 - **Presents as Anthropic Direct API**: Set `ANTHROPIC_BASE_URL` (NOT `CLAUDE_CODE_USE_BEDROCK`)
 - **Model ID mapping**: Auto-detected from AWS SDK region. See `config/mod.rs`
 - **Beta flag allowlist**: Only forward betas Bedrock accepts. See `translate/models.rs`
-- **Auth**: Virtual keys (DB cache) + OIDC JWT (multi-IDP) + gateway session tokens
+- **Auth**: Virtual keys (DB cache) + OIDC JWT (multi-IDP) + gateway session tokens + SCIM 2.0 provisioning
 - **Web search**: Intercepts `web_search` tool, executes via DuckDuckGo. See `websearch/mod.rs`
 - **Cache invalidation**: Polling `cache_version` table every 5s
 - **Database**: Postgres required. Migrations auto-run on startup

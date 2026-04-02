@@ -388,8 +388,14 @@ async fn build_provider_info(
     };
 
     // Build implicit flow URL: redirect back to /portal where checkSsoCallback extracts id_token
-    let redirect_host = host.split(':').next().unwrap_or(host);
-    let redirect_uri = format!("https://{redirect_host}/portal");
+    // Preserve port for local dev; use https unless localhost/127.0.0.1
+    let base_host = host.split(':').next().unwrap_or(host);
+    let scheme = if base_host == "localhost" || base_host == "127.0.0.1" {
+        "http"
+    } else {
+        "https"
+    };
+    let redirect_uri = format!("{scheme}://{host}/portal");
     let audience = idp.audience.as_deref().unwrap_or("");
     let nonce = format!("{}", chrono::Utc::now().timestamp());
 

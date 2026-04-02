@@ -12,7 +12,7 @@ A purpose-built gateway for running [Claude Code](https://docs.anthropic.com/en/
 
 **For developers:** One-command onboarding. No AWS credentials, no config files. A self-service portal shows personal usage metrics, budget consumption, and virtual key management.
 
-**For automation:** A management CLI (`ccag`) for scripting key provisioning, team setup, and budget enforcement. Webhook, SNS, and EventBridge integrations for piping budget alerts and events into your existing tools.
+**For automation:** A management CLI (`ccag`) for scripting key provisioning, team setup, budget enforcement, and SCIM provisioning setup. Webhook, SNS, and EventBridge integrations for piping budget alerts and events into your existing tools.
 
 **100% open source, every feature included.** No enterprise tier, no feature gates, no per-seat pricing.
 
@@ -29,6 +29,7 @@ When Claude Code connects to Bedrock directly (`CLAUDE_CODE_USE_BEDROCK=1`), it 
 | Budget controls | N/A | Per-user and per-team limits (notify, throttle, or block) |
 | Developer onboarding | Manual config | One-command setup via portal Connect page |
 | SSO authentication | N/A | OIDC with any provider (Okta, Azure AD, Google, etc.) |
+| User provisioning | N/A | SCIM 2.0 (Okta, Entra ID, authentik, etc.) |
 | Admin portal | N/A | Built-in SPA with real-time analytics |
 
 ## Architecture
@@ -129,7 +130,18 @@ Three-tier authentication for different use cases:
 2. Virtual API keys: database-backed keys for programmatic access
 3. OIDC SSO: JWT validation with any compliant identity provider
 
-Supported OIDC providers include Okta, Azure AD, Google Workspace, Auth0, Keycloak, and any provider with a `.well-known/openid-configuration` endpoint. Multiple providers can be active at the same time.
+Supported OIDC providers include Okta, Azure AD, Google Workspace, Auth0, authentik, and any provider with a `.well-known/openid-configuration` endpoint. Multiple providers can be active at the same time.
+
+#### SCIM 2.0 Provisioning
+
+Optional centralized user lifecycle management from your identity provider:
+
+- **User provisioning**: IdP pushes user creates, updates, and deactivations to CCAG's `/scim/v2` endpoint
+- **Role mapping**: SCIM groups control admin/member roles (configurable per IdP)
+- **Access control**: When SCIM is enabled for an IdP, users must be provisioned before they can log in
+- **Deactivation**: Deactivated users' virtual keys are automatically blocked
+
+SCIM is configured per identity provider — enable it in the portal (Settings > Identity Providers) or via CLI (`ccag scim enable`). See `docs/scim-spec.md` for the full API reference.
 
 ### Admin Portal
 
@@ -137,7 +149,7 @@ A built-in single-page application at `/portal` for:
 
 - Key creation and management
 - Team administration
-- Identity provider configuration
+- Identity provider configuration with SCIM provisioning setup
 - Gateway settings
 - Analytics dashboard with 4 tabs:
   - Spend: timeseries by team, spend by team/model/user, budget status, OLS cost forecast
