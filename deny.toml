@@ -17,7 +17,6 @@ allow = [
     "CC0-1.0",
     "CDLA-Permissive-2.0",
     "ISC",
-    "LGPL-2.1-or-later",
     "MIT",
     "MIT-0",
     "MPL-2.0",
@@ -26,6 +25,9 @@ allow = [
     "Zlib",
 ]
 confidence-threshold = 0.8
+exceptions = [
+    { allow = ["LGPL-2.1-or-later"], crate = "r-efi" },
+]
 
 [bans]
 multiple-versions = "warn"
