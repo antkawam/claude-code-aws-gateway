@@ -1,154 +1,223 @@
 ---
-title: "Deploying Claude Code for Teams: Budget Controls, SSO, and Audit Trails"
-description: "Deploy Claude Code for your engineering team on AWS with per-user budgets, OIDC SSO, SCIM provisioning, and a centralized admin portal."
+title: "Self-Hosted Claude Code for Enterprises on AWS"
+description: "Deploy Claude Code for your entire team on Amazon Bedrock with centralized budget controls, OIDC SSO, SCIM provisioning, audit trails, and a built-in admin portal."
 ---
 
-# Deploying Claude Code for Teams
+# Self-Hosted Claude Code for Enterprises on AWS
 
-Running Claude Code for a single developer is straightforward. Running it for a team of 20, 50, or 200 developers on AWS — with cost visibility, access control, and audit trails — requires infrastructure that neither Anthropic Direct nor Bedrock provide out of the box.
+Amazon Bedrock lets you run Claude inference in your AWS account, but it provides no team management layer. You can run Claude Code on Bedrock today — but every developer needs their own AWS credentials, there is no per-user spend visibility, no budget enforcement, no SSO, and no centralized audit trail. As a team scales from 5 to 50 to 500 engineers, managing this manually becomes untenable.
 
-CCAG provides that infrastructure as a single deployable service.
+CCAG is a self-hosted API gateway that sits between Claude Code and Bedrock. Developers connect to CCAG with a virtual API key; the gateway handles authentication, authorization, budget enforcement, and request routing. Infrastructure teams get a single deployment to manage instead of per-developer AWS credential configurations.
 
-## What Teams Need
+## What Enterprises Need
 
-| Requirement | Anthropic Direct | Bedrock Direct | CCAG |
-|---|---|---|---|
-| Centralized billing | Per-seat subscription | AWS bill (no per-user breakdown) | Per-user/team spend tracking |
-| Access control | API keys | IAM roles | OIDC SSO + virtual keys |
-| Budget enforcement | None | None | Notify, throttle, or block per user/team |
-| User provisioning | Manual | Manual | SCIM 2.0 (Okta, Entra ID, etc.) |
-| Usage analytics | None | CloudWatch (aggregate) | Per-user, per-model, per-tool dashboard |
-| Audit trail | None | CloudTrail (API-level) | Request-level spend log with user attribution |
+| Requirement | Direct Bedrock | Through CCAG |
+|---|---|---|
+| Single sign-on (Okta, Azure AD, Google) | No | OIDC with any compliant IdP |
+| Automated user provisioning/deprovisioning | No | SCIM 2.0 (Okta, Entra ID, authentik) |
+| Per-user and per-team spending limits | No | Configurable budgets (notify, throttle, block) |
+| Audit trail of requests and spend | No | Full spend log with user, model, token counts |
+| Centralized API key management | No | Virtual keys with rate limits and expiry |
+| Multi-account quota pooling | No | Multi-endpoint pool with automatic failover |
+| Data residency control | Partial | Endpoint-level region assignment per team |
+| Developer self-service onboarding | No | One-command setup from Connect page |
 
 ## Architecture
 
 ```
-Developer laptops                    Your AWS account
-┌──────────────┐                    ┌──────────────────────┐
-│ Claude Code   │─── HTTPS ────────▶│  CCAG (ECS Fargate)  │
-│ (ANTHROPIC_   │                   │  ┌────────────────┐  │
-│  BASE_URL)    │                   │  │ Auth (OIDC/keys)│  │
-└──────────────┘                    │  │ Budgets         │  │
-                                    │  │ Rate limits     │  │
-                                    │  │ Analytics       │  │
-                                    │  └───────┬────────┘  │
-                                    │          │           │
-                                    │  ┌───────▼────────┐  │
-                                    │  │ Amazon Bedrock  │  │
-                                    │  └────────────────┘  │
-                                    │  ┌────────────────┐  │
-                                    │  │ Postgres (RDS)  │  │
-                                    │  └────────────────┘  │
-                                    └──────────────────────┘
+Developer Machine
+  └── Claude Code
+        └── ANTHROPIC_BASE_URL → CCAG (ECS Fargate or self-hosted)
+                                    ├── Auth (virtual keys, OIDC JWTs, session tokens)
+                                    ├── Budget enforcement (per-user, per-team)
+                                    ├── Rate limiting (per-key sliding window)
+                                    ├── Endpoint routing (multi-account, multi-region)
+                                    └── Bedrock Runtime (your AWS account)
 ```
 
-## Developer Onboarding
+CCAG presents as the Anthropic Messages API. Claude Code connects to it with `ANTHROPIC_BASE_URL` and gets full feature access including extended thinking, tool use, and web search — none of which are available when connecting to Bedrock directly with `CLAUDE_CODE_USE_BEDROCK=1`.
 
-With CCAG, onboarding a new developer takes one command — no AWS credentials, no IAM roles, no config files.
+## Identity: OIDC SSO and SCIM Provisioning
 
-### Option 1: Browser-Based Login (OIDC)
+### OIDC Single Sign-On
 
-Developers authenticate through your existing identity provider:
+CCAG supports any OIDC-compliant identity provider. Developers log in to the portal using their corporate identity; no separate password is required. Multiple IDPs can be configured simultaneously — useful during migrations or for organizations with multiple identity systems.
 
-```bash
-# Install the CLI
-cargo install ccag-cli
+Supported providers include Okta, Azure AD / Entra ID, Google Workspace, Ping Identity, Keycloak, and any provider that implements the OIDC discovery spec.
 
-# Log in via browser (opens your SSO provider)
-ccag login https://ccag.example.com
-
-# That's it — Claude Code is configured
-claude
-```
-
-The `ccag login` command opens a browser for OIDC authentication, receives a session token, and writes `ANTHROPIC_BASE_URL` and `ANTHROPIC_API_KEY` to the developer's Claude Code configuration.
-
-### Option 2: Virtual API Key
-
-For CI/CD pipelines or developers who prefer manual setup:
+Register an IDP through the admin portal or API:
 
 ```bash
-export ANTHROPIC_BASE_URL=https://ccag.example.com
-export ANTHROPIC_API_KEY=sk-proxy-xxxxx  # from the portal
-```
-
-Admins create keys in the portal or via the API, scoped to a team with a specific rate limit and budget.
-
-## OIDC SSO Setup
-
-CCAG supports any OIDC provider that exposes a `.well-known/openid-configuration` endpoint. Multiple providers can be active simultaneously.
-
-### Configure via Environment Variable (Bootstrap)
-
-```bash
-OIDC_ISSUER=https://login.microsoftonline.com/{tenant}/v2.0
-```
-
-### Configure via Admin Portal (Runtime)
-
-Go to **Settings > Identity Providers > Add Provider**. Enter the issuer URL, client ID, and optional audience. CCAG auto-discovers the JWKS endpoint.
-
-Supported providers include Okta, Azure AD (Entra ID), Google Workspace, Auth0, Keycloak, AWS IAM Identity Center, and any standard OIDC-compliant provider.
-
-## SCIM 2.0 Provisioning
-
-For organizations using Okta or Entra ID, CCAG supports SCIM 2.0 for automatic user and group provisioning. When a user is added to your IdP, they are automatically created in CCAG. When removed, their access is revoked.
-
-Configure SCIM in your IdP pointing to `https://ccag.example.com/scim/v2` with a bearer token generated from the admin portal.
-
-## Budget Enforcement
-
-Set spending limits at the user or team level. When a threshold is reached, CCAG can:
-
-- **Notify**: Send an alert via webhook, SNS, or EventBridge
-- **Throttle**: Reduce the user's rate limit
-- **Block**: Reject requests until the next billing period
-
-```bash
-# Set a $50/month budget for a team with notification at 80%
-curl -X PUT https://ccag.example.com/admin/teams/{id}/budget \
+curl -X POST https://ccag.example.com/admin/idps \
   -H "authorization: Bearer $TOKEN" \
   -H "content-type: application/json" \
   -d '{
-    "monthly_limit_usd": 50.00,
-    "notification_threshold_pct": 80,
-    "action_on_limit": "block"
+    "name": "Corporate Okta",
+    "issuer": "https://your-org.okta.com",
+    "client_id": "0oa...",
+    "client_secret": "...",
+    "auto_provision": true
   }'
 ```
 
-Budget data is visible to developers in the portal's personal dashboard, so they can self-manage their usage.
+With `auto_provision: true`, users are created in CCAG on first login without any admin action.
 
-## Analytics Dashboard
+### SCIM 2.0 Provisioning
 
-The built-in admin portal provides four analytics views:
+For larger organizations, managing user lifecycle manually does not scale. CCAG implements SCIM 2.0, allowing your IdP to push user and group changes directly:
 
-- **Spend**: Total and per-user cost over time, with forecast
-- **Activity**: Request volume, latency, error rates
-- **Models**: Usage breakdown by model (which teams use which models)
-- **Tools**: Tool use frequency (how often web search, file editing, etc. are invoked)
+- Users are created when onboarded in Okta or Entra ID
+- Users are deactivated (soft-deleted, spend history preserved) when offboarded
+- Role assignments (`admin` / `member`) are managed via SCIM Groups
+- No CCAG admin action required for routine user lifecycle events
 
-All views support multi-select filters (team, user, model, endpoint) and adjustable time ranges with hourly/daily/weekly granularity. Data can be exported as CSV.
+Configure SCIM in the portal under **Identity Providers**. Generate a SCIM bearer token, then paste the base URL (`https://ccag.example.com/scim/v2`) and token into your IdP's application settings.
 
-## Deployment
+See [SCIM 2.0 API](../scim-spec.md) for the full provisioning spec.
 
-CCAG deploys as a single container with a Postgres database. The included AWS CDK stack provisions ECS Fargate, RDS, ALB, and CloudWatch in one command:
+## Budget Controls
+
+Every request goes through budget enforcement before reaching Bedrock. Budgets operate at two levels simultaneously — the more restrictive one applies.
+
+### Setting a Team Budget
 
 ```bash
-cd infra
-npx cdk deploy -c environment=prod
+curl -X PUT https://ccag.example.com/admin/teams/{team_id}/budget \
+  -H "authorization: Bearer $TOKEN" \
+  -H "content-type: application/json" \
+  -d '{
+    "budget_amount_usd": 2000.00,
+    "budget_period": "monthly",
+    "budget_policy": "standard",
+    "default_user_budget_usd": 100.00
+  }'
 ```
 
-Or use Docker Compose for smaller deployments:
+`default_user_budget_usd` sets a per-member limit inherited by all team members unless overridden individually.
+
+### Enforcement Modes
+
+| Mode | Behavior |
+|---|---|
+| `notify` | Alert is sent; request is allowed |
+| `shape` | Request is allowed; RPM is throttled to a configured rate |
+| `block` | Request is rejected with HTTP 402 |
+
+The `standard` policy notifies at 80% spend and blocks at 100%. Custom rule arrays give you fine-grained control:
 
 ```bash
+curl -X PUT https://ccag.example.com/admin/teams/{team_id}/budget \
+  -H "authorization: Bearer $TOKEN" \
+  -H "content-type: application/json" \
+  -d '{
+    "budget_amount_usd": 1000.00,
+    "budget_period": "monthly",
+    "budget_policy": [
+      {"at_percent": 70, "action": "notify"},
+      {"at_percent": 90, "action": "shape", "shaped_rpm": 10},
+      {"at_percent": 100, "action": "block"}
+    ]
+  }'
+```
+
+Budget events are delivered via webhook, SNS, or EventBridge. Configure notification channels in the portal under **Settings > Notifications**.
+
+See [Budget Controls](budget-controls.md) and [Budget Management](../budgets.md) for the full reference.
+
+## Audit Trail and Analytics
+
+The admin portal includes a cross-org analytics dashboard with four tabs: Spend, Activity, Models, and Tools. All data comes from the `spend_log` table — no additional infrastructure required.
+
+Filters include team, user, model, and endpoint. Time range and granularity (hourly, daily, weekly) are adjustable. All charts can be exported as CSV for reporting.
+
+For compliance requirements, the spend log records:
+
+- Timestamp
+- User identity (subject claim from OIDC JWT or virtual key name)
+- Team assignment
+- Model ID and version
+- Input and output token counts
+- Estimated USD cost
+- Endpoint used (region and account)
+- MCP tools invoked
+
+The log is stored in your Postgres database. Retention is managed by your standard database backup and rotation policies.
+
+## Developer Onboarding
+
+Once CCAG is deployed and configured, developer onboarding is a single command. The portal's **Connect** page generates a setup script that installs Claude Code (if needed), creates a virtual API key, and sets `ANTHROPIC_BASE_URL` and `ANTHROPIC_API_KEY` in the shell profile:
+
+```bash
+curl -fsSL https://ccag.example.com/setup | sh
+```
+
+No AWS credentials, no region configuration, no manual environment variables. Developers are productive immediately.
+
+For CLI-based onboarding (recommended for OIDC deployments):
+
+```bash
+cargo install ccag-cli
+ccag login https://ccag.example.com  # opens browser for SSO
+```
+
+After login, Claude Code is automatically configured to use the gateway.
+
+## Deployment Options
+
+### Docker Compose (Evaluation or Small Teams)
+
+```bash
+cp .env.example .env
+# Set AWS_REGION and AWS credentials in .env
 docker compose up -d
 ```
 
-See [Getting Started](../getting-started.md) for the full deployment guide.
+The gateway starts at `http://localhost:8080`. Suitable for evaluation, solo use, or small teams where high availability is not required.
+
+### AWS CDK (Production)
+
+For teams that need managed infrastructure:
+
+```bash
+cd infra && npm install
+# Configure environments.json with account ID, region, domain
+npx cdk deploy
+```
+
+This provisions a production stack: VPC, Application Load Balancer, ECS Fargate (ARM64/Graviton), RDS Postgres, autoscaling, and CloudWatch alarms. See [`infra/README.md`](../../infra/README.md) for the full deployment guide.
+
+## Data Residency
+
+If your organization has data residency requirements, pin each team to a specific Bedrock region by assigning team-specific endpoints:
+
+```bash
+# Create an EU-only endpoint
+curl -X POST https://ccag.example.com/admin/endpoints \
+  -H "authorization: Bearer $TOKEN" \
+  -H "content-type: application/json" \
+  -d '{
+    "name": "EU Compliance",
+    "region": "eu-west-1",
+    "routing_prefix": "eu",
+    "priority": 0
+  }'
+
+# Assign the EU team to the EU endpoint only
+curl -X PUT https://ccag.example.com/admin/teams/{eu_team_id}/endpoints \
+  -H "authorization: Bearer $TOKEN" \
+  -H "content-type: application/json" \
+  -d '{
+    "routing_strategy": "primary_fallback",
+    "endpoints": [{"endpoint_id": "eu-endpoint-uuid", "priority": 0}]
+  }'
+```
+
+Teams assigned to EU-only endpoints will never have requests routed to US or APAC regions.
 
 ## See Also
 
-- [Configuration](../configuration.md): all environment variables
-- [SCIM Provisioning](../scim.md): SCIM 2.0 setup guide
-- [Endpoint Routing](../endpoints.md): multi-account/region setup
-- [Comparison](../comparison.md): CCAG vs LiteLLM vs Direct Bedrock
+- [Getting Started](../getting-started.md): full deployment guide
+- [Authentication](../authentication.md): OIDC SSO setup and virtual key management
+- [SCIM 2.0 API](../scim-spec.md): automated user provisioning reference
+- [Budget Controls](budget-controls.md): per-user and per-team spending limits
+- [Endpoint Routing](../endpoints.md): multi-region and multi-account routing
