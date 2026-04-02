@@ -96,7 +96,7 @@ Full list: see `docs/configuration.md`
 
 ## Bedrock Gotchas
 
-- `cache_control` is preserved and passed through to Bedrock (supports prompt caching)
+- `cache_control` is sanitized before forwarding to Bedrock (only `type` and `ttl` fields are kept; unknown fields like `scope` are stripped)
 - `amazon-bedrock-invocationMetrics` must be stripped from SSE events
 - Inference profiles are mandatory for newer Claude models (4.5+)
 - Beta flags: ALLOWLIST approach (only forward betas Bedrock accepts)
