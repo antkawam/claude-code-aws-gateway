@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1
 # Build stage — BuildKit cache mounts persist cargo registry + target across builds
-FROM rust:1-alpine AS builder
+FROM rust:1-alpine@sha256:7f752ee8ea5deb9f4863d8c3f228a216a6466619882f09a44b9eda9617dc7770 AS builder
 RUN apk add --no-cache musl-dev
 WORKDIR /app
 
@@ -15,7 +15,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     mkdir -p src cli/src && \
     echo 'fn main() {}' > src/main.rs && \
     echo 'fn main() {}' > cli/src/main.rs && \
-    cargo build --release --bin ccag-server 2>&1 | tail -1 && \
+    cargo build --release --bin ccag-server --locked 2>&1 | tail -1 && \
     rm -rf src cli/src
 
 # Copy source and build (incremental — only recompiles project code)
@@ -28,11 +28,11 @@ ENV SQLX_OFFLINE=true
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
     --mount=type=cache,target=/app/target \
-    cargo build --release --bin ccag-server && \
+    cargo build --release --bin ccag-server --locked && \
     cp /app/target/release/ccag-server /usr/local/bin/ccag-server
 
 # Runtime stage — minimal Alpine
-FROM alpine:3.23
+FROM alpine:3.23@sha256:25109184c71bdad752c8312a8623239686a9a2071e8825f20acb8f2198c3f659
 RUN apk add --no-cache ca-certificates curl postgresql16-client && \
     addgroup -S proxy && adduser -S proxy -G proxy
 COPY --from=builder /usr/local/bin/ccag-server /usr/local/bin/
