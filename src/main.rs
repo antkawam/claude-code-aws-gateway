@@ -461,10 +461,12 @@ fn build_rustls_config() -> anyhow::Result<Arc<rustls::ServerConfig>> {
     if let (Ok(cert_path), Ok(key_path)) = (std::env::var("TLS_CERT"), std::env::var("TLS_KEY")) {
         let cert_pem = std::fs::read(&cert_path)?;
         let key_pem = std::fs::read(&key_path)?;
-        let certs: Vec<_> =
-            rustls_pemfile::certs(&mut &cert_pem[..]).collect::<Result<Vec<_>, _>>()?;
-        let key = rustls_pemfile::private_key(&mut &key_pem[..])?
-            .ok_or_else(|| anyhow::anyhow!("No private key found in {}", key_path))?;
+        use rustls_pki_types::pem::PemObject;
+        let certs: Vec<rustls_pki_types::CertificateDer> =
+            rustls_pki_types::CertificateDer::pem_slice_iter(&cert_pem)
+                .collect::<Result<Vec<_>, _>>()?;
+        let key = rustls_pki_types::PrivateKeyDer::from_pem_slice(&key_pem)
+            .map_err(|e| anyhow::anyhow!("No private key found in {}: {e}", key_path))?;
         let config = rustls::ServerConfig::builder()
             .with_no_client_auth()
             .with_single_cert(certs, key)?;
@@ -488,12 +490,13 @@ fn build_rustls_config() -> anyhow::Result<Arc<rustls::ServerConfig>> {
         trust_cert_in_keychain(&cert_path);
         let cert_pem = std::fs::read(&cert_path)?;
         let key_pem = std::fs::read(&key_path)?;
-        let certs: Vec<rustls::pki_types::CertificateDer> =
-            rustls_pemfile::certs(&mut &cert_pem[..])
+        use rustls_pki_types::pem::PemObject;
+        let certs: Vec<rustls_pki_types::CertificateDer> =
+            rustls_pki_types::CertificateDer::pem_slice_iter(&cert_pem)
                 .filter_map(|c| c.ok())
                 .collect();
-        let key = rustls_pemfile::private_key(&mut &key_pem[..])?
-            .ok_or_else(|| anyhow::anyhow!("No private key in dev-key.pem"))?;
+        let key = rustls_pki_types::PrivateKeyDer::from_pem_slice(&key_pem)
+            .map_err(|e| anyhow::anyhow!("No private key in dev-key.pem: {e}"))?;
         let config = rustls::ServerConfig::builder()
             .with_no_client_auth()
             .with_single_cert(certs, key)?;

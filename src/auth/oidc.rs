@@ -236,11 +236,8 @@ impl MultiIdpValidator {
         let kid = header.kid.clone();
 
         // Decode without validation to peek at issuer
-        let mut peek_validation = Validation::default();
-        peek_validation.insecure_disable_signature_validation();
-        peek_validation.validate_aud = false;
         let peek: jsonwebtoken::TokenData<OidcClaims> =
-            decode(token, &DecodingKey::from_secret(b""), &peek_validation)?;
+            jsonwebtoken::dangerous::insecure_decode(token)?;
         let issuer = &peek.claims.iss;
 
         // Find matching IDP

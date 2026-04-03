@@ -169,6 +169,8 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+      id-token: write
+      attestations: write
     needs: [server, cli, docker]
     steps:
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
@@ -177,6 +179,13 @@ jobs:
           merge-multiple: true
       - name: Generate checksums
         run: sha256sum ccag-*.tar.gz ccag-*.zip > checksums-sha256.txt 2>/dev/null || sha256sum ccag-*.tar.gz > checksums-sha256.txt
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@96b4a1ef7235a096b17240c259729fdd70c83d45 # v2
+        with:
+          subject-path: |
+            ccag-*.tar.gz
+            ccag-*.zip
+            checksums-sha256.txt
       - uses: softprops/action-gh-release@153bb8e04406b158c6c84fc1615b65b24149a1fe # v2
         with:
           generate_release_notes: true

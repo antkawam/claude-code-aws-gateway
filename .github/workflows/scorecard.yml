@@ -27,6 +27,12 @@ jobs:
           results_file: results.sarif
           results_format: sarif
           publish_results: true
+          # Branch-Protection check requires elevated permissions.
+          # Install the OpenSSF Scorecard GitHub App on this repo:
+          #   https://github.com/apps/openssf-scorecard
+          # Or set SCORECARD_TOKEN repo secret with a PAT that has
+          # administration:read scope, and uncomment the line below:
+          # repo_token: ${{ secrets.SCORECARD_TOKEN }}
       - uses: github/codeql-action/upload-sarif@c10b8064de6f491fea524254123dbe5e09572f13 # v4.35.1
         with:
           sarif_file: results.sarif

@@ -4,7 +4,8 @@
 [advisories]
 ignore = [
     { id = "RUSTSEC-2023-0071", reason = "rsa Marvin Attack — no fix available, used via sqlx-mysql (dev path only)" },
-    { id = "RUSTSEC-2025-0134", reason = "rustls-pemfile unmaintained — migrate to rustls-pki-types PemObject when updating rustls" },
+    { id = "RUSTSEC-2025-0119", reason = "number_prefix unmaintained — transitive dep via self_update → indicatif 0.17" },
+    { id = "RUSTSEC-2025-0134", reason = "rustls-pemfile unmaintained — transitive dep via reqwest/hyper-rustls, not directly used" },
 ]
 
 [licenses]

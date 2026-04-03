@@ -1962,21 +1962,12 @@ pub async fn count_tokens(
 
 /// Peek at JWT claims without validation (for logging purposes only).
 fn peek_jwt_claims(token: &str) -> Option<(String, String)> {
-    let mut validation = jsonwebtoken::Validation::default();
-    validation.insecure_disable_signature_validation();
-    validation.validate_aud = false;
-    validation.validate_exp = false;
     #[derive(serde::Deserialize)]
     struct Claims {
         iss: Option<String>,
         sub: Option<String>,
     }
-    let data = jsonwebtoken::decode::<Claims>(
-        token,
-        &jsonwebtoken::DecodingKey::from_secret(b""),
-        &validation,
-    )
-    .ok()?;
+    let data = jsonwebtoken::dangerous::insecure_decode::<Claims>(token).ok()?;
     Some((
         data.claims.iss.unwrap_or_default(),
         data.claims.sub.unwrap_or_default(),
