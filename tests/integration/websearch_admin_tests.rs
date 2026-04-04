@@ -64,7 +64,6 @@ async fn test_app(pool: &sqlx::PgPool) -> (axum::Router, String) {
         session_token_ttl_hours: AtomicI64::new(24),
         session_signing_key: signing_key.to_string(),
         cli_sessions: ccag::api::cli_auth::new_session_store(),
-        setup_tokens: tokio::sync::RwLock::new(std::collections::HashMap::new()),
         http_client: reqwest::Client::new(),
 
         budget_cache: Arc::new(BudgetSpendCache::new(30)),
@@ -76,7 +75,6 @@ async fn test_app(pool: &sqlx::PgPool) -> (axum::Router, String) {
         endpoint_pool: Arc::new(ccag::endpoint::EndpointPool::new()),
         endpoint_stats: Arc::new(ccag::endpoint::stats::EndpointStats::new()),
         started_at: std::time::Instant::now(),
-        login_attempts: tokio::sync::Mutex::new(Vec::new()),
     });
 
     let router = ccag::api::router(state);

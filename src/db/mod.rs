@@ -1,7 +1,9 @@
+pub mod affinity;
 pub mod budget;
 pub mod endpoints;
 pub mod idp;
 pub mod keys;
+pub mod login_attempts;
 pub mod model_mappings;
 pub mod notification_config;
 pub mod org_analytics;
@@ -12,6 +14,7 @@ pub mod scim_tokens;
 pub mod search_providers;
 pub mod sessions;
 pub mod settings;
+pub mod setup_tokens;
 pub mod spend;
 pub mod teams;
 pub mod users;

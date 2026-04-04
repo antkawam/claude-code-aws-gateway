@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::time::Instant;
@@ -18,15 +17,6 @@ use crate::ratelimit::RateLimiter;
 use crate::spend::SpendTracker;
 use crate::telemetry::Metrics;
 use crate::translate::models::ModelCache;
-
-/// A one-time setup token that embeds a virtual key for secure `curl | bash` setup.
-pub struct SetupToken {
-    /// The raw virtual key to embed in the setup script.
-    pub raw_key: String,
-    pub created_at: Instant,
-}
-
-pub type SetupTokenStore = RwLock<HashMap<String, SetupToken>>;
 
 /// TTL for setup tokens (5 minutes).
 pub const SETUP_TOKEN_TTL_SECS: u64 = 300;
@@ -49,7 +39,6 @@ pub struct GatewayState {
     /// HS256 key for signing gateway session tokens. Auto-generated and persisted to DB.
     pub session_signing_key: String,
     pub cli_sessions: CliSessionStore,
-    pub setup_tokens: SetupTokenStore,
     pub http_client: reqwest::Client,
 
     pub budget_cache: Arc<BudgetSpendCache>,
@@ -61,8 +50,6 @@ pub struct GatewayState {
     pub endpoint_stats: Arc<EndpointStats>,
     pub aws_config: aws_config::SdkConfig,
     pub started_at: Instant,
-    /// Rate limiting for admin login attempts (global, in-memory)
-    pub login_attempts: tokio::sync::Mutex<Vec<Instant>>,
 }
 
 impl GatewayState {

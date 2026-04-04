@@ -19,6 +19,7 @@ pub struct Metrics {
     pub auth_failure_count: Counter<u64>,
     pub spend_flush_errors: Counter<u64>,
     pub bedrock_throttle_count: Counter<u64>,
+    pub endpoint_request_count: Counter<u64>,
     pub in_flight_requests: opentelemetry::metrics::UpDownCounter<i64>,
     prometheus_registry: Registry,
 }
@@ -102,6 +103,10 @@ impl Metrics {
             bedrock_throttle_count: meter
                 .u64_counter("ccag.bedrock.throttles.total")
                 .with_description("Total Bedrock throttling events")
+                .build(),
+            endpoint_request_count: meter
+                .u64_counter("ccag.endpoint.requests.total")
+                .with_description("Total requests per endpoint")
                 .build(),
             in_flight_requests: meter
                 .i64_up_down_counter("ccag.requests.in_flight")
@@ -192,6 +197,12 @@ impl Metrics {
         self.spend_flush_errors.add(1, &[]);
     }
 
+    /// Record a request routed through a specific endpoint.
+    pub fn record_endpoint_request(&self, endpoint_id: &str) {
+        self.endpoint_request_count
+            .add(1, &[KeyValue::new("endpoint_id", endpoint_id.to_string())]);
+    }
+
     /// Record a Bedrock throttling event.
     pub fn record_bedrock_throttle(&self, model: &str, endpoint_id: Option<&str>) {
         let mut attrs = vec![KeyValue::new("model", model.to_string())];
@@ -240,6 +251,18 @@ mod tests {
         assert!(
             text.contains("ccag_requests_in_flight"),
             "Prometheus output should contain in-flight gauge"
+        );
+    }
+
+    #[test]
+    fn test_record_endpoint_request() {
+        let (metrics, _provider) = Metrics::new(None).unwrap();
+        metrics.record_endpoint_request("ep-789");
+        metrics.record_endpoint_request("ep-abc");
+        let text = metrics.prometheus_text();
+        assert!(
+            text.contains("ccag_endpoint_requests_total"),
+            "Prometheus output should contain endpoint request counter"
         );
     }
 

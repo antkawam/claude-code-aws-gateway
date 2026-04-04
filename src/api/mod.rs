@@ -277,17 +277,21 @@ async fn auth_login(
     let username = body.get("username").and_then(|v| v.as_str()).unwrap_or("");
     let password = body.get("password").and_then(|v| v.as_str()).unwrap_or("");
 
-    // Rate limit: max 10 login attempts per 60s (global, not per-user)
+    // Rate limit: max 10 login attempts per 60s (DB-backed, distributed)
     {
-        let now = std::time::Instant::now();
-        let mut attempts = state.login_attempts.lock().await;
-        attempts.retain(|t| now.duration_since(*t).as_secs() < 60);
-        if attempts.len() >= 10 {
-            return axum::Json(serde_json::json!({
-                "error": { "message": "Too many login attempts. Try again later." }
-            }));
+        let pool = state.db().await;
+        match crate::db::login_attempts::check_and_record(&pool, 10, 60.0).await {
+            Ok(true) => { /* proceed */ }
+            Ok(false) => {
+                return axum::Json(serde_json::json!({
+                    "error": { "message": "Too many login attempts. Try again later." }
+                }));
+            }
+            Err(e) => {
+                tracing::warn!("Failed to check login attempts: {e:?}");
+                // Fail open: allow the attempt if DB check fails
+            }
         }
-        attempts.push(now);
     }
 
     // Constant-time comparison to prevent timing attacks
@@ -985,22 +989,15 @@ async fn auth_setup(
         .and_then(|p| p.strip_prefix("token="));
 
     if let Some(token) = token_param {
-        // Consume the token (single-use)
+        // Consume the token (single-use) from DB
         let raw_key = {
-            let mut store = state.setup_tokens.write().await;
-            match store.remove(token) {
-                Some(t) => {
-                    if std::time::Instant::now()
-                        .duration_since(t.created_at)
-                        .as_secs()
-                        < crate::proxy::SETUP_TOKEN_TTL_SECS
-                    {
-                        Some(t.raw_key)
-                    } else {
-                        None // Expired
-                    }
+            let pool = state.db().await;
+            match crate::db::setup_tokens::consume(&pool, token).await {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::error!("Failed to consume setup token: {e:?}");
+                    None
                 }
-                None => None,
             }
         };
 

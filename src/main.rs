@@ -231,7 +231,6 @@ async fn main() -> anyhow::Result<()> {
         session_token_ttl_hours: AtomicI64::new(session_token_ttl_hours),
         session_signing_key,
         cli_sessions: api::cli_auth::new_session_store(),
-        setup_tokens: tokio::sync::RwLock::new(std::collections::HashMap::new()),
         http_client: reqwest::Client::new(),
 
         budget_cache: budget_cache.clone(),
@@ -243,7 +242,6 @@ async fn main() -> anyhow::Result<()> {
         endpoint_stats,
         aws_config: aws_config.clone(),
         started_at: std::time::Instant::now(),
-        login_attempts: tokio::sync::Mutex::new(Vec::new()),
     });
 
     // Load endpoints into pool
@@ -772,8 +770,11 @@ fn start_cache_poll_loop(state: Arc<proxy::GatewayState>) {
             // Rate limiter cleanup (every poll cycle, regardless of cache version)
             state.rate_limiter.cleanup().await;
 
-            // Endpoint affinity cleanup
+            // Endpoint affinity cleanup (L1 in-memory cache + L2 DB)
             state.endpoint_pool.cleanup_affinity().await;
+            if let Err(e) = crate::db::affinity::cleanup_stale(&state.db().await).await {
+                tracing::warn!("Failed to cleanup stale DB affinities: {e:?}");
+            }
 
             // Endpoint stats cleanup (evict >1h buckets)
             state.endpoint_stats.cleanup().await;

@@ -1890,19 +1890,15 @@ pub async fn create_setup_token(
     // Generate token
     let token = format!("st_{}", uuid::Uuid::new_v4().simple());
 
-    // Clean up expired tokens and insert new one
-    let mut store = state.setup_tokens.write().await;
-    let now = std::time::Instant::now();
-    store.retain(|_, t| {
-        now.duration_since(t.created_at).as_secs() < crate::proxy::SETUP_TOKEN_TTL_SECS
-    });
-    store.insert(
-        token.clone(),
-        crate::proxy::SetupToken {
-            raw_key,
-            created_at: now,
-        },
-    );
+    // Clean up expired tokens and insert new one into DB
+    crate::db::setup_tokens::cleanup_expired(pool).await.ok();
+    if let Err(e) = crate::db::setup_tokens::create(pool, &token, &raw_key).await {
+        tracing::error!("Failed to create setup token: {e:?}");
+        return error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Failed to create setup token",
+        );
+    }
 
     tracing::info!(key_id = %key_id, "Generated setup token for virtual key");
 

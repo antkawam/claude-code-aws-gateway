@@ -137,6 +137,7 @@ impl EndpointPool {
         team_endpoints: &[Endpoint],
         user_identity: Option<&str>,
         routing_strategy: &str,
+        db_pool: Option<&sqlx::PgPool>,
     ) -> Option<Arc<EndpointClient>> {
         let clients = self.clients.read().await;
 
@@ -155,10 +156,11 @@ impl EndpointPool {
 
         let candidate_ids: Vec<Uuid> = team_endpoints.iter().map(|e| e.id).collect();
 
-        // Sticky user: check affinity first. Bypassed if strategy is not sticky_user.
+        // Sticky user: check L1 cache first, then DB.
         if routing_strategy == "sticky_user"
             && let Some(identity) = user_identity
         {
+            // L1 in-memory cache check
             let affinity = self.user_affinity.read().await;
             if let Some((ep_id, last_seen)) = affinity.get(identity)
                 && last_seen.elapsed().as_secs() < AFFINITY_TTL_SECS
@@ -166,6 +168,20 @@ impl EndpointPool {
                 && let Some(client) = clients.get(ep_id)
                 && client.healthy.load(Ordering::Relaxed)
             {
+                return Some(Arc::clone(client));
+            }
+            drop(affinity);
+
+            // L2 DB fallback (cross-instance affinity)
+            if let Some(pool) = db_pool
+                && let Ok(Some(ep_id)) = crate::db::affinity::get(pool, identity).await
+                && candidate_ids.contains(&ep_id)
+                && let Some(client) = clients.get(&ep_id)
+                && client.healthy.load(Ordering::Relaxed)
+            {
+                // Populate L1 cache from DB hit
+                let mut aff = self.user_affinity.write().await;
+                aff.insert(identity.to_string(), (ep_id, Instant::now()));
                 return Some(Arc::clone(client));
             }
         }
@@ -234,7 +250,14 @@ impl EndpointPool {
     }
 
     /// Update user affinity after a successful request.
-    pub async fn update_affinity(&self, user_identity: &str, endpoint_id: Uuid) {
+    /// Writes to L1 in-memory cache and, if db_pool is provided, to DB (fire-and-forget).
+    pub async fn update_affinity(
+        &self,
+        user_identity: &str,
+        endpoint_id: Uuid,
+        db_pool: Option<&sqlx::PgPool>,
+    ) {
+        // L1 cache update
         let mut affinity = self.user_affinity.write().await;
 
         // LRU eviction if at capacity
@@ -249,6 +272,18 @@ impl EndpointPool {
         }
 
         affinity.insert(user_identity.to_string(), (endpoint_id, Instant::now()));
+        drop(affinity);
+
+        // L2 DB persistence (fire-and-forget)
+        if let Some(pool) = db_pool {
+            let pool = pool.clone();
+            let identity = user_identity.to_string();
+            tokio::spawn(async move {
+                if let Err(e) = crate::db::affinity::upsert(&pool, &identity, endpoint_id).await {
+                    tracing::warn!("Failed to persist affinity to DB: {e:?}");
+                }
+            });
+        }
     }
 
     /// Clean up expired affinity entries.
@@ -358,7 +393,9 @@ mod tests {
     #[tokio::test]
     async fn test_select_empty_pool_returns_none() {
         let pool = EndpointPool::new();
-        let result = pool.select_endpoint(&[], None, "primary_fallback").await;
+        let result = pool
+            .select_endpoint(&[], None, "primary_fallback", None)
+            .await;
         assert!(result.is_none());
     }
 
@@ -372,7 +409,9 @@ mod tests {
         insert_client(&pool, client).await;
         set_default(&pool, id).await;
 
-        let result = pool.select_endpoint(&[], None, "primary_fallback").await;
+        let result = pool
+            .select_endpoint(&[], None, "primary_fallback", None)
+            .await;
         assert!(result.is_some());
         assert_eq!(result.unwrap().config.id, id);
     }
@@ -387,7 +426,9 @@ mod tests {
         insert_client(&pool, client).await;
         set_default(&pool, id).await;
 
-        let result = pool.select_endpoint(&[], None, "primary_fallback").await;
+        let result = pool
+            .select_endpoint(&[], None, "primary_fallback", None)
+            .await;
         assert!(result.is_none());
     }
 
@@ -410,7 +451,7 @@ mod tests {
         let mut counts = HashMap::new();
         for _ in 0..6 {
             let selected = pool
-                .select_endpoint(&team_eps, None, "round_robin")
+                .select_endpoint(&team_eps, None, "round_robin", None)
                 .await
                 .unwrap();
             *counts.entry(selected.config.id).or_insert(0u32) += 1;
@@ -447,7 +488,7 @@ mod tests {
 
         for _ in 0..6 {
             let selected = pool
-                .select_endpoint(&team_eps, None, "round_robin")
+                .select_endpoint(&team_eps, None, "round_robin", None)
                 .await
                 .unwrap();
             assert!(
@@ -471,7 +512,9 @@ mod tests {
             insert_client(&pool, client).await;
         }
 
-        let result = pool.select_endpoint(&team_eps, None, "round_robin").await;
+        let result = pool
+            .select_endpoint(&team_eps, None, "round_robin", None)
+            .await;
         assert!(result.is_none());
     }
 
@@ -492,7 +535,7 @@ mod tests {
         }
 
         let selected = pool
-            .select_endpoint(&team_eps, None, "primary_fallback")
+            .select_endpoint(&team_eps, None, "primary_fallback", None)
             .await
             .unwrap();
         assert_eq!(
@@ -522,7 +565,7 @@ mod tests {
         }
 
         let selected = pool
-            .select_endpoint(&team_eps, None, "primary_fallback")
+            .select_endpoint(&team_eps, None, "primary_fallback", None)
             .await
             .unwrap();
         assert_eq!(
@@ -548,10 +591,10 @@ mod tests {
         }
 
         // Set affinity to the third endpoint
-        pool.update_affinity("user@example.com", ids[2]).await;
+        pool.update_affinity("user@example.com", ids[2], None).await;
 
         let selected = pool
-            .select_endpoint(&team_eps, Some("user@example.com"), "sticky_user")
+            .select_endpoint(&team_eps, Some("user@example.com"), "sticky_user", None)
             .await
             .unwrap();
         assert_eq!(
@@ -589,7 +632,7 @@ mod tests {
         }
 
         let selected = pool
-            .select_endpoint(&team_eps, Some("user@example.com"), "sticky_user")
+            .select_endpoint(&team_eps, Some("user@example.com"), "sticky_user", None)
             .await
             .unwrap();
         // With expired affinity, falls through to primary_fallback which picks first healthy
@@ -621,10 +664,10 @@ mod tests {
         }
 
         // Set affinity to the unhealthy third endpoint
-        pool.update_affinity("user@example.com", ids[2]).await;
+        pool.update_affinity("user@example.com", ids[2], None).await;
 
         let selected = pool
-            .select_endpoint(&team_eps, Some("user@example.com"), "sticky_user")
+            .select_endpoint(&team_eps, Some("user@example.com"), "sticky_user", None)
             .await
             .unwrap();
         // Unhealthy affinity endpoint should be skipped, falls through to primary_fallback
@@ -686,7 +729,7 @@ mod tests {
         let pool = EndpointPool::new();
         let id = Uuid::new_v4();
 
-        pool.update_affinity("user@test.com", id).await;
+        pool.update_affinity("user@test.com", id, None).await;
 
         let affinity = pool.user_affinity.read().await;
         assert!(affinity.contains_key("user@test.com"));
@@ -724,7 +767,7 @@ mod tests {
         }
 
         // Insert a 4th — should evict user1 (oldest timestamp)
-        pool.update_affinity("user4", ep_id).await;
+        pool.update_affinity("user4", ep_id, None).await;
 
         let affinity = pool.user_affinity.read().await;
         assert_eq!(affinity.len(), 3);

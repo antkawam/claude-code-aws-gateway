@@ -399,7 +399,12 @@ pub async fn messages(
     let user_identity_str = identity.user_identity.as_deref();
     let selected_endpoint = state
         .endpoint_pool
-        .select_endpoint(&team_endpoints, user_identity_str, &routing_strategy)
+        .select_endpoint(
+            &team_endpoints,
+            user_identity_str,
+            &routing_strategy,
+            Some(&state.db().await),
+        )
         .await;
 
     // Determine routing prefix: use endpoint's if available, otherwise gateway default
@@ -488,9 +493,10 @@ pub async fn messages(
 
     let endpoint_id = selected_endpoint.as_ref().map(|ep| ep.config.id);
 
-    // Record per-endpoint stats
+    // Record per-endpoint stats (in-memory + Prometheus)
     if let Some(ep_id) = endpoint_id {
         state.endpoint_stats.record_request(ep_id).await;
+        state.metrics.record_endpoint_request(&ep_id.to_string());
     }
 
     tracing::info!(
@@ -684,7 +690,7 @@ pub async fn messages(
                     if let Some(uid) = user_identity_str {
                         state
                             .endpoint_pool
-                            .update_affinity(uid, fallback_ep.config.id)
+                            .update_affinity(uid, fallback_ep.config.id, Some(&state.db().await))
                             .await;
                     }
                     tracing::info!(
@@ -705,7 +711,10 @@ pub async fn messages(
             && !is_failover_eligible(&resp)
             && let Some(uid) = user_identity_str
         {
-            state.endpoint_pool.update_affinity(uid, ep.config.id).await;
+            state
+                .endpoint_pool
+                .update_affinity(uid, ep.config.id, Some(&state.db().await))
+                .await;
         }
         resp
     };
