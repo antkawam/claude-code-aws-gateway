@@ -107,14 +107,13 @@ pub fn sanitize_cache_control(value: &mut Value) {
 /// to orchestrate search execution.
 pub fn translate(
     mut req: AnthropicRequest,
-    beta_header: Option<&str>,
     model_prefix: &str,
     model_cache: Option<&models::ModelCache>,
     websearch_mode: &str,
 ) -> (String, BedrockRequest, Option<websearch::WebSearchContext>) {
     let bedrock_model = models::anthropic_to_bedrock(&req.model, model_prefix, model_cache);
 
-    let betas = beta_header.map(models::filter_betas).unwrap_or_default();
+    let betas: Vec<String> = Vec::new();
 
     // Extract web_search server tool (if present) and replace with regular tool definition.
     // The mode controls behavior: "disabled" strips tools, "enabled"/"global" processes them.
@@ -181,7 +180,7 @@ mod tests {
     #[test]
     fn test_translate_basic() {
         let req = make_request("claude-sonnet-4-6-20250514");
-        let (model, body, ws_ctx) = translate(req, None, "us", None, "enabled");
+        let (model, body, ws_ctx) = translate(req, "us", None, "enabled");
         assert_eq!(model, "us.anthropic.claude-sonnet-4-6");
         assert_eq!(body.anthropic_version, "bedrock-2023-05-31");
         assert_eq!(body.max_tokens, 1024);
@@ -191,7 +190,7 @@ mod tests {
     #[test]
     fn test_translate_au_prefix() {
         let req = make_request("claude-sonnet-4-6-20250514");
-        let (model, _, _) = translate(req, None, "au", None, "enabled");
+        let (model, _, _) = translate(req, "au", None, "enabled");
         assert_eq!(model, "au.anthropic.claude-sonnet-4-6");
     }
 
@@ -208,7 +207,7 @@ mod tests {
             ..make_request("claude-sonnet-4-6-20250514")
         };
 
-        let (_, body, _) = translate(req, None, "us", None, "enabled");
+        let (_, body, _) = translate(req, "us", None, "enabled");
         let msg_str = serde_json::to_string(&body.messages).unwrap();
         assert!(msg_str.contains("cache_control"));
         let sys_str = serde_json::to_string(&body.system).unwrap();
@@ -225,7 +224,7 @@ mod tests {
             ..make_request("claude-sonnet-4-6-20250514")
         };
 
-        let (_, body, ws_ctx) = translate(req, None, "us", None, "enabled");
+        let (_, body, ws_ctx) = translate(req, "us", None, "enabled");
         let ctx = ws_ctx.unwrap();
         assert_eq!(ctx.tool_name, "web_search");
         assert_eq!(ctx.max_uses, 3);
@@ -256,8 +255,7 @@ mod tests {
             ..make_request("claude-sonnet-4-6-20250514")
         };
 
-        // translate() needs a websearch_mode parameter (5th arg)
-        let (_model, body, ws_ctx) = translate(req, None, "us", None, "disabled");
+        let (_model, body, ws_ctx) = translate(req, "us", None, "disabled");
 
         // Disabled mode: no web search context
         assert!(
@@ -287,7 +285,7 @@ mod tests {
             ..make_request("claude-sonnet-4-6-20250514")
         };
 
-        let (_model, body, ws_ctx) = translate(req, None, "us", None, "enabled");
+        let (_model, body, ws_ctx) = translate(req, "us", None, "enabled");
 
         // Enabled mode: web search context should be present
         let ctx =
@@ -318,7 +316,7 @@ mod tests {
             ..make_request("claude-sonnet-4-6-20250514")
         };
 
-        let (_model, body, ws_ctx) = translate(req, None, "us", None, "global");
+        let (_model, body, ws_ctx) = translate(req, "us", None, "global");
 
         // Global mode: web search context should be present
         let ctx = ws_ctx.expect("translate with mode 'global' should return Some WebSearchContext");
@@ -341,7 +339,7 @@ mod tests {
             ..make_request("claude-sonnet-4-6-20250514")
         };
 
-        let (_model, body, ws_ctx) = translate(req, None, "us", None, "disabled");
+        let (_model, body, ws_ctx) = translate(req, "us", None, "disabled");
 
         assert!(
             ws_ctx.is_none(),
@@ -515,7 +513,7 @@ mod tests {
             ..make_request("claude-sonnet-4-6-20250514")
         };
 
-        let (_, body, _) = translate(req, None, "us", None, "enabled");
+        let (_, body, _) = translate(req, "us", None, "enabled");
         let msg_str = serde_json::to_string(&body.messages).unwrap();
 
         assert!(
@@ -546,7 +544,7 @@ mod tests {
             ..make_request("claude-sonnet-4-6-20250514")
         };
 
-        let (_, body, _) = translate(req, None, "us", None, "enabled");
+        let (_, body, _) = translate(req, "us", None, "enabled");
         let sys_str = serde_json::to_string(&body.system).unwrap();
 
         assert!(
@@ -576,7 +574,7 @@ mod tests {
             ..make_request("claude-sonnet-4-6-20250514")
         };
 
-        let (_, body, _) = translate(req, None, "us", None, "enabled");
+        let (_, body, _) = translate(req, "us", None, "enabled");
         let tools_str = serde_json::to_string(&body.tools).unwrap();
 
         assert!(
