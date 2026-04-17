@@ -2576,21 +2576,17 @@ pub async fn set_search_provider(
     }
 
     match body.provider_type.as_str() {
-        "tavily" | "serper" => {
-            if body.api_key.as_ref().is_none_or(|k| k.is_empty()) {
-                return error_response(
-                    StatusCode::BAD_REQUEST,
-                    &format!("{} requires an API key", body.provider_type),
-                );
-            }
+        "tavily" | "serper" if body.api_key.as_ref().is_none_or(|k| k.is_empty()) => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                &format!("{} requires an API key", body.provider_type),
+            );
         }
-        "custom" => {
-            if body.api_url.as_ref().is_none_or(|u| u.is_empty()) {
-                return error_response(
-                    StatusCode::BAD_REQUEST,
-                    "Custom provider requires an API URL",
-                );
-            }
+        "custom" if body.api_url.as_ref().is_none_or(|u| u.is_empty()) => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                "Custom provider requires an API URL",
+            );
         }
         _ => {}
     }
