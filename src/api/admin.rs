@@ -2373,9 +2373,12 @@ pub async fn get_endpoint_models(
                     .last_health_check
                     .store(now_secs, std::sync::atomic::Ordering::Relaxed);
                 crate::endpoint::EndpointPool::mark_healthy(&client);
+                let prefix = &client.config.routing_prefix;
+                let prefix_dot = format!("{}.", prefix);
                 let models: Vec<_> = output
                     .inference_profile_summaries()
                     .iter()
+                    .filter(|p| p.inference_profile_id().starts_with(&prefix_dot))
                     .map(|p| {
                         json!({
                             "name": p.inference_profile_name(),
@@ -2426,9 +2429,12 @@ pub async fn get_all_models(
         }
         match client.control_client.list_inference_profiles().send().await {
             Ok(output) => {
+                let prefix = &client.config.routing_prefix;
+                let prefix_dot = format!("{}.", prefix);
                 let models: Vec<_> = output
                     .inference_profile_summaries()
                     .iter()
+                    .filter(|p| p.inference_profile_id().starts_with(&prefix_dot))
                     .map(|p| {
                         json!({
                             "name": p.inference_profile_name(),

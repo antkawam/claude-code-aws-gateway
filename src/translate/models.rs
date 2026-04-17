@@ -101,12 +101,12 @@ pub fn strip_date_suffix(model: &str) -> &str {
 }
 
 /// Discover a model by calling Bedrock ListInferenceProfiles and fuzzy-matching.
-/// Returns (anthropic_prefix, bedrock_suffix, anthropic_display) if found.
+/// Returns (anthropic_prefix, bedrock_suffix, anthropic_display, profile_prefix) if found.
 pub async fn discover_model(
     bedrock_client: &aws_sdk_bedrock::Client,
     anthropic_model: &str,
     _prefix: &str,
-) -> Option<(String, String, Option<String>)> {
+) -> Option<(String, String, Option<String>, String)> {
     let stripped = strip_date_suffix(anthropic_model);
     tracing::info!(
         model = %anthropic_model,
@@ -148,6 +148,14 @@ pub async fn discover_model(
         if profile_id.contains(stripped) {
             let profile_id = profile_id.to_string();
 
+            // Extract the profile prefix (region): everything before the first '.'
+            // e.g. "global.anthropic.claude-opus-4-7" -> "global"
+            let profile_prefix = profile_id
+                .find('.')
+                .map(|i| &profile_id[..i])
+                .unwrap_or(&profile_id)
+                .to_string();
+
             // Extract the bedrock_suffix: everything after the first '.'
             // e.g. "us.anthropic.claude-sonnet-5-0-v1" -> "anthropic.claude-sonnet-5-0-v1"
             let bedrock_suffix = profile_id
@@ -173,7 +181,12 @@ pub async fn discover_model(
                 "Discovered new model mapping"
             );
 
-            return Some((anthropic_prefix, bedrock_suffix, anthropic_display));
+            return Some((
+                anthropic_prefix,
+                bedrock_suffix,
+                anthropic_display,
+                profile_prefix,
+            ));
         }
     }
 
@@ -201,76 +214,36 @@ pub fn anthropic_to_bedrock(model: &str, prefix: &str, model_cache: Option<&Mode
     if let Some(cache) = model_cache
         && let Some(suffix) = cache.lookup_forward(model)
     {
-        let corrected = correct_prefix_for_model(model, prefix);
-        return format!("{corrected}.{suffix}");
+        return format!("{prefix}.{suffix}");
     }
 
     // Fall back to hardcoded mappings
     hardcoded_anthropic_to_bedrock(model, prefix)
 }
 
-/// Correct the regional prefix for models that don't have profiles under
-/// certain regional prefixes. E.g. Sonnet 4 has no `au.` profile (use `apac.`),
-/// Opus 4.5 has no `au.`/`apac.`/`jp.` profiles (use `global.`).
-fn correct_prefix_for_model<'a>(model: &str, prefix: &'a str) -> &'a str {
-    // Opus 4.5: only us, eu, global
-    if model.starts_with("claude-opus-4-5") {
-        return match prefix {
-            "au" | "apac" | "jp" => "global",
-            _ => prefix,
-        };
-    }
-    // Opus 4.6: us, eu, au, global (not apac, jp)
-    if model.starts_with("claude-opus-4-6") {
-        return match prefix {
-            "apac" | "jp" => "global",
-            _ => prefix,
-        };
-    }
-    // Sonnet 4 (not 4.5/4.6): us, eu, apac, global (not au, jp)
-    if model.starts_with("claude-sonnet-4-")
-        && !model.starts_with("claude-sonnet-4-5")
-        && !model.starts_with("claude-sonnet-4-6")
-    {
-        return match prefix {
-            "au" | "jp" => "apac",
-            _ => prefix,
-        };
-    }
-    // Newer models (4.5+, 4.6): available in us, eu, au, jp, global — NOT apac
-    if model.starts_with("claude-sonnet-4-5")
-        || model.starts_with("claude-sonnet-4-6")
-        || model.starts_with("claude-haiku-4-5")
-    {
-        return match prefix {
-            "apac" => "global",
-            _ => prefix,
-        };
-    }
-    prefix
-}
-
 /// Hardcoded forward mapping (no-DB fallback).
 fn hardcoded_anthropic_to_bedrock(model: &str, prefix: &str) -> String {
-    let p = correct_prefix_for_model(model, prefix);
     match model {
+        s if s.starts_with("claude-opus-4-7") => {
+            format!("{prefix}.anthropic.claude-opus-4-7")
+        }
         s if s.starts_with("claude-opus-4-6") => {
-            format!("{p}.anthropic.claude-opus-4-6-v1")
+            format!("{prefix}.anthropic.claude-opus-4-6-v1")
         }
         s if s.starts_with("claude-sonnet-4-6") => {
-            format!("{p}.anthropic.claude-sonnet-4-6")
+            format!("{prefix}.anthropic.claude-sonnet-4-6")
         }
         s if s.starts_with("claude-opus-4-5") => {
-            format!("{p}.anthropic.claude-opus-4-5-20251101-v1:0")
+            format!("{prefix}.anthropic.claude-opus-4-5-20251101-v1:0")
         }
         s if s.starts_with("claude-sonnet-4-5") => {
-            format!("{p}.anthropic.claude-sonnet-4-5-20250929-v1:0")
+            format!("{prefix}.anthropic.claude-sonnet-4-5-20250929-v1:0")
         }
         s if s.starts_with("claude-sonnet-4-") => {
-            format!("{p}.anthropic.claude-sonnet-4-20250514-v1:0")
+            format!("{prefix}.anthropic.claude-sonnet-4-20250514-v1:0")
         }
         s if s.starts_with("claude-haiku-4-5") => {
-            format!("{p}.anthropic.claude-haiku-4-5-20251001-v1:0")
+            format!("{prefix}.anthropic.claude-haiku-4-5-20251001-v1:0")
         }
         // Fallback: pass through as-is
         other => other.to_string(),
@@ -295,6 +268,7 @@ pub fn bedrock_to_anthropic(model: &str, model_cache: Option<&ModelCache>) -> St
 /// Hardcoded reverse mapping (no-DB fallback).
 fn hardcoded_bedrock_to_anthropic(model: &str) -> String {
     match model {
+        s if s.contains("claude-opus-4-7") => "claude-opus-4-7".to_string(),
         s if s.contains("claude-opus-4-6") => "claude-opus-4-6-20250605".to_string(),
         s if s.contains("claude-sonnet-4-6") => "claude-sonnet-4-6-20250514".to_string(),
         s if s.contains("claude-opus-4-5") => "claude-opus-4-5-20251101".to_string(),
@@ -303,29 +277,6 @@ fn hardcoded_bedrock_to_anthropic(model: &str) -> String {
         s if s.contains("claude-haiku-4-5") => "claude-haiku-4-5-20251001".to_string(),
         other => other.to_string(),
     }
-}
-
-/// Beta flags known to work on Bedrock. We use an allowlist because CC sends
-/// many Anthropic-specific betas (claude-code-*, adaptive-thinking-*, etc.)
-/// that Bedrock rejects with "invalid beta flag".
-const ALLOWED_BEDROCK_BETAS: &[&str] = &[
-    "interleaved-thinking-2025-05-14",
-    "context-1m-2025-08-07",
-    "token-counting-2024-11-01",
-    "tool-search-tool-2025-10-19",
-    // Prompt caching betas — Bedrock may accept or ignore these
-    "prompt-caching-2024-07-31",
-];
-
-/// Parse the `anthropic-beta` header (comma-separated) and return
-/// only the betas that Bedrock is known to support.
-pub fn filter_betas(anthropic_beta_header: &str) -> Vec<String> {
-    anthropic_beta_header
-        .split(',')
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .filter(|s| ALLOWED_BEDROCK_BETAS.contains(&s.as_str()))
-        .collect()
 }
 
 #[cfg(test)]
@@ -344,6 +295,10 @@ mod tests {
             anthropic_to_bedrock("claude-opus-4-6-20250605", "us", None),
             "us.anthropic.claude-opus-4-6-v1"
         );
+        assert_eq!(
+            anthropic_to_bedrock("claude-opus-4-7", "us", None),
+            "us.anthropic.claude-opus-4-7"
+        );
     }
 
     #[test]
@@ -356,10 +311,18 @@ mod tests {
             anthropic_to_bedrock("claude-opus-4-6-20250605", "au", None),
             "au.anthropic.claude-opus-4-6-v1"
         );
+        assert_eq!(
+            anthropic_to_bedrock("claude-opus-4-7", "au", None),
+            "au.anthropic.claude-opus-4-7"
+        );
     }
 
     #[test]
     fn test_all_hardcoded_mappings() {
+        assert_eq!(
+            anthropic_to_bedrock("claude-opus-4-7", "us", None),
+            "us.anthropic.claude-opus-4-7"
+        );
         assert_eq!(
             anthropic_to_bedrock("claude-opus-4-6-20250605", "us", None),
             "us.anthropic.claude-opus-4-6-v1"
@@ -395,6 +358,10 @@ mod tests {
         assert_eq!(
             bedrock_to_anthropic("au.anthropic.claude-sonnet-4-6", None),
             "claude-sonnet-4-6-20250514"
+        );
+        assert_eq!(
+            bedrock_to_anthropic("global.anthropic.claude-opus-4-7", None),
+            "claude-opus-4-7"
         );
     }
 
@@ -542,31 +509,5 @@ mod tests {
         assert_eq!(strip_date_suffix("short"), "short");
         assert_eq!(strip_date_suffix(""), "");
         assert_eq!(strip_date_suffix("12345678"), "12345678");
-    }
-
-    // --- Beta filter tests ---
-
-    #[test]
-    fn test_beta_filtering_allowlist() {
-        let betas = filter_betas(
-            "interleaved-thinking-2025-05-14,advanced-tool-use-2025-11-20,claude-code-20250219",
-        );
-        assert_eq!(betas, vec!["interleaved-thinking-2025-05-14"]);
-    }
-
-    #[test]
-    fn test_strips_all_unknown_betas() {
-        let betas =
-            filter_betas("claude-code-20250219,adaptive-thinking-2026-01-28,effort-2025-11-24");
-        assert!(betas.is_empty());
-    }
-
-    #[test]
-    fn test_allows_known_betas() {
-        let betas = filter_betas("interleaved-thinking-2025-05-14,context-1m-2025-08-07");
-        assert_eq!(
-            betas,
-            vec!["interleaved-thinking-2025-05-14", "context-1m-2025-08-07"]
-        );
     }
 }

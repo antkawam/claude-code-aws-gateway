@@ -75,6 +75,7 @@ struct RequestInfo {
 /// Required by Claude for Excel/PowerPoint add-ins.
 pub async fn list_models() -> Response {
     let models = [
+        ("claude-opus-4-7", "Claude Opus 4.7"),
         ("claude-opus-4-6-20250605", "Claude Opus 4.6"),
         ("claude-sonnet-4-6-20250514", "Claude Sonnet 4.6"),
         ("claude-opus-4-5-20251101", "Claude Opus 4.5"),
@@ -372,8 +373,6 @@ pub async fn messages(
     let is_streaming = body.stream.unwrap_or(false);
     let original_model = body.model.clone();
 
-    let beta_header = headers.get("anthropic-beta").and_then(|v| v.to_str().ok());
-
     // Resolve endpoint for this request
     let team_id = match &auth_result {
         AuthResult::VirtualKey(k) => k.team_id,
@@ -417,7 +416,6 @@ pub async fn messages(
 
     let (mut bedrock_model, bedrock_body, web_search_ctx) = request::translate(
         body,
-        beta_header,
         &routing_prefix,
         Some(&state.model_cache),
         &websearch_mode,
@@ -439,10 +437,10 @@ pub async fn messages(
             .unwrap_or(&state.bedrock_control_client);
 
         if !bedrock_model.contains('.')
-            && let Some((prefix, suffix, display)) =
+            && let Some((prefix, suffix, display, profile_prefix)) =
                 models::discover_model(control_client, &bedrock_model, &routing_prefix).await
         {
-            bedrock_model = format!("{}.{}", routing_prefix, &suffix);
+            bedrock_model = format!("{}.{}", profile_prefix, &suffix);
             let mapping = models::CachedMapping {
                 anthropic_prefix: prefix.clone(),
                 bedrock_suffix: suffix.clone(),
