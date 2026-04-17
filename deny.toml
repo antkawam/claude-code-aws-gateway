@@ -5,6 +5,8 @@
 ignore = [
     { id = "RUSTSEC-2023-0071", reason = "rsa Marvin Attack — no fix available, used via sqlx-mysql (dev path only)" },
     { id = "RUSTSEC-2025-0134", reason = "rustls-pemfile unmaintained — migrate to rustls-pki-types PemObject when updating rustls" },
+    { id = "RUSTSEC-2026-0098", reason = "rustls-webpki 0.101.7 URI name constraints — pinned by aws-smithy-http-client via rustls 0.21; no patch for 0.101.x branch" },
+    { id = "RUSTSEC-2026-0099", reason = "rustls-webpki 0.101.7 wildcard name constraints — same root cause as 0098, awaiting AWS SDK update" },
 ]
 
 [licenses]
