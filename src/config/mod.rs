@@ -23,6 +23,10 @@ pub struct GatewayConfig {
     pub database_name: String,
     /// Database user.
     pub database_user: String,
+    /// Seconds between automatic refreshes of model pricing from the AWS Price List API.
+    pub pricing_refresh_interval: u64,
+    /// Whether to run the automatic pricing refresh background loop.
+    pub pricing_refresh_enabled: bool,
 }
 
 impl GatewayConfig {
@@ -86,6 +90,13 @@ impl GatewayConfig {
             database_port,
             database_name,
             database_user,
+            pricing_refresh_interval: std::env::var("PRICING_REFRESH_INTERVAL")
+                .unwrap_or_else(|_| "86400".to_string())
+                .parse()
+                .unwrap_or(86400),
+            pricing_refresh_enabled: std::env::var("PRICING_REFRESH_ENABLED")
+                .map(|v| v == "true" || v == "1")
+                .unwrap_or(true),
         })
     }
 
@@ -208,6 +219,8 @@ mod tests {
             "RDS_IAM_AUTH",
             "ADMIN_USERS",
             "BUDGET_NOTIFICATION_URL",
+            "PRICING_REFRESH_INTERVAL",
+            "PRICING_REFRESH_ENABLED",
         ] {
             // SAFETY: tests using from_env are #[serial] so no concurrent env access.
             unsafe { std::env::remove_var(key) };
@@ -338,9 +351,112 @@ mod tests {
             database_port: 5432,
             database_name: "proxy".to_string(),
             database_user: "proxy".to_string(),
+            pricing_refresh_interval: 86400,
+            pricing_refresh_enabled: true,
         };
         let addr = config.listen_addr();
         assert_eq!(addr.ip().to_string(), "0.0.0.0");
         assert_eq!(addr.port(), 8080);
+    }
+
+    // --- pricing_refresh_interval and pricing_refresh_enabled env var tests ---
+
+    #[test]
+    #[serial]
+    fn pricing_refresh_interval_defaults_to_86400() {
+        clear_env();
+        unsafe { std::env::set_var("DATABASE_URL", "postgres://u:p@h/d") };
+        let config = GatewayConfig::from_env().unwrap();
+        assert_eq!(
+            config.pricing_refresh_interval, 86400,
+            "expected default pricing_refresh_interval of 86400"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn pricing_refresh_interval_parses_from_env() {
+        clear_env();
+        unsafe {
+            std::env::set_var("DATABASE_URL", "postgres://u:p@h/d");
+            std::env::set_var("PRICING_REFRESH_INTERVAL", "3600");
+        }
+        let config = GatewayConfig::from_env().unwrap();
+        assert_eq!(
+            config.pricing_refresh_interval, 3600,
+            "expected pricing_refresh_interval of 3600 from env"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn pricing_refresh_interval_invalid_falls_back_to_default() {
+        clear_env();
+        unsafe {
+            std::env::set_var("DATABASE_URL", "postgres://u:p@h/d");
+            std::env::set_var("PRICING_REFRESH_INTERVAL", "not-a-number");
+        }
+        let config = GatewayConfig::from_env().unwrap();
+        assert_eq!(
+            config.pricing_refresh_interval, 86400,
+            "invalid PRICING_REFRESH_INTERVAL should fall back to 86400"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn pricing_refresh_enabled_defaults_to_true() {
+        clear_env();
+        unsafe { std::env::set_var("DATABASE_URL", "postgres://u:p@h/d") };
+        let config = GatewayConfig::from_env().unwrap();
+        assert!(
+            config.pricing_refresh_enabled,
+            "expected pricing_refresh_enabled to default to true when env var is unset"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn pricing_refresh_enabled_false_when_explicit_false() {
+        clear_env();
+        unsafe {
+            std::env::set_var("DATABASE_URL", "postgres://u:p@h/d");
+            std::env::set_var("PRICING_REFRESH_ENABLED", "false");
+        }
+        let config = GatewayConfig::from_env().unwrap();
+        assert!(
+            !config.pricing_refresh_enabled,
+            "expected pricing_refresh_enabled=false when env var is \"false\""
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn pricing_refresh_enabled_false_when_zero() {
+        clear_env();
+        unsafe {
+            std::env::set_var("DATABASE_URL", "postgres://u:p@h/d");
+            std::env::set_var("PRICING_REFRESH_ENABLED", "0");
+        }
+        let config = GatewayConfig::from_env().unwrap();
+        assert!(
+            !config.pricing_refresh_enabled,
+            "expected pricing_refresh_enabled=false when env var is \"0\""
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn pricing_refresh_enabled_true_when_one() {
+        clear_env();
+        unsafe {
+            std::env::set_var("DATABASE_URL", "postgres://u:p@h/d");
+            std::env::set_var("PRICING_REFRESH_ENABLED", "1");
+        }
+        let config = GatewayConfig::from_env().unwrap();
+        assert!(
+            config.pricing_refresh_enabled,
+            "expected pricing_refresh_enabled=true when env var is \"1\""
+        );
     }
 }

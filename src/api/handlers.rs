@@ -1044,7 +1044,12 @@ async fn handle_non_streaming(
             state
                 .metrics
                 .record_error("bedrock_invoke", ep_str.as_deref());
-            let (status, message, is_throttle) = map_bedrock_error(&e);
+            let model_prefix = bedrock_model
+                .find('.')
+                .map(|i| &bedrock_model[..i])
+                .unwrap_or(bedrock_model);
+            let (status, message, is_throttle) =
+                map_bedrock_error(&e, Some((original_model, model_prefix)));
             if is_throttle {
                 state
                     .metrics
@@ -1230,7 +1235,13 @@ async fn handle_streaming(
             state
                 .metrics
                 .record_error("bedrock_stream", ep_str.as_deref());
-            let (status, message, is_throttle) = map_bedrock_error(&e);
+            let (status, message, is_throttle) = {
+                let model_prefix = bedrock_model
+                    .find('.')
+                    .map(|i| &bedrock_model[..i])
+                    .unwrap_or(bedrock_model);
+                map_bedrock_error(&e, Some((original_model, model_prefix)))
+            };
             if is_throttle {
                 state
                     .metrics
@@ -1348,7 +1359,7 @@ async fn handle_with_web_search(
             },
             Err(e) => {
                 tracing::error!(%e, "Bedrock call failed (web search loop)");
-                let (status, message, is_throttle) = map_bedrock_error(&e);
+                let (status, message, is_throttle) = map_bedrock_error(&e, None);
                 if is_throttle {
                     state.metrics.record_bedrock_throttle(
                         original_model,
@@ -2188,6 +2199,7 @@ fn error_response(status: StatusCode, error_type: &str, message: &str) -> Respon
 /// Returns `(status, message, is_throttle)` so callers can record throttle metrics.
 fn map_bedrock_error<E: std::fmt::Debug + std::fmt::Display>(
     error: &E,
+    model_context: Option<(&str, &str)>,
 ) -> (StatusCode, String, bool) {
     let debug_msg = format!("{error:?}");
     tracing::error!(details = %debug_msg, "Bedrock error details");
@@ -2207,6 +2219,17 @@ fn map_bedrock_error<E: std::fmt::Debug + std::fmt::Display>(
         StatusCode::SERVICE_UNAVAILABLE
     } else {
         StatusCode::BAD_GATEWAY
+    };
+    let message = if status == StatusCode::BAD_REQUEST
+        && message.contains("model identifier is invalid")
+        && let Some((model, prefix)) = model_context
+    {
+        format!(
+            "{model} is not available on your endpoint ({prefix} region). \
+             Use /model to select a different model, or ask your admin to add a global endpoint."
+        )
+    } else {
+        message
     };
     (status, message, is_throttle)
 }

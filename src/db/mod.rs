@@ -3,6 +3,7 @@ pub mod endpoints;
 pub mod idp;
 pub mod keys;
 pub mod model_mappings;
+pub mod model_pricing;
 pub mod notification_config;
 pub mod org_analytics;
 

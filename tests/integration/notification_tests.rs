@@ -352,6 +352,8 @@ async fn test_app(pool: &sqlx::PgPool) -> (axum::Router, String) {
         database_port: 5432,
         database_name: "test".to_string(),
         database_user: "test".to_string(),
+        pricing_refresh_interval: 86400,
+        pricing_refresh_enabled: true,
     };
 
     let signing_key = "test-signing-key-for-integration-tests";
@@ -401,6 +403,7 @@ async fn test_app(pool: &sqlx::PgPool) -> (axum::Router, String) {
         endpoint_stats: Arc::new(ccag::endpoint::stats::EndpointStats::new()),
         started_at: std::time::Instant::now(),
         login_attempts: tokio::sync::Mutex::new(Vec::new()),
+        pricing_client: std::sync::Arc::new(aws_sdk_pricing::Client::new(&aws_config)),
     });
 
     let router = ccag::api::router(state);

@@ -800,6 +800,22 @@ pub async fn get_budget_status(
         .await
         .unwrap_or_default();
 
+    // Count unpriced tokens: sum of all token dimensions for spend_log rows in the
+    // budget period where estimate_cost_usd returns NULL.
+    let period_start = effective_period.period_start();
+    let unpriced_tokens: i64 = sqlx::query_scalar::<_, i64>(
+        r#"SELECT COALESCE(SUM(input_tokens + output_tokens + cache_read_tokens + cache_write_tokens), 0)::bigint
+           FROM spend_log
+           WHERE user_identity = $1
+             AND recorded_at >= $2
+             AND estimate_cost_usd(model, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens) IS NULL"#,
+    )
+    .bind(&identity)
+    .bind(period_start)
+    .fetch_one(pool)
+    .await
+    .unwrap_or(0);
+
     let mut team_json = team.as_ref().map(|t| {
         json!({
             "id": t.id,
@@ -828,6 +844,7 @@ pub async fn get_budget_status(
         "policy": policy,
         "team": team_json,
         "recent_events": recent_events,
+        "unpriced_tokens": unpriced_tokens,
     }))
     .into_response()
 }
@@ -1084,6 +1101,20 @@ pub async fn get_analytics(
             .await
     };
 
+    // Unpriced rows/models: count spend_log entries in the last 7 days where
+    // estimate_cost_usd returns NULL. Always uses a fixed 7-day window regardless
+    // of the analytics query range so the dashboard alert is consistent.
+    let unpriced_query = r#"
+        SELECT
+            COUNT(*) FILTER (WHERE estimate_cost_usd(model, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens) IS NULL)::bigint AS unpriced_rows,
+            COALESCE(ARRAY_AGG(DISTINCT model) FILTER (WHERE estimate_cost_usd(model, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens) IS NULL), ARRAY[]::TEXT[]) AS unpriced_models
+        FROM spend_log
+        WHERE recorded_at >= now() - interval '7 days'
+    "#;
+    let unpriced_result = sqlx::query_as::<_, UnpricedStatsRow>(unpriced_query)
+        .fetch_optional(pool)
+        .await;
+
     // Build response
     let t = match totals {
         Ok(row) => row,
@@ -1162,11 +1193,21 @@ pub async fn get_analytics(
     })
     .collect();
 
+    let (unpriced_rows, unpriced_models) = match unpriced_result {
+        Ok(Some(row)) => (
+            row.unpriced_rows.unwrap_or(0),
+            row.unpriced_models.unwrap_or_default(),
+        ),
+        _ => (0, vec![]),
+    };
+
     Json(json!({
         "days": days,
         "granularity": granularity,
         "scope": "user",
         "user": admin_identity,
+        "unpriced_rows": unpriced_rows,
+        "unpriced_models": unpriced_models,
         "totals": {
             "requests": t.as_ref().and_then(|t| t.total_requests).unwrap_or(0),
             "input_tokens": total_input,
@@ -1238,6 +1279,12 @@ struct TrendRow {
     request_count: Option<i64>,
     total_tokens: Option<i64>,
     cost_usd: Option<f64>,
+}
+
+#[derive(sqlx::FromRow)]
+struct UnpricedStatsRow {
+    unpriced_rows: Option<i64>,
+    unpriced_models: Option<Vec<String>>,
 }
 
 // --- Org Analytics ---
@@ -3661,4 +3708,162 @@ pub async fn update_idp_scim(
         Ok(_) => error_response(StatusCode::NOT_FOUND, "IDP not found"),
         Err(e) => admin_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Admin Pricing API
+// ---------------------------------------------------------------------------
+
+/// GET /admin/pricing — list all model pricing rows sorted by model_prefix ASC.
+pub async fn list_pricing(State(state): State<Arc<GatewayState>>, headers: HeaderMap) -> Response {
+    if let Err(resp) = check_admin_auth(&headers, &state).await {
+        return resp;
+    }
+    let pool = state.db().await;
+    match crate::db::model_pricing::list_all(&pool).await {
+        Ok(rows) => Json(rows).into_response(),
+        Err(e) => admin_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    }
+}
+
+#[derive(Deserialize)]
+pub struct PricingUpsertBody {
+    pub input_rate: f64,
+    pub output_rate: f64,
+    pub cache_read_rate: f64,
+    pub cache_write_rate: f64,
+    pub aws_sku: Option<String>,
+}
+
+/// PUT /admin/pricing/:prefix — create or override a pricing row (forced source='admin_manual').
+///
+/// We accept raw bytes rather than a typed body so that auth is checked
+/// before deserialization, ensuring missing-field errors return 400 (not 422)
+/// and unauthenticated requests with an invalid body still return 401.
+pub async fn upsert_pricing(
+    State(state): State<Arc<GatewayState>>,
+    headers: HeaderMap,
+    Path(prefix): Path<String>,
+    body: axum::body::Bytes,
+) -> Response {
+    if let Err(resp) = check_admin_auth(&headers, &state).await {
+        return resp;
+    }
+
+    // Parse body bytes as JSON
+    let value: serde_json::Value = match serde_json::from_slice(&body) {
+        Ok(v) => v,
+        Err(_) => return error_response(StatusCode::BAD_REQUEST, "Invalid JSON body"),
+    };
+
+    // Validate required fields manually — return 400 for missing fields
+    let input_rate = match value.get("input_rate").and_then(|v| v.as_f64()) {
+        Some(v) => v,
+        None => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                "Missing required field: input_rate",
+            );
+        }
+    };
+    let output_rate = match value.get("output_rate").and_then(|v| v.as_f64()) {
+        Some(v) => v,
+        None => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                "Missing required field: output_rate",
+            );
+        }
+    };
+    let cache_read_rate = match value.get("cache_read_rate").and_then(|v| v.as_f64()) {
+        Some(v) => v,
+        None => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                "Missing required field: cache_read_rate",
+            );
+        }
+    };
+    let cache_write_rate = match value.get("cache_write_rate").and_then(|v| v.as_f64()) {
+        Some(v) => v,
+        None => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                "Missing required field: cache_write_rate",
+            );
+        }
+    };
+    let aws_sku = value
+        .get("aws_sku")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+
+    let pool = state.db().await;
+
+    let row = crate::db::model_pricing::ModelPricing {
+        model_prefix: prefix.clone(),
+        input_rate,
+        output_rate,
+        cache_read_rate,
+        cache_write_rate,
+        source: "admin_manual".to_string(),
+        aws_sku,
+        updated_at: chrono::Utc::now(),
+    };
+
+    if let Err(e) = crate::db::model_pricing::upsert_manual(&pool, &row).await {
+        return admin_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string());
+    }
+
+    // Fetch back to return the persisted row (with server-updated timestamp)
+    match crate::db::model_pricing::get(&pool, &prefix).await {
+        Ok(Some(stored)) => Json(stored).into_response(),
+        Ok(None) => admin_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Row not found after upsert",
+        ),
+        Err(e) => admin_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    }
+}
+
+/// DELETE /admin/pricing/:prefix — remove a pricing row.
+/// Returns 200 `{"deleted": true}` on success, 404 `{"deleted": false, "error": "not found"}` if missing.
+pub async fn delete_pricing(
+    State(state): State<Arc<GatewayState>>,
+    headers: HeaderMap,
+    Path(prefix): Path<String>,
+) -> Response {
+    if let Err(resp) = check_admin_auth(&headers, &state).await {
+        return resp;
+    }
+    let pool = state.db().await;
+    match crate::db::model_pricing::delete(&pool, &prefix).await {
+        Ok(true) => Json(json!({ "deleted": true })).into_response(),
+        Ok(false) => (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "deleted": false, "error": "not found" })),
+        )
+            .into_response(),
+        Err(e) => admin_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    }
+}
+
+/// POST /admin/pricing/refresh — trigger a price list refresh from AWS.
+/// Always returns 200; errors are surfaced in the RefreshReport body.
+pub async fn refresh_pricing(
+    State(state): State<Arc<GatewayState>>,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(resp) = check_admin_auth(&headers, &state).await {
+        return resp;
+    }
+    let pool = state.db().await;
+    let report = crate::pricing::refresh_pricing(&pool, &state.pricing_client, &state.http_client)
+        .await
+        .unwrap_or_else(|e| {
+            let mut r = crate::pricing::RefreshReport::default();
+            r.errors.push(format!("refresh_pricing failed: {e:?}"));
+            r
+        });
+    Json(report).into_response()
 }
