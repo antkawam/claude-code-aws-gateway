@@ -122,6 +122,15 @@ export class GatewayStack extends cdk.Stack {
       }),
     );
 
+    // AWS Price List API: used by the daily pricing-refresh job to pull Bedrock
+    // foundation-model rates. Pricing API does not support resource-level permissions.
+    taskDef.taskRole.addToPrincipalPolicy(
+      new iam.PolicyStatement({
+        actions: ['pricing:ListPriceLists', 'pricing:GetPriceListFileUrl'],
+        resources: ['*'],
+      }),
+    );
+
     // SNS Publish — app-level notifications (budget alerts, etc.) to BYO SNS topics
     taskDef.taskRole.addToPrincipalPolicy(
       new iam.PolicyStatement({
