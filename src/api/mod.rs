@@ -29,6 +29,13 @@ pub fn router(state: Arc<GatewayState>) -> Router {
         .route("/v1/messages", post(handlers::messages))
         .route("/v1/messages/count_tokens", post(handlers::count_tokens))
         .route("/v1/models", get(handlers::list_models))
+        // Admin API — Pricing
+        .route("/admin/pricing", get(admin::list_pricing))
+        .route("/admin/pricing/refresh", post(admin::refresh_pricing))
+        .route(
+            "/admin/pricing/{prefix}",
+            put(admin::upsert_pricing).delete(admin::delete_pricing),
+        )
         // Admin API — Keys
         .route("/admin/keys", post(admin::create_key))
         .route("/admin/keys", get(admin::list_keys))
