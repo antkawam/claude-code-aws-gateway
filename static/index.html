@@ -1788,7 +1788,7 @@ input[type="date"].oa-filter-select { background-image: none; padding-right: 8px
         </div>
         <div class="card">
           <table>
-            <thead><tr><th>Key Prefix</th><th>Name</th><th>Status</th><th>Created</th><th></th></tr></thead>
+            <thead><tr><th>Key Prefix</th><th>Name</th><th>Team</th><th>Status</th><th>Created</th><th></th></tr></thead>
             <tbody id="keys-table"></tbody>
           </table>
           <div id="keys-empty" class="empty-state" style="display:none">
@@ -2050,7 +2050,7 @@ input[type="date"].oa-filter-select { background-image: none; padding-right: 8px
         <!-- Teams table -->
         <div class="card">
           <table>
-            <thead><tr><th>Team</th><th>Members</th><th>Team Budget</th><th>Resets</th><th>Spend</th><th>Usage</th><th></th></tr></thead>
+            <thead><tr><th>Team</th><th>Members</th><th>Keys</th><th>Team Budget</th><th>Resets</th><th>Spend</th><th>Usage</th><th></th></tr></thead>
             <tbody id="budgets-table"></tbody>
           </table>
           <div id="budgets-empty" class="empty-state" style="display:none">
@@ -3699,14 +3699,21 @@ function renderKeys() {
     return;
   }
   document.getElementById('keys-empty').style.display = 'none';
-  document.getElementById('keys-table').innerHTML = all.map(k => `
+  document.getElementById('keys-table').innerHTML = all.map(k => {
+    const teamObj = (data.budgetTeams || []).find(t => t.team_id === k.team_id);
+    const teamCell = teamObj
+      ? `<span style="font-size:12px">${escHtml(teamObj.team_name)}</span>`
+      : `<span style="color:var(--text-muted)">--</span>`;
+    return `
     <tr>
       <td><code>${k.prefix}</code></td>
       <td>${k.name || '<span style="color:var(--text-muted)">--</span>'}</td>
+      <td>${teamCell}</td>
       <td><span class="badge ${k.is_active ? 'badge-green' : 'badge-red'}"><span class="badge-dot"></span>${k.is_active ? 'Active' : 'Revoked'}</span></td>
       <td>${fmtDate(k.created_at)}</td>
       <td>${k.is_active ? `<button class="btn btn-danger btn-sm" onclick="revokeKey('${k.id}')">Revoke</button>` : ''}</td>
-    </tr>`).join('');
+    </tr>`;
+  }).join('');
 }
 
 // ---- Members ----
@@ -3908,6 +3915,7 @@ function renderBudgets() {
   document.getElementById('budgets-empty').style.display = 'none';
 
   document.getElementById('budgets-table').innerHTML = teams.map(t => {
+    const keyCount = (data.keys || []).filter(k => k.team_id === t.team_id && k.is_active).length;
     const pct = t.budget_amount_usd ? (t.current_spend_usd / t.budget_amount_usd * 100) : 0;
     const barColor = pct >= 100 ? 'var(--red)' : pct >= 80 ? 'var(--yellow)' : 'var(--green)';
     const statusBadge = !t.budget_amount_usd
@@ -3918,6 +3926,7 @@ function renderBudgets() {
     return `<tr>
       <td><strong>${escHtml(t.team_name)}</strong></td>
       <td>${t.user_count || 0}</td>
+      <td>${keyCount}</td>
       <td>${t.budget_amount_usd ? fmtUsd(t.budget_amount_usd) : '<span style="color:var(--text-muted)">-</span>'}</td>
       <td>${t.budget_amount_usd ? `<span style="font-size:11px;color:var(--text-secondary)">${fmtResetDate(t.budget_period)}</span>` : ''}</td>
       <td>${fmtUsd(t.current_spend_usd)}</td>
@@ -5713,6 +5722,21 @@ async function renderSetup() {
     const keysNote = activeKeys.length > 0
       ? `<p style="color:var(--text-secondary);font-size:11px;margin-top:8px">You have ${activeKeys.length} active key${activeKeys.length !== 1 ? 's' : ''}. Manage them in <a href="#" onclick="navigate('keys');return false" style="color:var(--accent)">Virtual Keys</a>.</p>`
       : '';
+    const existingKeyOptions = activeKeys.map(k =>
+      `<option value="${k.id}">${escHtml(k.name || k.prefix)}</option>`
+    ).join('');
+    const existingKeySection = activeKeys.length > 0 ? `
+      <div style="margin-top:16px;padding-top:16px;border-top:1px solid var(--border)">
+        <p style="font-size:12px;color:var(--text-secondary);margin-bottom:8px">Or set up an existing key:</p>
+        <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
+          <select class="form-select" id="vk-existing-select" style="width:200px;font-size:12px;padding:6px 10px">
+            ${existingKeyOptions}
+          </select>
+          <input class="form-input" id="vk-existing-rawkey" placeholder="Paste raw key value" type="password" style="width:220px;font-size:12px;padding:6px 10px">
+          <button class="btn btn-secondary btn-sm" onclick="setupExistingKey()">Generate Setup Command</button>
+        </div>
+        <p style="font-size:11px;color:var(--text-muted);margin-top:6px">The raw key is only needed here to generate the one-time setup command and is never stored.</p>
+      </div>` : '';
     return `
       <div id="vk-setup-actions" style="margin:0 0 12px">
         <div style="display:flex;align-items:center;gap:10px">
@@ -5720,6 +5744,7 @@ async function renderSetup() {
           <button class="btn btn-primary btn-sm" onclick="createKeyFromSetup()">Create Key &amp; Setup</button>
         </div>
         ${keysNote}
+        ${existingKeySection}
       </div>
       <div id="vk-setup-scope-area" style="${vkSetupToken ? '' : 'display:none'}">
         <p style="margin-bottom:12px">This command downloads a setup script that configures Claude Code to route through this gateway. It will:</p>
@@ -6202,6 +6227,24 @@ async function createKeyFromSetup() {
   // renderSetup() restores vkSetupToken terminal state automatically
 }
 
+
+async function setupExistingKey() {
+  const keyId = document.getElementById('vk-existing-select')?.value;
+  const rawKey = document.getElementById('vk-existing-rawkey')?.value;
+  if (!keyId || !rawKey) {
+    toast('Select a key and paste its value', 'error');
+    return;
+  }
+  const tokenRes = await api('POST', `/admin/keys/${keyId}/setup-token`, { raw_key: rawKey });
+  if (tokenRes.token) {
+    vkSetupToken = tokenRes.token;
+    toast('Setup command ready', 'success');
+    activeSetupTab = 'vk';
+    await loadAll();
+  } else {
+    toast(tokenRes.error?.message || 'Failed to generate setup token', 'error');
+  }
+}
 
 async function revokeKey(id) {
   if (!confirm('Revoke this virtual key? This action cannot be undone.')) return;

@@ -153,6 +153,7 @@ pub async fn list_keys(State(state): State<Arc<GatewayState>>, headers: HeaderMa
                         "prefix": k.key_prefix,
                         "name": k.name,
                         "user_id": k.user_id,
+                        "team_id": k.team_id,
                         "is_active": k.is_active,
                         "rate_limit_rpm": k.rate_limit_rpm,
                         "created_at": k.created_at,
