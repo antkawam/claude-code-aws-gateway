@@ -12,7 +12,7 @@ use axum::{
     extract::State,
     http::Method,
     response::{Html, IntoResponse, Redirect},
-    routing::{delete, get, post, put},
+    routing::{delete, get, patch, post, put},
 };
 use subtle::ConstantTimeEq;
 use tower_http::cors::{AllowHeaders, AllowOrigin, CorsLayer};
@@ -41,6 +41,7 @@ pub fn router(state: Arc<GatewayState>) -> Router {
         .route("/admin/keys", get(admin::list_keys))
         .route("/admin/keys/{key_id}/revoke", post(admin::revoke_key))
         .route("/admin/keys/{key_id}", delete(admin::delete_key))
+        .route("/admin/keys/{key_id}", patch(admin::update_key))
         .route(
             "/admin/keys/{key_id}/setup-token",
             post(admin::create_setup_token),

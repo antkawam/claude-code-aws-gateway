@@ -219,6 +219,78 @@ pub async fn revoke_key(
     }
 }
 
+#[derive(serde::Deserialize)]
+pub struct UpdateKeyRequest {
+    pub user_id: Option<serde_json::Value>,
+    pub team_id: Option<serde_json::Value>,
+}
+
+pub async fn update_key(
+    State(state): State<Arc<GatewayState>>,
+    headers: HeaderMap,
+    Path(key_id): Path<Uuid>,
+    Json(body): Json<UpdateKeyRequest>,
+) -> Response {
+    let (_, role, _) = match check_auth_identity(&headers, &state).await {
+        Ok(auth) => auth,
+        Err(resp) => return resp,
+    };
+
+    if role != "admin" {
+        return error_response(StatusCode::FORBIDDEN, "Admin only");
+    }
+
+    let pool = state.db().await;
+    let pool = &pool;
+
+    // Accept UUID string, null (clear), or absent (keep existing via re-read)
+    let parse_uuid = |v: &Option<serde_json::Value>| -> Option<Option<Uuid>> {
+        match v {
+            None => None, // field absent -- caller didn't send it
+            Some(serde_json::Value::Null) => Some(None), // explicit null -- clear
+            Some(serde_json::Value::String(s)) => {
+                s.parse::<Uuid>().ok().map(|id| Some(id))
+            }
+            _ => None,
+        }
+    };
+
+    let new_user_id = parse_uuid(&body.user_id);
+    let new_team_id = parse_uuid(&body.team_id);
+
+    // Read current values to fill in any absent fields
+    let current = sqlx::query_as::<_, (Option<Uuid>, Option<Uuid>)>(
+        "SELECT user_id, team_id FROM virtual_keys WHERE id = $1",
+    )
+    .bind(key_id)
+    .fetch_optional(pool)
+    .await;
+
+    let (cur_user, cur_team) = match current {
+        Ok(Some(row)) => row,
+        Ok(None) => return error_response(StatusCode::NOT_FOUND, "Key not found"),
+        Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    };
+
+    let final_user_id = new_user_id.unwrap_or(cur_user);
+    let final_team_id = new_team_id.unwrap_or(cur_team);
+
+    match db::keys::update_key(pool, key_id, final_user_id, final_team_id).await {
+        Ok(true) => {
+            if let Err(e) = state.key_cache.load_from_db(pool).await {
+                tracing::warn!(%e, "Failed to reload key cache after update");
+            }
+            tracing::info!(%key_id, "Updated virtual key");
+            Json(json!({ "updated": true })).into_response()
+        }
+        Ok(false) => error_response(StatusCode::NOT_FOUND, "Key not found"),
+        Err(e) => {
+            tracing::error!(%e, "Failed to update key");
+            error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string())
+        }
+    }
+}
+
 pub async fn delete_key(
     State(state): State<Arc<GatewayState>>,
     headers: HeaderMap,
