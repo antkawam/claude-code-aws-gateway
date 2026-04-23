@@ -1788,7 +1788,7 @@ input[type="date"].oa-filter-select { background-image: none; padding-right: 8px
         </div>
         <div class="card">
           <table>
-            <thead><tr><th>Key Prefix</th><th>Name</th><th>Team</th><th>Status</th><th>Created</th><th></th></tr></thead>
+            <thead><tr><th>Key Prefix</th><th>Name</th><th>Team</th><th>User</th><th>Status</th><th>Created</th><th></th></tr></thead>
             <tbody id="keys-table"></tbody>
           </table>
           <div id="keys-empty" class="empty-state" style="display:none">
@@ -2625,6 +2625,13 @@ input[type="date"].oa-filter-select { background-image: none; padding-right: 8px
           <option value="">None</option>
         </select>
         <div class="form-hint">Assign to a team for budget enforcement</div>
+      </div>
+      <div class="form-group">
+        <label class="form-label">User</label>
+        <select class="form-select" id="mk-user">
+          <option value="">None</option>
+        </select>
+        <div class="form-hint">Assign to a specific member</div>
       </div>
     </div>
     <div class="modal-footer">
@@ -3704,11 +3711,16 @@ function renderKeys() {
     const teamCell = teamObj
       ? `<span style="font-size:12px">${escHtml(teamObj.team_name)}</span>`
       : `<span style="color:var(--text-muted)">--</span>`;
+    const userObj = (data.users || []).find(u => u.id === k.user_id);
+    const userCell = userObj
+      ? `<span style="font-size:12px">${escHtml(userObj.email)}</span>`
+      : `<span style="color:var(--text-muted)">--</span>`;
     return `
     <tr>
       <td><code>${k.prefix}</code></td>
       <td>${k.name || '<span style="color:var(--text-muted)">--</span>'}</td>
       <td>${teamCell}</td>
+      <td>${userCell}</td>
       <td><span class="badge ${k.is_active ? 'badge-green' : 'badge-red'}"><span class="badge-dot"></span>${k.is_active ? 'Active' : 'Revoked'}</span></td>
       <td>${fmtDate(k.created_at)}</td>
       <td>${k.is_active ? `<button class="btn btn-danger btn-sm" onclick="revokeKey('${k.id}')">Revoke</button>` : ''}</td>
@@ -3736,6 +3748,10 @@ function renderMembers() {
   const mkTeamSelect = document.getElementById('mk-team');
   if (mkTeamSelect) {
     mkTeamSelect.innerHTML = '<option value="">None</option>' + teams.map(t => `<option value="${t.team_id}">${escHtml(t.team_name)}</option>`).join('');
+  }
+  const mkUserSelect = document.getElementById('mk-user');
+  if (mkUserSelect) {
+    mkUserSelect.innerHTML = '<option value="">None</option>' + (data.users || []).map(u => `<option value="${u.id}">${escHtml(u.email)}</option>`).join('');
   }
   document.getElementById('members-table').innerHTML = data.users.map(u => {
     const userTeam = u.team_id || '';
@@ -6190,13 +6206,15 @@ async function revokeScimToken(tokenId) {
 async function createKey() {
   const name = document.getElementById('mk-name').value || undefined;
   const team_id = document.getElementById('mk-team').value || undefined;
-  const res = await api('POST', '/admin/keys', { name, team_id, user_id: currentUserId || undefined });
+  const user_id = document.getElementById('mk-user').value || undefined;
+  const res = await api('POST', '/admin/keys', { name, team_id, user_id });
   if (res.key) {
     closeModal();
     document.getElementById('new-key-banner').style.display = 'block';
     document.getElementById('new-key-value').textContent = res.key;
     document.getElementById('mk-name').value = '';
     document.getElementById('mk-team').value = '';
+    document.getElementById('mk-user').value = '';
     toast('Virtual key created', 'success');
     loadAll();
   } else {

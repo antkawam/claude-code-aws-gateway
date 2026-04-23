@@ -92,6 +92,18 @@ pub async fn create_key(
     .await
     {
         Ok((raw_key, vk)) => {
+            // Fetch user email for spend attribution (needed for analytics team filter)
+            let user_email = if let Some(uid) = vk.user_id {
+                sqlx::query_scalar::<_, String>("SELECT email FROM users WHERE id = $1")
+                    .bind(uid)
+                    .fetch_optional(pool)
+                    .await
+                    .ok()
+                    .flatten()
+            } else {
+                None
+            };
+
             // Update in-memory cache
             state
                 .key_cache
@@ -101,6 +113,7 @@ pub async fn create_key(
                         id: vk.id,
                         name: vk.name.clone(),
                         user_id: vk.user_id,
+                        user_email,
                         team_id: vk.team_id,
                         rate_limit_rpm: vk.rate_limit_rpm,
                     },

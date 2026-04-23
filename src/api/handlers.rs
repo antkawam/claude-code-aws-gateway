@@ -300,7 +300,7 @@ pub async fn messages(
     let identity = match &auth_result {
         AuthResult::VirtualKey(k) => AuthIdentity {
             key_id: Some(k.id),
-            user_identity: k.name.clone(),
+            user_identity: k.user_email.clone().or_else(|| k.name.clone()),
             user_id: k.user_id,
         },
         AuthResult::Oidc(id) => {
