@@ -2528,6 +2528,7 @@ input[type="date"].oa-filter-select { background-image: none; padding-right: 8px
                             <option value="duckduckgo">DuckDuckGo</option>
                             <option value="tavily">Tavily</option>
                             <option value="serper">Serper</option>
+                            <option value="searxng">SearXNG</option>
                             <option value="custom">Custom</option>
                           </select>
                         </div>
@@ -5188,9 +5189,16 @@ const wsProviderMeta = {
     hint: 'Google Search results via <a href="https://serper.dev" target="_blank" style="color:var(--accent)">serper.dev</a>.',
     keyHint: 'Get your key at <a href="https://serper.dev/dashboard" target="_blank" style="color:var(--accent)">serper.dev/dashboard</a>.',
   },
+  searxng: {
+    name: 'SearXNG',
+    desc: 'Self-hosted search engine. No API key required; just point to your instance URL.',
+    needsKey: false, needsUrl: true,
+    hint: 'Enter your SearXNG instance URL (e.g. your internal ALB or private hostname).',
+    keyHint: '',
+  },
   custom: {
     name: 'Custom',
-    desc: 'Any POST endpoint. Works with SearXNG, custom proxies, or internal search APIs.',
+    desc: 'Any POST endpoint. Works with custom proxies or internal search APIs.',
     needsKey: false, needsUrl: true,
     hint: 'Any POST endpoint returning search results.',
     keyHint: 'Optional Bearer token for your endpoint.',
