@@ -2619,6 +2619,13 @@ input[type="date"].oa-filter-select { background-image: none; padding-right: 8px
         <input class="form-input" id="mk-name" placeholder="e.g. dev-team-key, john-personal">
         <div class="form-hint">A descriptive name to identify this key</div>
       </div>
+      <div class="form-group">
+        <label class="form-label">Team</label>
+        <select class="form-select" id="mk-team">
+          <option value="">None</option>
+        </select>
+        <div class="form-hint">Assign to a team for budget enforcement</div>
+      </div>
     </div>
     <div class="modal-footer">
       <button class="btn btn-secondary" onclick="closeModal()">Cancel</button>
@@ -3718,6 +3725,10 @@ function renderMembers() {
   const mmTeamSelect = document.getElementById('mm-team');
   if (mmTeamSelect) {
     mmTeamSelect.innerHTML = '<option value="">None</option>' + teams.map(t => `<option value="${t.team_id}">${escHtml(t.team_name)}</option>`).join('');
+  }
+  const mkTeamSelect = document.getElementById('mk-team');
+  if (mkTeamSelect) {
+    mkTeamSelect.innerHTML = '<option value="">None</option>' + teams.map(t => `<option value="${t.team_id}">${escHtml(t.team_name)}</option>`).join('');
   }
   document.getElementById('members-table').innerHTML = data.users.map(u => {
     const userTeam = u.team_id || '';
@@ -6153,12 +6164,14 @@ async function revokeScimToken(tokenId) {
 // ---- Actions ----
 async function createKey() {
   const name = document.getElementById('mk-name').value || undefined;
-  const res = await api('POST', '/admin/keys', { name, user_id: currentUserId || undefined });
+  const team_id = document.getElementById('mk-team').value || undefined;
+  const res = await api('POST', '/admin/keys', { name, team_id, user_id: currentUserId || undefined });
   if (res.key) {
     closeModal();
     document.getElementById('new-key-banner').style.display = 'block';
     document.getElementById('new-key-value').textContent = res.key;
     document.getElementById('mk-name').value = '';
+    document.getElementById('mk-team').value = '';
     toast('Virtual key created', 'success');
     loadAll();
   } else {
