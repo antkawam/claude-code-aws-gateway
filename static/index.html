@@ -3304,7 +3304,15 @@ async function api(method, path, body) {
   const opts = { method, headers: { 'content-type': 'application/json', 'x-api-key': apiKey } };
   if (body) opts.body = JSON.stringify(body);
   const res = await fetch(BASE + path, opts);
-  return res.json();
+  const text = await res.text();
+  try { return JSON.parse(text); } catch { return { error: text || `HTTP ${res.status}` }; }
+}
+
+function normalizeUrl(url) {
+  if (!url) return url;
+  url = url.trim();
+  if (!url.startsWith('http://') && !url.startsWith('https://')) return 'http://' + url;
+  return url;
 }
 
 // ---- Navigation ----
@@ -5311,7 +5319,7 @@ function renderWsCards(activeType) {
       if (meta.needsUrl || type === 'custom') {
         html += `<div class="form-group" style="margin-bottom:10px">`;
         html += `<label class="form-label" style="font-size:11px">API URL</label>`;
-        html += `<input class="form-input" id="ws-url-${type}" type="url" placeholder="https://your-search-api.example.com/search" style="max-width:360px" value="${escHtml(config?.api_url || '')}">`;
+        html += `<input class="form-input" id="ws-url-${type}" type="text" placeholder="http://your-search-instance/search" style="max-width:360px" value="${escHtml(config?.api_url || '')}">`;
         html += `<div class="form-hint">POST endpoint accepting:<pre style="margin:6px 0 0;padding:8px 10px;background:var(--bg-base);border:1px solid var(--border);border-radius:4px;font-size:11px;line-height:1.5;overflow-x:auto">{ "query": "...", "count": N }</pre>and returning:<pre style="margin:6px 0 0;padding:8px 10px;background:var(--bg-base);border:1px solid var(--border);border-radius:4px;font-size:11px;line-height:1.5;overflow-x:auto">[ { "title": "...", "link": "...", "snippet": "..." } ]</pre></div>`;
         html += `</div>`;
       }
@@ -5375,7 +5383,7 @@ async function wsCardSave(type) {
       // If required and empty and no existing key, that's an error
     }
   }
-  if (urlEl) body.api_url = urlEl.value.trim();
+  if (urlEl) body.api_url = normalizeUrl(urlEl.value.trim());
   if (maxEl) body.max_results = parseInt(maxEl.value, 10) || 5;
 
   // Validation
@@ -5441,7 +5449,7 @@ async function wsCardTest(type) {
   const urlEl = document.getElementById(`ws-url-${type}`);
   if (keyEl && keyEl.value.trim()) body.api_key = keyEl.value.trim();
   else if (config?.has_api_key) body.api_key = '__saved__'; // placeholder — server uses saved
-  if (urlEl) body.api_url = urlEl.value.trim();
+  if (urlEl) body.api_url = normalizeUrl(urlEl.value.trim());
   else if (config?.api_url) body.api_url = config.api_url;
 
   // For test endpoint we need actual keys — if using saved, we can't test without them
