@@ -5571,8 +5571,8 @@ function cancelGlobalProvider() {
 
 function wsGlobalTypeChanged() {
   const type = document.getElementById('ws-global-type').value;
-  document.getElementById('ws-global-key-group').style.display = (type === 'duckduckgo') ? 'none' : '';
-  document.getElementById('ws-global-url-group').style.display = (type === 'custom') ? '' : 'none';
+  document.getElementById('ws-global-key-group').style.display = (type === 'duckduckgo' || type === 'searxng') ? 'none' : '';
+  document.getElementById('ws-global-url-group').style.display = (type === 'custom' || type === 'searxng') ? '' : 'none';
 }
 
 async function setWebsearchMode(mode) {
