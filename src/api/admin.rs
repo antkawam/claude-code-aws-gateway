@@ -2697,7 +2697,7 @@ pub async fn set_search_provider(
         None => return error_response(StatusCode::NOT_FOUND, "User not found in database"),
     };
 
-    let valid_types = ["duckduckgo", "tavily", "serper", "custom"];
+    let valid_types = ["duckduckgo", "tavily", "serper", "searxng", "custom"];
     if !valid_types.contains(&body.provider_type.as_str()) {
         return error_response(
             StatusCode::BAD_REQUEST,
@@ -2898,6 +2898,22 @@ pub async fn test_search_provider(
                 api_url,
                 api_key: body.api_key.clone(),
                 max_results: body.max_results.clamp(1, 5) as usize,
+            }
+        }
+        "searxng" => {
+            let api_url = match &body.api_url {
+                Some(u) if !u.is_empty() => u.clone(),
+                _ => {
+                    return Json(json!({
+                        "success": false,
+                        "error": "SearXNG provider requires an API URL",
+                    }))
+                    .into_response();
+                }
+            };
+            crate::websearch::SearchProvider::SearXNG {
+                api_url,
+                max_results: body.max_results.clamp(1, 10) as usize,
             }
         }
         _ => {
@@ -3492,22 +3508,26 @@ pub async fn set_websearch_mode(
                 );
             }
             Some(provider) => {
-                let valid_types = ["duckduckgo", "tavily", "serper", "custom"];
+                let valid_types = ["duckduckgo", "tavily", "serper", "searxng", "custom"];
                 match provider.get("provider_type").and_then(|v| v.as_str()) {
                     Some(pt) if valid_types.contains(&pt) => {}
                     Some(pt) => {
                         return error_response(
                             StatusCode::BAD_REQUEST,
                             &format!(
-                                "Invalid provider_type '{}'. Must be one of: duckduckgo, tavily, serper, custom",
-                                pt
+                                "Invalid provider_type '{}'. Must be one of: {}",
+                                pt,
+                                valid_types.join(", ")
                             ),
                         );
                     }
                     None => {
                         return error_response(
                             StatusCode::BAD_REQUEST,
-                            "provider_type is required in the provider configuration. Must be one of: duckduckgo, tavily, serper, custom",
+                            &format!(
+                                "provider_type is required in the provider configuration. Must be one of: {}",
+                                valid_types.join(", ")
+                            ),
                         );
                     }
                 }
