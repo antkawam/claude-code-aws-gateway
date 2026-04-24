@@ -2524,21 +2524,12 @@ input[type="date"].oa-filter-select { background-image: none; padding-right: 8px
                       <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:flex-end">
                         <div>
                           <div class="form-label">Provider</div>
-                          <select id="ws-global-type" class="form-select" style="width:140px" onchange="wsGlobalTypeChanged()">
-                            <option value="duckduckgo">DuckDuckGo</option>
-                            <option value="tavily">Tavily</option>
-                            <option value="serper">Serper</option>
-                            <option value="searxng">SearXNG</option>
-                            <option value="custom">Custom</option>
-                          </select>
+                          <select id="ws-global-type" class="form-select" style="width:160px" onchange="wsGlobalTypeChanged()"></select>
                         </div>
-                        <div id="ws-global-key-group">
+                        <div id="ws-global-key-group" style="display:none">
                           <div class="form-label">API Key</div>
-                          <input class="form-input" id="ws-global-key" type="password" placeholder="API key" style="width:200px">
-                        </div>
-                        <div id="ws-global-url-group" style="display:none">
-                          <div class="form-label">API URL</div>
-                          <input class="form-input" id="ws-global-url" type="text" placeholder="https://..." style="width:200px">
+                          <input class="form-input" id="ws-global-key" type="password" placeholder="Re-enter key" style="width:200px">
+                          <div class="form-hint">Key is not stored in plain text — re-enter to set globally.</div>
                         </div>
                         <div>
                           <div class="form-label">Max Results</div>
@@ -5561,18 +5552,33 @@ async function loadGlobalProviderInfo() {
 }
 
 function showGlobalProviderForm() {
+  const sel = document.getElementById('ws-global-type');
+  sel.innerHTML = '';
+  // Populate from already-configured providers
+  const configured = Object.entries(wsProviderConfigs);
+  if (configured.length === 0) {
+    sel.innerHTML = '<option value="">No providers configured</option>';
+  } else {
+    for (const [type, cfg] of configured) {
+      const meta = wsProviderMeta[type];
+      const opt = document.createElement('option');
+      opt.value = type;
+      opt.textContent = meta?.name || type;
+      sel.appendChild(opt);
+    }
+  }
   document.getElementById('websearch-global-provider-form').style.display = '';
   wsGlobalTypeChanged();
 }
 
-function cancelGlobalProvider() {
-  document.getElementById('websearch-global-provider-form').style.display = 'none';
-}
-
 function wsGlobalTypeChanged() {
   const type = document.getElementById('ws-global-type').value;
-  document.getElementById('ws-global-key-group').style.display = (type === 'duckduckgo' || type === 'searxng') ? 'none' : '';
-  document.getElementById('ws-global-url-group').style.display = (type === 'custom' || type === 'searxng') ? '' : 'none';
+  const saved = wsProviderConfigs[type];
+  const meta = wsProviderMeta[type];
+  // Only show key field for providers that need a key (and don't have it stored accessibly)
+  document.getElementById('ws-global-key-group').style.display = meta?.needsKey ? '' : 'none';
+  // Pre-fill max results from saved config
+  if (saved?.max_results) document.getElementById('ws-global-max').value = saved.max_results;
 }
 
 async function setWebsearchMode(mode) {
@@ -5597,15 +5603,21 @@ async function setWebsearchMode(mode) {
   }
 }
 
-async function saveGlobalProvider() {
-  const providerType = document.getElementById('ws-global-type').value;
-  const apiKey = document.getElementById('ws-global-key').value;
-  const apiUrl = document.getElementById('ws-global-url').value;
-  const maxResults = parseInt(document.getElementById('ws-global-max').value) || 5;
+function cancelGlobalProvider() {
+  document.getElementById('websearch-global-provider-form').style.display = 'none';
+}
 
-  const provider = { provider_type: providerType, max_results: maxResults };
-  if (apiKey) provider.api_key = apiKey;
-  if (apiUrl) provider.api_url = apiUrl;
+async function saveGlobalProvider() {
+  const type = document.getElementById('ws-global-type').value;
+  if (!type) { toast('Select a provider first', 'error'); return; }
+  const saved = wsProviderConfigs[type];
+  const maxResults = parseInt(document.getElementById('ws-global-max').value) || 5;
+  const provider = { provider_type: type, max_results: maxResults };
+  // Pull url from saved config
+  if (saved?.api_url) provider.api_url = saved.api_url;
+  // Key must be re-entered (not returned by API)
+  const keyEl = document.getElementById('ws-global-key');
+  if (keyEl?.value) provider.api_key = keyEl.value;
 
   const res = await api('PUT', '/admin/websearch-mode', { mode: 'global', provider });
   if (res.updated) {
