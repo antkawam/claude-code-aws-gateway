@@ -310,6 +310,8 @@ async fn search_searxng(
     let url = format!("{}/search", api_url.trim_end_matches('/'));
     let resp = client
         .get(&url)
+        .header("User-Agent", "Mozilla/5.0 (compatible; CCAG/1.0)")
+        .header("Accept", "application/json")
         .query(&[
             ("q", query),
             ("format", "json"),
