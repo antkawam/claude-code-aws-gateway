@@ -317,9 +317,22 @@ pub async fn messages(
         }
     };
 
-    // Budget check for OIDC users (replaces old spend limit check)
-    let budget_status = if let AuthResult::Oidc(ref oidc) = auth_result {
-        match check_budget(&state, oidc.user_id()).await {
+    // Resolve budget identity: OIDC email, or virtual key's assigned user email
+    let budget_identity = match &auth_result {
+        AuthResult::Oidc(oidc) => Some(oidc.user_id().to_string()),
+        AuthResult::VirtualKey(key) => key.user_email.clone(),
+    };
+
+    let budget_status = if let Some(ref identity) = budget_identity {
+        match check_budget(&state, identity).await {
+            Ok(status) => status,
+            Err(resp) => return resp,
+        }
+    } else if let AuthResult::VirtualKey(ref key) = auth_result
+        && let Some(team_id) = key.team_id
+    {
+        // Key assigned to a team but no user -- check team budget only
+        match check_team_budget_only(&state, team_id).await {
             Ok(status) => status,
             Err(resp) => return resp,
         }
@@ -1910,6 +1923,122 @@ async fn check_budget(
             remaining_usd: remaining,
             status: "ok",
             resets: status_period.period_start().to_rfc3339(),
+            shaped_rpm: None,
+        })),
+    }
+}
+
+/// Check team budget for a virtual key that has only team_id (no user assignment).
+async fn check_team_budget_only(
+    state: &GatewayState,
+    team_id: Uuid,
+) -> Result<Option<BudgetStatus>, Response> {
+    use crate::budget::{self, BudgetDecision, BudgetPeriod, PolicyRule};
+
+    let pool = state.db().await;
+    let pool = &pool;
+
+    let team = match crate::db::teams::get_team(pool, team_id).await {
+        Ok(Some(t)) => t,
+        _ => return Ok(None),
+    };
+    let Some(team_limit) = team.budget_amount_usd else {
+        return Ok(None);
+    };
+
+    let team_period = BudgetPeriod::parse(&team.budget_period);
+    let team_spend = match state.budget_cache.get_team_spend(team_id).await {
+        Some(s) => s,
+        None => {
+            let s = crate::db::budget::get_team_spend(pool, team_id, team_period)
+                .await
+                .unwrap_or(0.0);
+            state.budget_cache.set_team_spend(team_id, s).await;
+            s
+        }
+    };
+
+    let team_policy: Vec<PolicyRule> = team
+        .budget_policy
+        .as_ref()
+        .and_then(|v| serde_json::from_value(v.clone()).ok())
+        .unwrap_or_else(budget::preset_standard);
+
+    let decision = budget::evaluate(&team_policy, team_spend, team_limit);
+
+    match &decision {
+        BudgetDecision::Notify { threshold_percent }
+        | BudgetDecision::Shape {
+            threshold_percent, ..
+        }
+        | BudgetDecision::Block { threshold_percent } => {
+            let event_type = match &decision {
+                BudgetDecision::Notify { .. } => "team_notify",
+                BudgetDecision::Shape { .. } => "team_shape",
+                BudgetDecision::Block { .. } => "team_block",
+                _ => unreachable!(),
+            };
+            let _ = crate::db::budget::insert_event(
+                pool,
+                None,
+                Some(team_id),
+                event_type,
+                *threshold_percent as i32,
+                team_spend,
+                team_limit,
+                (team_spend / team_limit) * 100.0,
+                team_period.as_str(),
+                team_period.period_start(),
+            )
+            .await;
+        }
+        _ => {}
+    }
+
+    let percent = (team_spend / team_limit) * 100.0;
+    let remaining = (team_limit - team_spend).max(0.0);
+
+    match decision {
+        BudgetDecision::Block { threshold_percent } => {
+            tracing::warn!(
+                %team_id,
+                spend = team_spend,
+                limit = team_limit,
+                threshold = threshold_percent,
+                "Team budget blocked (virtual key)"
+            );
+            Err(budget_block_response(team_spend, team_limit, team_period))
+        }
+        BudgetDecision::Shape {
+            threshold_percent,
+            rpm,
+        } => {
+            tracing::info!(
+                %team_id,
+                rpm,
+                threshold = threshold_percent,
+                "Team budget shaping active (virtual key)"
+            );
+            Ok(Some(BudgetStatus {
+                percent,
+                remaining_usd: remaining,
+                status: "shaped",
+                resets: team_period.period_start().to_rfc3339(),
+                shaped_rpm: Some(rpm),
+            }))
+        }
+        BudgetDecision::Notify { .. } => Ok(Some(BudgetStatus {
+            percent,
+            remaining_usd: remaining,
+            status: "warning",
+            resets: team_period.period_start().to_rfc3339(),
+            shaped_rpm: None,
+        })),
+        BudgetDecision::Allow => Ok(Some(BudgetStatus {
+            percent,
+            remaining_usd: remaining,
+            status: "ok",
+            resets: team_period.period_start().to_rfc3339(),
             shaped_rpm: None,
         })),
     }

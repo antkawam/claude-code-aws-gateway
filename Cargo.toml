@@ -4,7 +4,7 @@ resolver = "3"
 
 [package]
 name = "ccag"
-version = "1.4.0"
+version = "1.4.10"
 edition = "2024"
 description = "Self-hosted API gateway that routes Claude Code through Amazon Bedrock"
 repository = "https://github.com/antkawam/claude-code-aws-gateway"
