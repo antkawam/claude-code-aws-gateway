@@ -1794,6 +1794,8 @@ async fn check_budget(
     };
 
     // Evaluate team budget (if set)
+    // Hoist team values so we can use them in the block response if team is the binding constraint.
+    let mut team_binding: Option<(f64, f64, BudgetPeriod)> = None;
     if let Some(ref team) = team
         && let Some(team_limit) = team.budget_amount_usd
     {
@@ -1847,11 +1849,20 @@ async fn check_budget(
             _ => {}
         }
 
-        decision = budget::most_restrictive(decision, team_decision);
+        // If team blocks but user doesn't, record team as the binding constraint
+        let prev_decision = decision.clone();
+        decision = budget::most_restrictive(decision, team_decision.clone());
+        if matches!(team_decision, BudgetDecision::Block { .. })
+            && !matches!(prev_decision, BudgetDecision::Block { .. })
+        {
+            team_binding = Some((team_spend, team_limit, team_period));
+        }
     }
 
-    // Build budget status for headers
-    let (status_limit, status_spend, status_period) = if let Some(limit) = user_limit {
+    // Build budget status for headers -- use team values when team is the binding constraint
+    let (status_limit, status_spend, status_period) = if let Some((ts, tl, tp)) = team_binding {
+        (tl, ts, tp)
+    } else if let Some(limit) = user_limit {
         (limit, user_spend, effective_period)
     } else if let Some(ref team) = team {
         if let Some(team_limit) = team.budget_amount_usd {
@@ -1907,7 +1918,7 @@ async fn check_budget(
                 percent,
                 remaining_usd: remaining,
                 status: "shaped",
-                resets: status_period.period_start().to_rfc3339(),
+                resets: status_period.period_next_start().to_rfc3339(),
                 shaped_rpm: Some(rpm),
             }))
         }
@@ -1915,14 +1926,14 @@ async fn check_budget(
             percent,
             remaining_usd: remaining,
             status: "warning",
-            resets: status_period.period_start().to_rfc3339(),
+            resets: status_period.period_next_start().to_rfc3339(),
             shaped_rpm: None,
         })),
         BudgetDecision::Allow => Ok(Some(BudgetStatus {
             percent,
             remaining_usd: remaining,
             status: "ok",
-            resets: status_period.period_start().to_rfc3339(),
+            resets: status_period.period_next_start().to_rfc3339(),
             shaped_rpm: None,
         })),
     }
@@ -2023,7 +2034,7 @@ async fn check_team_budget_only(
                 percent,
                 remaining_usd: remaining,
                 status: "shaped",
-                resets: team_period.period_start().to_rfc3339(),
+                resets: team_period.period_next_start().to_rfc3339(),
                 shaped_rpm: Some(rpm),
             }))
         }
@@ -2031,21 +2042,21 @@ async fn check_team_budget_only(
             percent,
             remaining_usd: remaining,
             status: "warning",
-            resets: team_period.period_start().to_rfc3339(),
+            resets: team_period.period_next_start().to_rfc3339(),
             shaped_rpm: None,
         })),
         BudgetDecision::Allow => Ok(Some(BudgetStatus {
             percent,
             remaining_usd: remaining,
             status: "ok",
-            resets: team_period.period_start().to_rfc3339(),
+            resets: team_period.period_next_start().to_rfc3339(),
             shaped_rpm: None,
         })),
     }
 }
 
 fn budget_block_response(spend: f64, limit: f64, period: crate::budget::BudgetPeriod) -> Response {
-    let resets = period.period_start().to_rfc3339();
+    let resets = period.period_next_start().to_rfc3339();
     Response::builder()
         .status(StatusCode::TOO_MANY_REQUESTS)
         .header("content-type", "application/json")
