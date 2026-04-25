@@ -86,6 +86,26 @@ pub async fn revoke_key(pool: &PgPool, key_id: Uuid) -> anyhow::Result<bool> {
     Ok(result.rows_affected() > 0)
 }
 
+pub async fn update_key(
+    pool: &PgPool,
+    key_id: Uuid,
+    user_id: Option<Uuid>,
+    team_id: Option<Uuid>,
+) -> anyhow::Result<bool> {
+    let result = sqlx::query(
+        "UPDATE virtual_keys SET user_id = $2, team_id = $3 WHERE id = $1",
+    )
+    .bind(key_id)
+    .bind(user_id)
+    .bind(team_id)
+    .execute(pool)
+    .await?;
+    if result.rows_affected() > 0 {
+        bump_cache_version(pool).await?;
+    }
+    Ok(result.rows_affected() > 0)
+}
+
 pub async fn delete_key(pool: &PgPool, key_id: Uuid) -> anyhow::Result<bool> {
     let result = sqlx::query("DELETE FROM virtual_keys WHERE id = $1")
         .bind(key_id)
