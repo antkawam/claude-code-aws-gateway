@@ -92,6 +92,18 @@ pub async fn create_key(
     .await
     {
         Ok((raw_key, vk)) => {
+            // Fetch user email for spend attribution (needed for analytics team filter)
+            let user_email = if let Some(uid) = vk.user_id {
+                sqlx::query_scalar::<_, String>("SELECT email FROM users WHERE id = $1")
+                    .bind(uid)
+                    .fetch_optional(pool)
+                    .await
+                    .ok()
+                    .flatten()
+            } else {
+                None
+            };
+
             // Update in-memory cache
             state
                 .key_cache
@@ -101,6 +113,7 @@ pub async fn create_key(
                         id: vk.id,
                         name: vk.name.clone(),
                         user_id: vk.user_id,
+                        user_email,
                         team_id: vk.team_id,
                         rate_limit_rpm: vk.rate_limit_rpm,
                     },
@@ -153,6 +166,7 @@ pub async fn list_keys(State(state): State<Arc<GatewayState>>, headers: HeaderMa
                         "prefix": k.key_prefix,
                         "name": k.name,
                         "user_id": k.user_id,
+                        "team_id": k.team_id,
                         "is_active": k.is_active,
                         "rate_limit_rpm": k.rate_limit_rpm,
                         "created_at": k.created_at,
@@ -200,6 +214,103 @@ pub async fn revoke_key(
         Ok(false) => error_response(StatusCode::NOT_FOUND, "Key not found"),
         Err(e) => {
             tracing::error!(%e, "Failed to revoke key");
+            error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string())
+        }
+    }
+}
+
+#[derive(serde::Deserialize)]
+pub struct UpdateKeyRequest {
+    pub user_id: Option<serde_json::Value>,
+    pub team_id: Option<serde_json::Value>,
+}
+
+pub async fn update_key(
+    State(state): State<Arc<GatewayState>>,
+    headers: HeaderMap,
+    Path(key_id): Path<Uuid>,
+    Json(body): Json<UpdateKeyRequest>,
+) -> Response {
+    let (_, role, _) = match check_auth_identity(&headers, &state).await {
+        Ok(auth) => auth,
+        Err(resp) => return resp,
+    };
+
+    if role != "admin" {
+        return error_response(StatusCode::FORBIDDEN, "Admin only");
+    }
+
+    let pool = state.db().await;
+    let pool = &pool;
+
+    // Accept UUID string, null (clear), or absent (keep existing via re-read)
+    #[allow(clippy::result_large_err)]
+    fn parse_uuid(
+        field: &str,
+        v: &Option<serde_json::Value>,
+    ) -> Result<Option<Option<Uuid>>, Response> {
+        match v {
+            None => Ok(None), // field absent -- caller didn't send it
+            Some(serde_json::Value::Null) => Ok(Some(None)), // explicit null -- clear
+            Some(serde_json::Value::String(s)) => match s.parse::<Uuid>() {
+                Ok(id) => Ok(Some(Some(id))),
+                Err(_) => Err(error_response(
+                    StatusCode::BAD_REQUEST,
+                    &format!("Invalid UUID for {field}"),
+                )),
+            },
+            _ => Err(error_response(
+                StatusCode::BAD_REQUEST,
+                &format!("{field} must be a UUID string or null"),
+            )),
+        }
+    }
+
+    let new_user_id = match parse_uuid("user_id", &body.user_id) {
+        Ok(v) => v,
+        Err(resp) => return resp,
+    };
+    let new_team_id = match parse_uuid("team_id", &body.team_id) {
+        Ok(v) => v,
+        Err(resp) => return resp,
+    };
+
+    // Read current values to fill in any absent fields
+    let current = sqlx::query_as::<_, (Option<Uuid>, Option<Uuid>)>(
+        "SELECT user_id, team_id FROM virtual_keys WHERE id = $1",
+    )
+    .bind(key_id)
+    .fetch_optional(pool)
+    .await;
+
+    let (cur_user, cur_team) = match current {
+        Ok(Some(row)) => row,
+        Ok(None) => return error_response(StatusCode::NOT_FOUND, "Key not found"),
+        Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    };
+
+    let final_user_id = new_user_id.unwrap_or(cur_user);
+    let final_team_id = new_team_id.unwrap_or(cur_team);
+
+    match db::keys::update_key(pool, key_id, final_user_id, final_team_id).await {
+        Ok(true) => {
+            if let Err(e) = state.key_cache.load_from_db(pool).await {
+                tracing::warn!(%e, "Failed to reload key cache after update");
+            }
+            tracing::info!(%key_id, "Updated virtual key");
+            Json(json!({ "updated": true })).into_response()
+        }
+        Ok(false) => error_response(StatusCode::NOT_FOUND, "Key not found"),
+        Err(e) => {
+            if let Some(sqlx::Error::Database(dbe)) = e.downcast_ref::<sqlx::Error>()
+                && dbe.code().as_deref() == Some("23503")
+            {
+                return error_response(
+                    StatusCode::BAD_REQUEST,
+                    "Referenced user or team does not exist",
+                );
+            }
+            tracing::error!(%e, "Failed to update key");
             error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string())
         }
     }
@@ -2611,7 +2722,7 @@ pub async fn set_search_provider(
         None => return error_response(StatusCode::NOT_FOUND, "User not found in database"),
     };
 
-    let valid_types = ["duckduckgo", "tavily", "serper", "custom"];
+    let valid_types = ["duckduckgo", "tavily", "serper", "searxng", "custom"];
     if !valid_types.contains(&body.provider_type.as_str()) {
         return error_response(
             StatusCode::BAD_REQUEST,
@@ -2812,6 +2923,22 @@ pub async fn test_search_provider(
                 api_url,
                 api_key: body.api_key.clone(),
                 max_results: body.max_results.clamp(1, 5) as usize,
+            }
+        }
+        "searxng" => {
+            let api_url = match &body.api_url {
+                Some(u) if !u.is_empty() => u.clone(),
+                _ => {
+                    return Json(json!({
+                        "success": false,
+                        "error": "SearXNG provider requires an API URL",
+                    }))
+                    .into_response();
+                }
+            };
+            crate::websearch::SearchProvider::SearXNG {
+                api_url,
+                max_results: body.max_results.clamp(1, 10) as usize,
             }
         }
         _ => {
@@ -3406,22 +3533,26 @@ pub async fn set_websearch_mode(
                 );
             }
             Some(provider) => {
-                let valid_types = ["duckduckgo", "tavily", "serper", "custom"];
+                let valid_types = ["duckduckgo", "tavily", "serper", "searxng", "custom"];
                 match provider.get("provider_type").and_then(|v| v.as_str()) {
                     Some(pt) if valid_types.contains(&pt) => {}
                     Some(pt) => {
                         return error_response(
                             StatusCode::BAD_REQUEST,
                             &format!(
-                                "Invalid provider_type '{}'. Must be one of: duckduckgo, tavily, serper, custom",
-                                pt
+                                "Invalid provider_type '{}'. Must be one of: {}",
+                                pt,
+                                valid_types.join(", ")
                             ),
                         );
                     }
                     None => {
                         return error_response(
                             StatusCode::BAD_REQUEST,
-                            "provider_type is required in the provider configuration. Must be one of: duckduckgo, tavily, serper, custom",
+                            &format!(
+                                "provider_type is required in the provider configuration. Must be one of: {}",
+                                valid_types.join(", ")
+                            ),
                         );
                     }
                 }

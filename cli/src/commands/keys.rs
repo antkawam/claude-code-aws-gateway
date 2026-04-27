@@ -40,6 +40,10 @@ pub enum KeysCommands {
     SetupToken {
         /// Key ID to generate setup token for
         key_id: String,
+
+        /// Raw API key value returned at creation time (required by server)
+        #[arg(long)]
+        raw_key: String,
     },
 }
 
@@ -122,11 +126,11 @@ pub async fn run(cmd: KeysCommands, url: Option<String>, token: Option<String>) 
             util::success(&format!("Key {key_id} deleted"));
         }
 
-        KeysCommands::SetupToken { key_id } => {
+        KeysCommands::SetupToken { key_id, raw_key } => {
             let resp = client
                 .post(
                     &format!("/admin/keys/{key_id}/setup-token"),
-                    &serde_json::json!({}),
+                    &serde_json::json!({ "raw_key": raw_key }),
                 )
                 .await?;
             if let Some(token) = resp["token"].as_str() {

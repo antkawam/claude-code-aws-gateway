@@ -12,6 +12,8 @@ pub enum SearchProvider {
     Tavily { api_key: String, max_results: usize },
     /// Serper.dev Google Search API
     Serper { api_key: String, max_results: usize },
+    /// SearXNG self-hosted instance (GET JSON API)
+    SearXNG { api_url: String, max_results: usize },
     /// Custom provider with a simple POST JSON contract
     Custom {
         api_url: String,
@@ -59,6 +61,18 @@ impl SearchProvider {
                 Ok(Self::Custom {
                     api_url,
                     api_key: config.api_key.clone(),
+                    max_results,
+                })
+            }
+            "searxng" => {
+                let api_url = config
+                    .api_url
+                    .as_ref()
+                    .filter(|u| !u.is_empty())
+                    .ok_or_else(|| anyhow::anyhow!("SearXNG provider requires an API URL"))?
+                    .clone();
+                Ok(Self::SearXNG {
+                    api_url,
                     max_results,
                 })
             }
@@ -118,6 +132,15 @@ impl SearchProvider {
                     max_results,
                 })
             }
+            "searxng" => {
+                let api_url = api_url
+                    .filter(|u| !u.is_empty())
+                    .ok_or_else(|| anyhow::anyhow!("SearXNG provider requires an API URL"))?;
+                Ok(Self::SearXNG {
+                    api_url,
+                    max_results,
+                })
+            }
             other => anyhow::bail!("Unknown search provider: {}", other),
         }
     }
@@ -127,6 +150,7 @@ impl SearchProvider {
             Self::DuckDuckGo { .. } => "duckduckgo",
             Self::Tavily { .. } => "tavily",
             Self::Serper { .. } => "serper",
+            Self::SearXNG { .. } => "searxng",
             Self::Custom { .. } => "custom",
         }
     }
@@ -149,6 +173,10 @@ impl SearchProvider {
                 api_key,
                 max_results,
             } => search_serper(client, api_key, query, *max_results).await,
+            Self::SearXNG {
+                api_url,
+                max_results,
+            } => search_searxng(client, api_url, query, *max_results).await,
             Self::Custom {
                 api_url,
                 api_key,
@@ -270,6 +298,58 @@ async fn search_serper(
                 snippet: r
                     .get("snippet")
                     .and_then(|s| s.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+            })
+        })
+        .collect())
+}
+
+/// Search via a SearXNG self-hosted instance.
+/// GET {api_url}/search?q=...&format=json&categories=general
+/// Expects: {"results": [{"title": "...", "url": "...", "content": "..."}]}
+async fn search_searxng(
+    client: &reqwest::Client,
+    api_url: &str,
+    query: &str,
+    max_results: usize,
+) -> anyhow::Result<Vec<WebSearchResult>> {
+    let url = format!("{}/search", api_url.trim_end_matches('/'));
+    let resp = client
+        .get(&url)
+        .header("User-Agent", "Mozilla/5.0 (compatible; CCAG/1.0)")
+        .header("Accept", "application/json")
+        .query(&[
+            ("q", query),
+            ("format", "json"),
+            ("categories", "general"),
+            ("language", "en"),
+        ])
+        .timeout(std::time::Duration::from_secs(10))
+        .send()
+        .await?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        anyhow::bail!("SearXNG returned HTTP {}", status);
+    }
+
+    let json: Value = resp.json().await?;
+    let results = json
+        .get("results")
+        .and_then(|r| r.as_array())
+        .ok_or_else(|| anyhow::anyhow!("SearXNG response missing results array"))?;
+
+    Ok(results
+        .iter()
+        .take(max_results)
+        .filter_map(|r| {
+            Some(WebSearchResult {
+                title: r.get("title")?.as_str()?.to_string(),
+                url: r.get("url")?.as_str()?.to_string(),
+                snippet: r
+                    .get("content")
+                    .and_then(|c| c.as_str())
                     .unwrap_or("")
                     .to_string(),
             })
@@ -598,5 +678,54 @@ mod tests {
             }
             _ => panic!("Expected DuckDuckGo variant"),
         }
+    }
+
+    #[test]
+    fn test_provider_from_config_searxng() {
+        let config = UserSearchProvider {
+            id: uuid::Uuid::new_v4(),
+            user_id: uuid::Uuid::new_v4(),
+            provider_type: "searxng".to_string(),
+            api_key: None,
+            api_url: Some("http://searxng.local".to_string()),
+            max_results: 5,
+            enabled: true,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        };
+        let provider = SearchProvider::from_config(&config).unwrap();
+        assert_eq!(provider.provider_name(), "searxng");
+    }
+
+    #[test]
+    fn test_provider_from_config_searxng_requires_url() {
+        let config = UserSearchProvider {
+            id: uuid::Uuid::new_v4(),
+            user_id: uuid::Uuid::new_v4(),
+            provider_type: "searxng".to_string(),
+            api_key: None,
+            api_url: None,
+            max_results: 5,
+            enabled: true,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        };
+        assert!(SearchProvider::from_config(&config).is_err());
+    }
+
+    #[test]
+    fn test_provider_from_config_searxng_empty_url() {
+        let config = UserSearchProvider {
+            id: uuid::Uuid::new_v4(),
+            user_id: uuid::Uuid::new_v4(),
+            provider_type: "searxng".to_string(),
+            api_key: None,
+            api_url: Some("".to_string()),
+            max_results: 5,
+            enabled: true,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        };
+        assert!(SearchProvider::from_config(&config).is_err());
     }
 }
