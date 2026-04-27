@@ -190,4 +190,46 @@ mod tests {
         assert_eq!(snaps.get(&ep1).unwrap().request_count, 1);
         assert_eq!(snaps.get(&ep2).unwrap().request_count, 2);
     }
+
+    /// Two `record_throttle` calls made within the same 60-second window must
+    /// be aggregated into a single bucket. The snapshot must report
+    /// `throttle_count_1h == 2` (sum of both increments in the one bucket),
+    /// confirming that the bucket accumulates rather than creating a second entry.
+    ///
+    /// Expected to PASS.
+    #[tokio::test]
+    async fn test_throttle_same_bucket_aggregates() {
+        let stats = EndpointStats::new();
+        let ep_id = Uuid::new_v4();
+
+        // Both calls happen within milliseconds of each other — well within the
+        // 60-second BUCKET_WINDOW_SECS threshold — so they must land in the same bucket.
+        stats.record_throttle(ep_id).await;
+        stats.record_throttle(ep_id).await;
+
+        let snaps = stats.get_all_stats().await;
+        let snap = snaps.get(&ep_id).unwrap();
+
+        // The 1-hour sum must reflect both increments.
+        assert_eq!(
+            snap.throttle_count_1h, 2,
+            "Two throttle calls within the same bucket window must aggregate to a count of 2"
+        );
+
+        // Verify there is exactly one bucket by reading the internal map directly.
+        // A count of 2 from a single `get_all_stats` call is only possible when both
+        // increments are in the same bucket (i.e., not two separate buckets each
+        // contributing 1). We confirm this by checking the raw bucket vec length.
+        //
+        // `inner` is accessible here because this test lives in the same module
+        // (`#[cfg(test)] mod tests` inside stats.rs).
+        let map = stats.inner.read().await;
+        let counters = map.get(&ep_id).unwrap();
+        assert_eq!(
+            counters.throttle_buckets.len(),
+            1,
+            "Both throttle calls within 60 s must be stored in exactly one bucket"
+        );
+    }
 }
+// #[cfg(test)] block above
