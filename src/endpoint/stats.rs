@@ -231,5 +231,68 @@ mod tests {
             "Both throttle calls within 60 s must be stored in exactly one bucket"
         );
     }
+
+    /// Calling `record_request` for a brand-new endpoint ID must create a fresh
+    /// entry with `request_count == 1` and zeroed throttle/error counters.
+    ///
+    /// Expected to PASS.
+    #[tokio::test]
+    async fn test_record_request_creates_entry_for_new_endpoint() {
+        let stats = EndpointStats::new();
+        let ep_id = Uuid::new_v4();
+
+        stats.record_request(ep_id).await;
+
+        let snaps = stats.get_all_stats().await;
+        let snap = snaps
+            .get(&ep_id)
+            .expect("get_all_stats must contain an entry after record_request");
+
+        assert_eq!(
+            snap.request_count, 1,
+            "request_count must be 1 after a single record_request call"
+        );
+        assert_eq!(
+            snap.throttle_count_1h, 0,
+            "throttle_count_1h must be 0 for a freshly created entry"
+        );
+        assert_eq!(
+            snap.error_count_1h, 0,
+            "error_count_1h must be 0 for a freshly created entry"
+        );
+    }
+
+    /// Two `record_error` calls within the same 60-second bucket window must
+    /// aggregate into a single bucket, yielding `error_count_1h == 2`.
+    ///
+    /// Expected to PASS.
+    #[tokio::test]
+    async fn test_error_same_bucket_aggregates() {
+        let stats = EndpointStats::new();
+        let ep_id = Uuid::new_v4();
+
+        // Both calls happen within milliseconds — well inside the 60-second window.
+        stats.record_error(ep_id).await;
+        stats.record_error(ep_id).await;
+
+        let snaps = stats.get_all_stats().await;
+        let snap = snaps
+            .get(&ep_id)
+            .expect("get_all_stats must contain an entry after record_error");
+
+        assert_eq!(
+            snap.error_count_1h, 2,
+            "Two error calls within the same bucket window must sum to error_count_1h == 2"
+        );
+
+        // Verify the two increments landed in exactly one bucket.
+        let map = stats.inner.read().await;
+        let counters = map.get(&ep_id).unwrap();
+        assert_eq!(
+            counters.error_buckets.len(),
+            1,
+            "Both error calls within 60 s must be stored in exactly one bucket"
+        );
+    }
 }
 // #[cfg(test)] block above

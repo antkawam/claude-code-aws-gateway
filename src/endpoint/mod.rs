@@ -164,6 +164,7 @@ impl EndpointPool {
                 && last_seen.elapsed().as_secs() < AFFINITY_TTL_SECS
                 && candidate_ids.contains(ep_id)
                 && let Some(client) = clients.get(ep_id)
+                && client.config.enabled
                 && client.healthy.load(Ordering::Relaxed)
             {
                 return Some(Arc::clone(client));
@@ -1312,5 +1313,239 @@ impl aws_credential_types::provider::ProvideCredentials for AssumeRoleProvider {
                 "ccag-assume-role",
             ))
         })
+    }
+}
+
+// ── Slice 3: new tests ──
+
+#[cfg(test)]
+mod tests_slice3 {
+    use super::*;
+    use std::sync::atomic::Ordering;
+
+    fn make_test_endpoint(id: Uuid, name: &str, is_default: bool) -> Endpoint {
+        Endpoint {
+            id,
+            name: name.to_string(),
+            role_arn: None,
+            external_id: None,
+            inference_profile_arn: None,
+            region: "us-east-1".to_string(),
+            routing_prefix: "us".to_string(),
+            priority: 0,
+            is_default,
+            enabled: true,
+            created_at: chrono::Utc::now(),
+        }
+    }
+
+    fn make_test_client(ep: Endpoint) -> EndpointClient {
+        let runtime_client = aws_sdk_bedrockruntime::Client::from_conf(
+            aws_sdk_bedrockruntime::Config::builder()
+                .behavior_version(aws_sdk_bedrockruntime::config::BehaviorVersion::latest())
+                .region(aws_config::Region::new("us-east-1"))
+                .build(),
+        );
+        let control_client = aws_sdk_bedrock::Client::from_conf(
+            aws_sdk_bedrock::Config::builder()
+                .behavior_version(aws_sdk_bedrock::config::BehaviorVersion::latest())
+                .region(aws_config::Region::new("us-east-1"))
+                .build(),
+        );
+        let quota_client = aws_sdk_servicequotas::Client::from_conf(
+            aws_sdk_servicequotas::Config::builder()
+                .behavior_version(aws_sdk_servicequotas::config::BehaviorVersion::latest())
+                .region(aws_config::Region::new("us-east-1"))
+                .build(),
+        );
+        EndpointClient {
+            config: ep,
+            runtime_client,
+            control_client,
+            quota_cache: crate::quota::QuotaCache::new(quota_client),
+            healthy: AtomicBool::new(true),
+            last_health_check: AtomicI64::new(0),
+        }
+    }
+
+    async fn insert_client(pool: &EndpointPool, client: EndpointClient) {
+        let mut clients = pool.clients.write().await;
+        clients.insert(client.config.id, Arc::new(client));
+    }
+
+    #[allow(dead_code)]
+    async fn set_default(pool: &EndpointPool, id: Uuid) {
+        let mut default_id = pool.default_endpoint_id.write().await;
+        *default_id = Some(id);
+    }
+
+    /// When a user has affinity set to an endpoint that is healthy but
+    /// `enabled = false`, `select_endpoint` with `"sticky_user"` must NOT
+    /// return that disabled endpoint. It should fall through to the first
+    /// healthy+enabled team endpoint instead.
+    ///
+    /// NOTE: This test is expected to FAIL. The sticky_user path at line ~167
+    /// only checks `client.healthy` but not `client.config.enabled`. The
+    /// builder must add an `enabled` check there.
+    #[tokio::test]
+    async fn test_sticky_user_disabled_affinity_falls_through() {
+        let pool = EndpointPool::new();
+
+        let id_a = Uuid::new_v4();
+        let id_b = Uuid::new_v4();
+        let id_c = Uuid::new_v4();
+
+        let mut team_eps = Vec::new();
+
+        // id_a: disabled but healthy — affinity points here, must be skipped
+        {
+            let mut ep = make_test_endpoint(id_a, "ep-a", false);
+            ep.enabled = false;
+            team_eps.push(ep.clone());
+            let client = make_test_client(ep);
+            client.healthy.store(true, Ordering::Relaxed);
+            insert_client(&pool, client).await;
+        }
+
+        // id_b: enabled+healthy — should be returned as the first valid fallback
+        {
+            let ep = make_test_endpoint(id_b, "ep-b", false);
+            team_eps.push(ep.clone());
+            let client = make_test_client(ep);
+            client.healthy.store(true, Ordering::Relaxed);
+            insert_client(&pool, client).await;
+        }
+
+        // id_c: enabled+healthy — also a candidate, but after id_b
+        {
+            let ep = make_test_endpoint(id_c, "ep-c", false);
+            team_eps.push(ep.clone());
+            let client = make_test_client(ep);
+            client.healthy.store(true, Ordering::Relaxed);
+            insert_client(&pool, client).await;
+        }
+
+        // Point the user's affinity to the disabled endpoint
+        pool.update_affinity("user@example.com", id_a).await;
+
+        let selected = pool
+            .select_endpoint(&team_eps, Some("user@example.com"), "sticky_user")
+            .await
+            .unwrap();
+
+        // The disabled affinity endpoint must be rejected; the first enabled+healthy
+        // endpoint in team order (id_b) must be returned.
+        assert_eq!(
+            selected.config.id, id_b,
+            "sticky_user must not return a disabled affinity endpoint; expected id_b (first healthy+enabled)"
+        );
+    }
+
+    /// When `team_endpoints` is empty and no default has been set on the pool,
+    /// `select_endpoint` must return `None` even when clients exist in the pool.
+    ///
+    /// Expected to PASS.
+    #[tokio::test]
+    async fn test_no_default_set_empty_team_returns_none() {
+        let pool = EndpointPool::new();
+
+        // Insert a client but do NOT call set_default
+        let id = Uuid::new_v4();
+        let ep = make_test_endpoint(id, "some-ep", false);
+        let client = make_test_client(ep);
+        client.healthy.store(true, Ordering::Relaxed);
+        insert_client(&pool, client).await;
+
+        // No team endpoints and no default endpoint registered
+        let result = pool.select_endpoint(&[], None, "primary_fallback").await;
+
+        assert!(
+            result.is_none(),
+            "select_endpoint must return None when team_endpoints is empty and no default is set"
+        );
+    }
+
+    /// With a single healthy+enabled team endpoint, `select_endpoint` with
+    /// `"round_robin"` must return that same endpoint on every call regardless
+    /// of how many times it is invoked.
+    ///
+    /// Expected to PASS.
+    #[tokio::test]
+    async fn test_single_endpoint_round_robin() {
+        let pool = EndpointPool::new();
+
+        let id = Uuid::new_v4();
+        let ep = make_test_endpoint(id, "only-ep", false);
+        let team_eps = vec![ep.clone()];
+        let client = make_test_client(ep);
+        client.healthy.store(true, Ordering::Relaxed);
+        insert_client(&pool, client).await;
+
+        for call_num in 1..=3 {
+            let selected = pool
+                .select_endpoint(&team_eps, None, "round_robin")
+                .await
+                .unwrap();
+            assert_eq!(
+                selected.config.id, id,
+                "Call {call_num}: round_robin with a single endpoint must always return that endpoint"
+            );
+        }
+    }
+
+    /// `is_empty` and `len` must accurately reflect the number of clients
+    /// currently loaded in the pool.
+    ///
+    /// Expected to PASS.
+    #[tokio::test]
+    async fn test_is_empty_and_len() {
+        let pool = EndpointPool::new();
+
+        // Fresh pool: no clients loaded
+        assert!(
+            pool.is_empty().await,
+            "Newly created pool must report is_empty() == true"
+        );
+        assert_eq!(
+            pool.len().await,
+            0,
+            "Newly created pool must report len() == 0"
+        );
+
+        // Insert first client
+        let id1 = Uuid::new_v4();
+        insert_client(
+            &pool,
+            make_test_client(make_test_endpoint(id1, "ep-1", false)),
+        )
+        .await;
+
+        assert!(
+            !pool.is_empty().await,
+            "Pool with one client must report is_empty() == false"
+        );
+        assert_eq!(
+            pool.len().await,
+            1,
+            "Pool with one client must report len() == 1"
+        );
+
+        // Insert second client
+        let id2 = Uuid::new_v4();
+        insert_client(
+            &pool,
+            make_test_client(make_test_endpoint(id2, "ep-2", false)),
+        )
+        .await;
+
+        assert_eq!(
+            pool.len().await,
+            2,
+            "Pool with two clients must report len() == 2"
+        );
+        assert!(
+            !pool.is_empty().await,
+            "Pool with two clients must report is_empty() == false"
+        );
     }
 }
