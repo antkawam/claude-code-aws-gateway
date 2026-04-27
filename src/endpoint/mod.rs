@@ -1549,3 +1549,204 @@ mod tests_slice3 {
         );
     }
 }
+
+#[cfg(test)]
+mod tests_slice4 {
+    use super::*;
+    use std::sync::atomic::Ordering;
+
+    fn make_dummy_aws_config() -> aws_config::SdkConfig {
+        aws_config::SdkConfig::builder()
+            .behavior_version(aws_config::BehaviorVersion::latest())
+            .region(aws_config::Region::new("us-east-1"))
+            .build()
+    }
+
+    fn make_test_endpoint(id: Uuid, name: &str, is_default: bool) -> Endpoint {
+        Endpoint {
+            id,
+            name: name.to_string(),
+            role_arn: None,
+            external_id: None,
+            inference_profile_arn: None,
+            region: "us-east-1".to_string(),
+            routing_prefix: "us".to_string(),
+            priority: 0,
+            is_default,
+            enabled: true,
+            created_at: chrono::Utc::now(),
+        }
+    }
+
+    /// `load_endpoints` must populate the pool with one client per provided
+    /// `Endpoint` and make each accessible via `get_client`.
+    ///
+    /// Expected to PASS.
+    #[tokio::test]
+    async fn test_load_endpoints_populates_pool() {
+        let pool = EndpointPool::new();
+        let config = make_dummy_aws_config();
+
+        let id1 = Uuid::new_v4();
+        let id2 = Uuid::new_v4();
+        let id3 = Uuid::new_v4();
+
+        let ep1 = make_test_endpoint(id1, "ep-1", false);
+        let ep2 = make_test_endpoint(id2, "ep-2", false);
+        let ep3 = make_test_endpoint(id3, "ep-3", false);
+
+        pool.load_endpoints(vec![ep1, ep2, ep3], &config).await;
+
+        assert_eq!(
+            pool.len().await,
+            3,
+            "load_endpoints with 3 endpoints must produce pool.len() == 3"
+        );
+        assert!(
+            !pool.is_empty().await,
+            "pool must not be empty after loading 3 endpoints"
+        );
+        assert!(
+            pool.get_client(id1).await.is_some(),
+            "client for id1 must be present after load"
+        );
+        assert!(
+            pool.get_client(id2).await.is_some(),
+            "client for id2 must be present after load"
+        );
+        assert!(
+            pool.get_client(id3).await.is_some(),
+            "client for id3 must be present after load"
+        );
+    }
+
+    /// When one of the loaded endpoints has `is_default: true`, `select_endpoint`
+    /// with no team endpoints must return that default endpoint once it is healthy.
+    ///
+    /// Expected to PASS.
+    #[tokio::test]
+    async fn test_load_endpoints_sets_default() {
+        let pool = EndpointPool::new();
+        let config = make_dummy_aws_config();
+
+        let non_default_id = Uuid::new_v4();
+        let default_id = Uuid::new_v4();
+
+        let non_default_ep = make_test_endpoint(non_default_id, "non-default", false);
+        let default_ep = make_test_endpoint(default_id, "default-ep", true);
+
+        pool.load_endpoints(vec![non_default_ep, default_ep], &config)
+            .await;
+
+        // `create_client` initialises healthy = false; mark the default as healthy.
+        pool.get_client(default_id)
+            .await
+            .unwrap()
+            .healthy
+            .store(true, Ordering::Relaxed);
+
+        let selected = pool
+            .select_endpoint(&[], None, "primary_fallback")
+            .await;
+
+        assert!(
+            selected.is_some(),
+            "select_endpoint must return the default endpoint when team_endpoints is empty"
+        );
+        assert_eq!(
+            selected.unwrap().config.id,
+            default_id,
+            "selected endpoint must be the one marked is_default"
+        );
+
+        // Non-default endpoint must also be accessible via get_client.
+        assert!(
+            pool.get_client(non_default_id).await.is_some(),
+            "non-default endpoint must still be reachable via get_client"
+        );
+    }
+
+    /// A second call to `load_endpoints` with a different set of endpoints must
+    /// completely replace the previous pool contents.
+    ///
+    /// Expected to PASS.
+    #[tokio::test]
+    async fn test_load_endpoints_reload_replaces() {
+        let pool = EndpointPool::new();
+        let config = make_dummy_aws_config();
+
+        let id_a = Uuid::new_v4();
+        let id_b = Uuid::new_v4();
+
+        pool.load_endpoints(
+            vec![
+                make_test_endpoint(id_a, "ep-a", false),
+                make_test_endpoint(id_b, "ep-b", false),
+            ],
+            &config,
+        )
+        .await;
+
+        assert_eq!(pool.len().await, 2, "initial load must produce 2 clients");
+
+        // Reload with a completely different endpoint.
+        let id_c = Uuid::new_v4();
+        pool.load_endpoints(vec![make_test_endpoint(id_c, "ep-c", false)], &config)
+            .await;
+
+        assert_eq!(
+            pool.len().await,
+            1,
+            "after reload with 1 endpoint, pool.len() must be 1"
+        );
+        assert!(
+            pool.get_client(id_a).await.is_none(),
+            "old endpoint id_a must not be present after reload"
+        );
+        assert!(
+            pool.get_client(id_b).await.is_none(),
+            "old endpoint id_b must not be present after reload"
+        );
+        assert!(
+            pool.get_client(id_c).await.is_some(),
+            "new endpoint id_c must be present after reload"
+        );
+    }
+
+    /// Calling `load_endpoints` with an empty slice must clear all existing pool
+    /// entries.
+    ///
+    /// Expected to PASS.
+    #[tokio::test]
+    async fn test_load_endpoints_empty_clears_pool() {
+        let pool = EndpointPool::new();
+        let config = make_dummy_aws_config();
+
+        let id1 = Uuid::new_v4();
+        let id2 = Uuid::new_v4();
+
+        pool.load_endpoints(
+            vec![
+                make_test_endpoint(id1, "ep-1", false),
+                make_test_endpoint(id2, "ep-2", false),
+            ],
+            &config,
+        )
+        .await;
+
+        assert_eq!(pool.len().await, 2, "initial load must produce 2 clients");
+
+        // Reload with an empty list — pool must be cleared.
+        pool.load_endpoints(vec![], &config).await;
+
+        assert!(
+            pool.is_empty().await,
+            "pool must be empty after load_endpoints(vec![])"
+        );
+        assert_eq!(
+            pool.len().await,
+            0,
+            "pool.len() must be 0 after load_endpoints(vec![])"
+        );
+    }
+}
