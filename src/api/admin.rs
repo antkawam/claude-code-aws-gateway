@@ -244,19 +244,36 @@ pub async fn update_key(
     let pool = &pool;
 
     // Accept UUID string, null (clear), or absent (keep existing via re-read)
-    let parse_uuid = |v: &Option<serde_json::Value>| -> Option<Option<Uuid>> {
+    #[allow(clippy::result_large_err)]
+    fn parse_uuid(
+        field: &str,
+        v: &Option<serde_json::Value>,
+    ) -> Result<Option<Option<Uuid>>, Response> {
         match v {
-            None => None, // field absent -- caller didn't send it
-            Some(serde_json::Value::Null) => Some(None), // explicit null -- clear
-            Some(serde_json::Value::String(s)) => {
-                s.parse::<Uuid>().ok().map(|id| Some(id))
-            }
-            _ => None,
+            None => Ok(None), // field absent -- caller didn't send it
+            Some(serde_json::Value::Null) => Ok(Some(None)), // explicit null -- clear
+            Some(serde_json::Value::String(s)) => match s.parse::<Uuid>() {
+                Ok(id) => Ok(Some(Some(id))),
+                Err(_) => Err(error_response(
+                    StatusCode::BAD_REQUEST,
+                    &format!("Invalid UUID for {field}"),
+                )),
+            },
+            _ => Err(error_response(
+                StatusCode::BAD_REQUEST,
+                &format!("{field} must be a UUID string or null"),
+            )),
         }
-    };
+    }
 
-    let new_user_id = parse_uuid(&body.user_id);
-    let new_team_id = parse_uuid(&body.team_id);
+    let new_user_id = match parse_uuid("user_id", &body.user_id) {
+        Ok(v) => v,
+        Err(resp) => return resp,
+    };
+    let new_team_id = match parse_uuid("team_id", &body.team_id) {
+        Ok(v) => v,
+        Err(resp) => return resp,
+    };
 
     // Read current values to fill in any absent fields
     let current = sqlx::query_as::<_, (Option<Uuid>, Option<Uuid>)>(
@@ -285,6 +302,14 @@ pub async fn update_key(
         }
         Ok(false) => error_response(StatusCode::NOT_FOUND, "Key not found"),
         Err(e) => {
+            if let Some(sqlx::Error::Database(dbe)) = e.downcast_ref::<sqlx::Error>()
+                && dbe.code().as_deref() == Some("23503")
+            {
+                return error_response(
+                    StatusCode::BAD_REQUEST,
+                    "Referenced user or team does not exist",
+                );
+            }
             tracing::error!(%e, "Failed to update key");
             error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string())
         }

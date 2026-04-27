@@ -87,8 +87,7 @@ impl BudgetPeriod {
                     .unwrap()
             }
             Self::Weekly => {
-                let days_until_next_monday =
-                    7 - now.weekday().num_days_from_monday() as i64;
+                let days_until_next_monday = 7 - now.weekday().num_days_from_monday() as i64;
                 let next_monday = now + Duration::days(days_until_next_monday);
                 Utc.with_ymd_and_hms(
                     next_monday.year(),
@@ -507,5 +506,45 @@ mod tests {
 
         cache.set_user_spend("alice", 42.0).await;
         assert_eq!(cache.get_user_spend("alice").await, Some(42.0));
+    }
+
+    #[test]
+    fn test_period_next_start_daily() {
+        let now = Utc::now();
+        let next = BudgetPeriod::Daily.period_next_start();
+        let tomorrow = now + Duration::days(1);
+        assert_eq!(next.day(), tomorrow.day());
+        assert_eq!(next.month(), tomorrow.month());
+        assert_eq!(next.year(), tomorrow.year());
+        assert_eq!(next.hour(), 0);
+        assert_eq!(next.minute(), 0);
+        assert_eq!(next.second(), 0);
+    }
+
+    #[test]
+    fn test_period_next_start_weekly() {
+        let now = Utc::now();
+        let next = BudgetPeriod::Weekly.period_next_start();
+        assert_eq!(next.weekday(), Weekday::Mon);
+        assert!(next > now, "next Monday start must be strictly after now");
+        assert_eq!(next.hour(), 0);
+        assert_eq!(next.minute(), 0);
+        assert_eq!(next.second(), 0);
+    }
+
+    #[test]
+    fn test_period_next_start_monthly() {
+        let now = Utc::now();
+        let next = BudgetPeriod::Monthly.period_next_start();
+        assert_eq!(next.day(), 1);
+        let expected_month = if now.month() == 12 {
+            1
+        } else {
+            now.month() + 1
+        };
+        assert_eq!(next.month(), expected_month);
+        assert_eq!(next.hour(), 0);
+        assert_eq!(next.minute(), 0);
+        assert_eq!(next.second(), 0);
     }
 }

@@ -38,12 +38,11 @@ pub async fn get_emails_by_ids(
     if ids.is_empty() {
         return Ok(HashMap::new());
     }
-    let rows = sqlx::query_as::<_, (Uuid, String)>(
-        "SELECT id, email FROM users WHERE id = ANY($1)",
-    )
-    .bind(ids)
-    .fetch_all(pool)
-    .await?;
+    let rows =
+        sqlx::query_as::<_, (Uuid, String)>("SELECT id, email FROM users WHERE id = ANY($1)")
+            .bind(ids)
+            .fetch_all(pool)
+            .await?;
     Ok(rows.into_iter().collect())
 }
 

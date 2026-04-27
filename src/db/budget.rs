@@ -202,6 +202,7 @@ pub async fn get_analytics_overview(pool: &PgPool) -> anyhow::Result<Vec<TeamSpe
 /// Get team analytics detail: per-user spend breakdown.
 #[derive(Debug, sqlx::FromRow, Serialize)]
 pub struct UserSpendInTeam {
+    pub user_id: Uuid,
     pub email: String,
     pub spend_limit_monthly_usd: Option<f64>,
     pub budget_period: String,
@@ -215,6 +216,7 @@ pub async fn get_team_analytics(
 ) -> anyhow::Result<Vec<UserSpendInTeam>> {
     let rows = sqlx::query_as::<_, UserSpendInTeam>(
         r#"SELECT
+            u.id as user_id,
             u.email,
             u.spend_limit_monthly_usd,
             u.budget_period,

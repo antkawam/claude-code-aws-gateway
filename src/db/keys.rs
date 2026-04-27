@@ -92,14 +92,12 @@ pub async fn update_key(
     user_id: Option<Uuid>,
     team_id: Option<Uuid>,
 ) -> anyhow::Result<bool> {
-    let result = sqlx::query(
-        "UPDATE virtual_keys SET user_id = $2, team_id = $3 WHERE id = $1",
-    )
-    .bind(key_id)
-    .bind(user_id)
-    .bind(team_id)
-    .execute(pool)
-    .await?;
+    let result = sqlx::query("UPDATE virtual_keys SET user_id = $2, team_id = $3 WHERE id = $1")
+        .bind(key_id)
+        .bind(user_id)
+        .bind(team_id)
+        .execute(pool)
+        .await?;
     if result.rows_affected() > 0 {
         bump_cache_version(pool).await?;
     }

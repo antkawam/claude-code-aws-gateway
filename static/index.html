@@ -3967,7 +3967,7 @@ function renderBudgets() {
   document.getElementById('budgets-empty').style.display = 'none';
 
   document.getElementById('budgets-table').innerHTML = teams.map(t => {
-    const keyCount = (data.keys || []).filter(k => k.team_id === t.team_id && k.is_active).length;
+    const keyCount = (data.keys || []).filter(k => k.team_id === t.team_id && !k.user_id && k.is_active).length;
     const pct = t.budget_amount_usd ? (t.current_spend_usd / t.budget_amount_usd * 100) : 0;
     const barColor = pct >= 100 ? 'var(--red)' : pct >= 80 ? 'var(--yellow)' : 'var(--green)';
     const statusBadge = !t.budget_amount_usd
