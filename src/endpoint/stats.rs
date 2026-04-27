@@ -294,5 +294,50 @@ mod tests {
             "Both error calls within 60 s must be stored in exactly one bucket"
         );
     }
+
+    /// `get_all_stats` on a freshly created `EndpointStats` must return an
+    /// empty HashMap — no entries exist before any recording takes place.
+    ///
+    /// Expected to PASS.
+    #[tokio::test]
+    async fn test_get_all_stats_empty() {
+        let stats = EndpointStats::new();
+
+        let snaps = stats.get_all_stats().await;
+
+        assert!(
+            snaps.is_empty(),
+            "get_all_stats on a new EndpointStats must return an empty map"
+        );
+    }
+
+    /// `cleanup` evicts stale throttle/error buckets but must NOT reset the
+    /// atomic `request_count`. After recording 3 requests and calling `cleanup`,
+    /// the snapshot must still report `request_count == 3`.
+    ///
+    /// Expected to PASS.
+    #[tokio::test]
+    async fn test_cleanup_preserves_request_count() {
+        let stats = EndpointStats::new();
+        let ep_id = Uuid::new_v4();
+
+        stats.record_request(ep_id).await;
+        stats.record_request(ep_id).await;
+        stats.record_request(ep_id).await;
+
+        // Run cleanup — all buckets are recent so nothing is evicted, but the
+        // atomic counter must be unaffected regardless.
+        stats.cleanup().await;
+
+        let snaps = stats.get_all_stats().await;
+        let snap = snaps
+            .get(&ep_id)
+            .expect("entry must exist after recording requests");
+
+        assert_eq!(
+            snap.request_count, 3,
+            "cleanup must not modify the atomic request_count; expected 3"
+        );
+    }
 }
 // #[cfg(test)] block above

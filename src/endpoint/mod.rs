@@ -1645,9 +1645,7 @@ mod tests_slice4 {
             .healthy
             .store(true, Ordering::Relaxed);
 
-        let selected = pool
-            .select_endpoint(&[], None, "primary_fallback")
-            .await;
+        let selected = pool.select_endpoint(&[], None, "primary_fallback").await;
 
         assert!(
             selected.is_some(),
@@ -1747,6 +1745,164 @@ mod tests_slice4 {
             pool.len().await,
             0,
             "pool.len() must be 0 after load_endpoints(vec![])"
+        );
+    }
+}
+
+// ── Slice 5: edge-case tests ──
+
+#[cfg(test)]
+mod tests_slice5 {
+    use super::*;
+    use std::collections::HashSet;
+    use std::sync::atomic::Ordering;
+
+    fn make_test_endpoint(id: Uuid, name: &str, is_default: bool) -> Endpoint {
+        Endpoint {
+            id,
+            name: name.to_string(),
+            role_arn: None,
+            external_id: None,
+            inference_profile_arn: None,
+            region: "us-east-1".to_string(),
+            routing_prefix: "us".to_string(),
+            priority: 0,
+            is_default,
+            enabled: true,
+            created_at: chrono::Utc::now(),
+        }
+    }
+
+    fn make_test_client(ep: Endpoint) -> EndpointClient {
+        let runtime_client = aws_sdk_bedrockruntime::Client::from_conf(
+            aws_sdk_bedrockruntime::Config::builder()
+                .behavior_version(aws_sdk_bedrockruntime::config::BehaviorVersion::latest())
+                .region(aws_config::Region::new("us-east-1"))
+                .build(),
+        );
+        let control_client = aws_sdk_bedrock::Client::from_conf(
+            aws_sdk_bedrock::Config::builder()
+                .behavior_version(aws_sdk_bedrock::config::BehaviorVersion::latest())
+                .region(aws_config::Region::new("us-east-1"))
+                .build(),
+        );
+        let quota_client = aws_sdk_servicequotas::Client::from_conf(
+            aws_sdk_servicequotas::Config::builder()
+                .behavior_version(aws_sdk_servicequotas::config::BehaviorVersion::latest())
+                .region(aws_config::Region::new("us-east-1"))
+                .build(),
+        );
+        EndpointClient {
+            config: ep,
+            runtime_client,
+            control_client,
+            quota_cache: crate::quota::QuotaCache::new(quota_client),
+            healthy: AtomicBool::new(true),
+            last_health_check: AtomicI64::new(0),
+        }
+    }
+
+    async fn insert_client(pool: &EndpointPool, client: EndpointClient) {
+        let mut clients = pool.clients.write().await;
+        clients.insert(client.config.id, Arc::new(client));
+    }
+
+    /// `mark_unhealthy` sets `healthy` to `false`; `mark_healthy` restores it to
+    /// `true`. Both methods operate directly on the `EndpointClient` without
+    /// requiring pool involvement.
+    ///
+    /// Expected to PASS.
+    #[tokio::test]
+    async fn test_mark_healthy_and_unhealthy() {
+        let ep = make_test_endpoint(Uuid::new_v4(), "ep", false);
+        let client = make_test_client(ep);
+
+        // Starts healthy (make_test_client sets healthy = true)
+        assert!(
+            client.healthy.load(Ordering::Relaxed),
+            "client must start healthy"
+        );
+
+        EndpointPool::mark_unhealthy(&client);
+        assert!(
+            !client.healthy.load(Ordering::Relaxed),
+            "mark_unhealthy must set healthy to false"
+        );
+
+        EndpointPool::mark_healthy(&client);
+        assert!(
+            client.healthy.load(Ordering::Relaxed),
+            "mark_healthy must set healthy to true"
+        );
+    }
+
+    /// `get_all_clients` must return all clients currently in the pool.
+    ///
+    /// Expected to PASS.
+    #[tokio::test]
+    async fn test_get_all_clients() {
+        let pool = EndpointPool::new();
+
+        let id1 = Uuid::new_v4();
+        let id2 = Uuid::new_v4();
+        let id3 = Uuid::new_v4();
+
+        for (id, name) in [(id1, "ep-1"), (id2, "ep-2"), (id3, "ep-3")] {
+            let ep = make_test_endpoint(id, name, false);
+            insert_client(&pool, make_test_client(ep)).await;
+        }
+
+        let all = pool.get_all_clients().await;
+
+        assert_eq!(all.len(), 3, "get_all_clients must return all 3 clients");
+
+        let returned_ids: HashSet<Uuid> = all.iter().map(|c| c.config.id).collect();
+        assert!(
+            returned_ids.contains(&id1),
+            "get_all_clients must include id1"
+        );
+        assert!(
+            returned_ids.contains(&id2),
+            "get_all_clients must include id2"
+        );
+        assert!(
+            returned_ids.contains(&id3),
+            "get_all_clients must include id3"
+        );
+    }
+
+    /// An unknown routing strategy must fall through to the `_` arm of the match,
+    /// which behaves identically to `"primary_fallback"`: it returns the first
+    /// healthy+enabled endpoint in team order.
+    ///
+    /// Expected to PASS.
+    #[tokio::test]
+    async fn test_select_endpoint_unknown_strategy_uses_primary_fallback() {
+        let pool = EndpointPool::new();
+        let mut team_eps = Vec::new();
+        let mut ids = Vec::new();
+
+        for i in 0..3 {
+            let id = Uuid::new_v4();
+            ids.push(id);
+            let ep = make_test_endpoint(id, &format!("ep-{i}"), false);
+            team_eps.push(ep.clone());
+            let client = make_test_client(ep);
+            client.healthy.store(true, Ordering::Relaxed);
+            insert_client(&pool, client).await;
+        }
+
+        // Use a strategy name that does not match any known arm
+        let selected = pool
+            .select_endpoint(&team_eps, None, "some_future_strategy")
+            .await
+            .unwrap();
+
+        // The `_` arm is identical to primary_fallback: returns the first healthy+enabled
+        // endpoint in team_endpoints order, which is ids[0].
+        assert_eq!(
+            selected.config.id, ids[0],
+            "unknown strategy must fall through to primary_fallback behavior (first healthy endpoint)"
         );
     }
 }
