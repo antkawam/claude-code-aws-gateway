@@ -21,7 +21,7 @@ test.describe('Team Management', () => {
     await expect(page.locator('#page-budgets')).toContainText(teamName, { timeout: 5_000 });
   });
 
-  test('sets a team budget', async ({ page }) => {
+  test('sets a team budget via Configure modal Budget tab', async ({ page }) => {
     // Create team first
     await page.click('button:has-text("Create Team")');
     const teamName = `budget-team-${Date.now()}`;
@@ -29,22 +29,25 @@ test.describe('Team Management', () => {
     await page.click('#modal-create-team button:has-text("Create Team")');
     await expect(page.locator('#page-budgets')).toContainText(teamName, { timeout: 5_000 });
 
-    // Click budget edit for this team
+    // Open Configure modal for this team
     const teamRow = page.locator(`text=${teamName}`).locator('..');
-    const editBudgetBtn = teamRow.locator('button:has-text("Budget"), button:has-text("Edit"), button:has-text("Set")').first();
-    if (await editBudgetBtn.isVisible()) {
-      await editBudgetBtn.click();
-      await expect(page.locator('#modal-edit-budget')).toBeVisible();
+    const configureBtn = teamRow.locator('button:has-text("Configure")').first();
+    await configureBtn.click();
+    await expect(page.locator('#modal-team-members')).toBeVisible();
 
-      // Set budget amount
-      await page.fill('#mb-amount', '500');
-      await page.click('#modal-edit-budget button:has-text("Save")');
-      // Modal should close
-      await expect(page.locator('#modal-edit-budget')).toBeHidden({ timeout: 5_000 });
-    }
+    // Switch to Budget tab
+    await page.click('#team-tab-budget');
+    await expect(page.locator('#team-panel-budget')).toBeVisible();
+
+    // Set budget amount and save
+    await page.fill('#tb-amount', '500');
+    await page.click('#team-panel-budget button:has-text("Save Budget")');
+
+    // Modal should close after save
+    await expect(page.locator('#modal-team-members')).toBeHidden({ timeout: 5_000 });
   });
 
-  test('opens team members panel', async ({ page }) => {
+  test('opens team members panel via Configure modal', async ({ page }) => {
     // Create team first
     await page.click('button:has-text("Create Team")');
     const teamName = `members-team-${Date.now()}`;
@@ -52,14 +55,55 @@ test.describe('Team Management', () => {
     await page.click('#modal-create-team button:has-text("Create Team")');
     await expect(page.locator('#page-budgets')).toContainText(teamName, { timeout: 5_000 });
 
-    // Click on team name or members button to open members panel
-    const teamLink = page.locator(`text=${teamName}`).first();
-    await teamLink.click();
-    // Members modal or panel should appear
-    const membersPanel = page.locator('#modal-team-members, [class*="team-detail"]').first();
-    if (await membersPanel.isVisible({ timeout: 3_000 }).catch(() => false)) {
-      await expect(membersPanel).toBeVisible();
-    }
+    // Open Configure modal — Members tab is default
+    const teamRow = page.locator(`text=${teamName}`).locator('..');
+    const configureBtn = teamRow.locator('button:has-text("Configure")').first();
+    await configureBtn.click();
+
+    // The consolidated modal uses the same #modal-team-members ID
+    await expect(page.locator('#modal-team-members')).toBeVisible({ timeout: 5_000 });
+
+    // Members tab panel should be visible by default
+    await expect(page.locator('#team-panel-members')).toBeVisible();
+  });
+
+  test('manages team keys via Configure modal', async ({ page }) => {
+    // Create team first
+    await page.click('button:has-text("Create Team")');
+    const teamName = `keys-team-${Date.now()}`;
+    await page.fill('#mt-name', teamName);
+    await page.click('#modal-create-team button:has-text("Create Team")');
+    await expect(page.locator('#page-budgets')).toContainText(teamName, { timeout: 5_000 });
+
+    // Open Configure modal
+    const teamRow = page.locator(`text=${teamName}`).locator('..');
+    const configureBtn = teamRow.locator('button:has-text("Configure")').first();
+    await configureBtn.click();
+    await expect(page.locator('#modal-team-members')).toBeVisible();
+
+    // Switch to Keys tab
+    await page.click('#team-tab-keys');
+    await expect(page.locator('#team-panel-keys')).toBeVisible();
+
+    // Create a team key
+    const keyName = `e2e-key-${Date.now()}`;
+    await page.fill('#tk-name', keyName);
+    await page.click('#team-panel-keys button:has-text("Create Key")');
+
+    // New key banner should appear with the raw key value
+    await expect(page.locator('#tk-new-key-banner')).toBeVisible({ timeout: 5_000 });
+
+    // Key should appear in the table
+    await expect(page.locator('#team-keys-table')).toContainText(keyName, { timeout: 5_000 });
+
+    // Revoke the key
+    const keyRow = page.locator(`#team-keys-table tr`).filter({ hasText: keyName });
+    await keyRow.locator('button:has-text("Revoke")').click();
+
+    // After revoke the row status should reflect inactive or the revoke button disappears
+    await expect(
+      keyRow.locator('button:has-text("Revoke")'),
+    ).toBeHidden({ timeout: 5_000 });
   });
 
   test('deletes a team', async ({ page }) => {

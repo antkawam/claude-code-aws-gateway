@@ -117,6 +117,7 @@ pub fn router(state: Arc<GatewayState>) -> Router {
             "/admin/teams/{team_id}/members/{user_id}",
             delete(admin::remove_team_member),
         )
+        .route("/admin/teams/{team_id}/keys", get(admin::list_team_keys))
         // Admin API — Endpoints
         .route("/admin/endpoints", get(admin::list_endpoints))
         .route("/admin/endpoints", post(admin::create_endpoint))

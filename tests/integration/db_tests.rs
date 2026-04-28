@@ -90,6 +90,95 @@ async fn keys_with_rate_limit() {
 }
 
 // ============================================================
+// Keys: list_keys_for_team
+// ============================================================
+
+#[tokio::test]
+async fn list_keys_for_team_only_returns_matching_team() {
+    let pool = helpers::setup_test_db().await;
+    let team_a = helpers::create_test_team(&pool, "team-a").await;
+    let team_b = helpers::create_test_team(&pool, "team-b").await;
+
+    let (_, k_a1) = helpers::create_test_key(&pool, Some("a-key-1"), None, Some(team_a.id)).await;
+    let (_, k_a2) = helpers::create_test_key(&pool, Some("a-key-2"), None, Some(team_a.id)).await;
+    let (_, _k_b) = helpers::create_test_key(&pool, Some("b-key"), None, Some(team_b.id)).await;
+    // global key with no team
+    helpers::create_test_key(&pool, Some("global-key"), None, None).await;
+
+    let team_a_keys = db::keys::list_keys_for_team(&pool, team_a.id)
+        .await
+        .unwrap();
+    assert_eq!(team_a_keys.len(), 2);
+    let ids: Vec<_> = team_a_keys.iter().map(|k| k.id).collect();
+    assert!(ids.contains(&k_a1.id));
+    assert!(ids.contains(&k_a2.id));
+
+    let team_b_keys = db::keys::list_keys_for_team(&pool, team_b.id)
+        .await
+        .unwrap();
+    assert_eq!(team_b_keys.len(), 1);
+    assert_eq!(team_b_keys[0].name.as_deref(), Some("b-key"));
+}
+
+#[tokio::test]
+async fn list_keys_for_team_includes_team_only_and_user_scoped_keys() {
+    let pool = helpers::setup_test_db().await;
+    let team = helpers::create_test_team(&pool, "mixed-team").await;
+    let user = helpers::create_test_user(&pool, "member@test.com", Some(team.id), "member").await;
+
+    // team-only key (user_id = NULL)
+    let (_, team_key) =
+        helpers::create_test_key(&pool, Some("team-only"), None, Some(team.id)).await;
+    // user-scoped key (user_id = user.id)
+    let (_, user_key) =
+        helpers::create_test_key(&pool, Some("user-scoped"), Some(user.id), Some(team.id)).await;
+
+    let keys = db::keys::list_keys_for_team(&pool, team.id).await.unwrap();
+    assert_eq!(keys.len(), 2);
+
+    let ids: Vec<_> = keys.iter().map(|k| k.id).collect();
+    assert!(ids.contains(&team_key.id));
+    assert!(ids.contains(&user_key.id));
+
+    let found_team_only = keys.iter().find(|k| k.id == team_key.id).unwrap();
+    assert!(found_team_only.user_id.is_none());
+
+    let found_user_scoped = keys.iter().find(|k| k.id == user_key.id).unwrap();
+    assert_eq!(found_user_scoped.user_id, Some(user.id));
+}
+
+#[tokio::test]
+async fn list_keys_for_team_empty_for_team_with_no_keys() {
+    let pool = helpers::setup_test_db().await;
+    let team = helpers::create_test_team(&pool, "empty-team").await;
+    // Create a key for a different team to make sure isolation works
+    let other_team = helpers::create_test_team(&pool, "other-team").await;
+    helpers::create_test_key(&pool, Some("other-key"), None, Some(other_team.id)).await;
+
+    let keys = db::keys::list_keys_for_team(&pool, team.id).await.unwrap();
+    assert!(keys.is_empty());
+}
+
+#[tokio::test]
+async fn list_keys_for_team_ordered_by_created_at_desc() {
+    let pool = helpers::setup_test_db().await;
+    let team = helpers::create_test_team(&pool, "ordered-team").await;
+
+    // Insert three keys sequentially; DB timestamps will be in insertion order
+    let (_, k1) = helpers::create_test_key(&pool, Some("first"), None, Some(team.id)).await;
+    let (_, k2) = helpers::create_test_key(&pool, Some("second"), None, Some(team.id)).await;
+    let (_, k3) = helpers::create_test_key(&pool, Some("third"), None, Some(team.id)).await;
+
+    let keys = db::keys::list_keys_for_team(&pool, team.id).await.unwrap();
+    assert_eq!(keys.len(), 3);
+
+    // DESC order: most recently created first
+    assert_eq!(keys[0].id, k3.id);
+    assert_eq!(keys[1].id, k2.id);
+    assert_eq!(keys[2].id, k1.id);
+}
+
+// ============================================================
 // Users
 // ============================================================
 
