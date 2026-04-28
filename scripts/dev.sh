@@ -196,6 +196,8 @@ else
     export PROXY_PORT
 fi
 
+export SQLX_OFFLINE=true
+
 echo ""
 echo "Starting gateway..."
 echo "  Database: ${DATABASE_URL}"
