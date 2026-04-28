@@ -42,8 +42,8 @@ test.describe('Team Management', () => {
     await page.fill('#tb-amount', '500');
     await page.click('#team-panel-budget button:has-text("Save Budget")');
 
-    // Modal should close after save
-    await expect(page.locator('#modal-team-members')).toBeHidden({ timeout: 5_000 });
+    // Success toast should appear
+    await expect(page.locator('.toast, [class*="toast"]')).toContainText('Budget updated', { timeout: 5_000 });
   });
 
   test('opens team members panel via Configure modal', async ({ page }) => {
