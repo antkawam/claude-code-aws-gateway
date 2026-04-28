@@ -30,9 +30,8 @@ test.describe('Team Management', () => {
     await expect(page.locator('#page-budgets')).toContainText(teamName, { timeout: 5_000 });
 
     // Open Configure modal for this team
-    const teamRow = page.locator(`text=${teamName}`).locator('..');
-    const configureBtn = teamRow.locator('button:has-text("Configure")').first();
-    await configureBtn.click();
+    const teamRow = page.locator('#budgets-table tr').filter({ hasText: teamName });
+    await teamRow.locator('button:has-text("Configure")').click();
     await expect(page.locator('#modal-team-members')).toBeVisible();
 
     // Switch to Budget tab
@@ -56,9 +55,8 @@ test.describe('Team Management', () => {
     await expect(page.locator('#page-budgets')).toContainText(teamName, { timeout: 5_000 });
 
     // Open Configure modal — Members tab is default
-    const teamRow = page.locator(`text=${teamName}`).locator('..');
-    const configureBtn = teamRow.locator('button:has-text("Configure")').first();
-    await configureBtn.click();
+    const teamRow = page.locator('#budgets-table tr').filter({ hasText: teamName });
+    await teamRow.locator('button:has-text("Configure")').click();
 
     // The consolidated modal uses the same #modal-team-members ID
     await expect(page.locator('#modal-team-members')).toBeVisible({ timeout: 5_000 });
@@ -76,9 +74,8 @@ test.describe('Team Management', () => {
     await expect(page.locator('#page-budgets')).toContainText(teamName, { timeout: 5_000 });
 
     // Open Configure modal
-    const teamRow = page.locator(`text=${teamName}`).locator('..');
-    const configureBtn = teamRow.locator('button:has-text("Configure")').first();
-    await configureBtn.click();
+    const teamRow = page.locator('#budgets-table tr').filter({ hasText: teamName });
+    await teamRow.locator('button:has-text("Configure")').click();
     await expect(page.locator('#modal-team-members')).toBeVisible();
 
     // Switch to Keys tab
@@ -96,7 +93,8 @@ test.describe('Team Management', () => {
     // Key should appear in the table
     await expect(page.locator('#team-keys-table')).toContainText(keyName, { timeout: 5_000 });
 
-    // Revoke the key
+    // Revoke the key (accept the confirm dialog)
+    page.once('dialog', dialog => dialog.accept());
     const keyRow = page.locator(`#team-keys-table tr`).filter({ hasText: keyName });
     await keyRow.locator('button:has-text("Revoke")').click();
 
@@ -115,7 +113,7 @@ test.describe('Team Management', () => {
     await expect(page.locator('#page-budgets')).toContainText(teamName, { timeout: 5_000 });
 
     // Find and click delete button for this team
-    const teamRow = page.locator(`text=${teamName}`).locator('..');
+    const teamRow = page.locator('#budgets-table tr').filter({ hasText: teamName });
     const deleteBtn = teamRow.locator('button:has-text("Delete"), button[title*="delete"], button[title*="Delete"]').first();
     if (await deleteBtn.isVisible()) {
       await deleteBtn.click();
