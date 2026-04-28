@@ -4514,7 +4514,7 @@ function setPolicyFromRules(policy, prefix) {
   prefix = prefix || 'mb';
   const list = document.getElementById(prefix + '-custom-rules-list');
   list.innerHTML = '';
-  if (!policy || !Array.isArray(policy)) {
+  if (!policy || !Array.isArray(policy) || policy.length === 0) {
     document.getElementById(prefix + '-policy').value = 'standard';
     document.getElementById(prefix + '-custom-group').style.display = 'none';
     return;

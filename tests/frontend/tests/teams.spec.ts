@@ -43,7 +43,7 @@ test.describe('Team Management', () => {
     await page.click('#team-panel-budget button:has-text("Save Budget")');
 
     // Success toast should appear
-    await expect(page.locator('.toast, [class*="toast"]')).toContainText('Budget updated', { timeout: 5_000 });
+    await expect(page.locator('#toast-container')).toContainText('Budget updated', { timeout: 5_000 });
   });
 
   test('opens team members panel via Configure modal', async ({ page }) => {
