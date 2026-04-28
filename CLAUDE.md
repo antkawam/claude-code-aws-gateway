@@ -11,7 +11,10 @@ make lint                # Format check + clippy
 make test-integration    # Integration tests (needs Docker)
 make check               # All of the above (what CI runs)
 make test-e2e            # E2E HTTP tests (needs AWS credentials)
-make dev                 # Start Postgres, then cargo run
+make dev                 # Start Postgres + gateway (auto-detects free ports)
+make dev-seed            # Start with mock analytics data
+make dev-reset           # Wipe Postgres and start fresh
+make dev-down            # Stop local dev environment
 ```
 
 ## Project Structure

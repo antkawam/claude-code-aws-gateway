@@ -1,4 +1,4 @@
-.PHONY: test lint fmt test-integration test-e2e test-frontend test-load test-load-constrained coverage check build help
+.PHONY: test lint fmt test-integration test-e2e test-frontend test-load test-load-constrained coverage check build help dev dev-reset dev-seed dev-down
 
 help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-20s\033[0m %s\n", $$1, $$2}'
@@ -122,10 +122,13 @@ test-load-constrained: ## Run k6 stress test with Fargate/RDS resource constrain
 		exit $$status
 
 dev: ## Start local dev environment (Postgres + gateway)
-	docker compose up -d postgres
-	@PG_PORT=$${POSTGRES_PORT:-5432}; \
-	echo "Postgres running on port $${PG_PORT}. Start the gateway with:"; \
-	echo "  DATABASE_URL=postgres://proxy:devpass@127.0.0.1:$${PG_PORT}/proxy cargo run"
+	scripts/dev.sh $(ARGS)
+
+dev-reset: ## Wipe Postgres and start fresh
+	scripts/dev.sh --reset
+
+dev-seed: ## Start dev environment with mock analytics data
+	scripts/dev.sh --seed
 
 dev-down: ## Stop local dev environment
-	docker compose down
+	scripts/dev.sh stop
