@@ -3761,6 +3761,39 @@ pub async fn list_team_members(
     }
 }
 
+pub async fn list_team_keys(
+    State(state): State<Arc<GatewayState>>,
+    headers: HeaderMap,
+    Path(team_id): Path<Uuid>,
+) -> Response {
+    if let Err(resp) = check_admin_auth(&headers, &state).await {
+        return resp;
+    }
+    let pool = state.db().await;
+    match db::keys::list_keys_for_team(&pool, team_id).await {
+        Ok(keys) => {
+            let keys_json: Vec<_> = keys
+                .iter()
+                .map(|k| {
+                    json!({
+                        "id": k.id,
+                        "prefix": k.key_prefix,
+                        "name": k.name,
+                        "user_id": k.user_id,
+                        "team_id": k.team_id,
+                        "is_active": k.is_active,
+                        "rate_limit_rpm": k.rate_limit_rpm,
+                        "created_at": k.created_at,
+                        "expires_at": k.expires_at,
+                    })
+                })
+                .collect();
+            Json(json!({ "keys": keys_json })).into_response()
+        }
+        Err(e) => admin_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    }
+}
+
 /// POST /admin/teams/{team_id}/members — Add a member to a team
 pub async fn add_team_member(
     State(state): State<Arc<GatewayState>>,
