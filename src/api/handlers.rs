@@ -123,7 +123,7 @@ pub async fn health(State(state): State<Arc<GatewayState>>) -> Response {
     let code = StatusCode::OK;
     (
         code,
-        Json(serde_json::json!({ "status": status, "db": db_ok })),
+        Json(serde_json::json!({ "status": status, "db": db_ok, "version": env!("CARGO_PKG_VERSION") })),
     )
         .into_response()
 }
