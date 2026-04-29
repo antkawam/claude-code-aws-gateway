@@ -3072,7 +3072,7 @@ pub async fn get_health_status(
     };
 
     Json(json!({
-        "gateway": { "status": gateway_status, "uptime_seconds": uptime_seconds },
+        "gateway": { "status": gateway_status, "uptime_seconds": uptime_seconds, "version": env!("CARGO_PKG_VERSION") },
         "database": { "status": db_status, "pool_size": db_pool_size, "pool_idle": db_pool_idle },
         "bedrock": { "status": bedrock_status, "last_check": bedrock_last_check },
         "endpoints": endpoints,
