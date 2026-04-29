@@ -101,6 +101,13 @@ When `DATABASE_HOST` is set, the gateway constructs the connection string from t
 |---|---|---|
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | _(none)_ | OTLP gRPC endpoint for exporting metrics (e.g., `http://otel-collector:4317`). When set, all metric instruments are exported via gRPC every 60 seconds alongside the Prometheus scrape endpoint. See `docs/metrics.md` for the full metric list. |
 
+### Pricing
+
+| Variable | Default | Description |
+|---|---|---|
+| `PRICING_REFRESH_INTERVAL` | `86400` | Seconds between automatic refreshes of model pricing from the AWS Price List API (default 86400 = 24 hours). |
+| `PRICING_REFRESH_ENABLED` | `true` | Set to `false` or `0` to disable the automatic pricing refresh background loop. Useful when AWS credentials lack Pricing API access or for air-gapped environments. |
+
 ### Infrastructure Alarms
 
 CloudWatch Alarms for infrastructure monitoring (ALB 5xx errors, unhealthy targets, RDS CPU/storage) are configured in the CDK stack. Alarms route to an SNS topic (`AlarmTopicArn`, available as a CDK output). Subscribe after deployment:

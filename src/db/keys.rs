@@ -62,6 +62,16 @@ pub async fn list_keys(pool: &PgPool) -> anyhow::Result<Vec<VirtualKey>> {
     Ok(keys)
 }
 
+pub async fn list_keys_for_team(pool: &PgPool, team_id: Uuid) -> anyhow::Result<Vec<VirtualKey>> {
+    let keys = sqlx::query_as::<_, VirtualKey>(
+        "SELECT * FROM virtual_keys WHERE team_id = $1 ORDER BY created_at DESC",
+    )
+    .bind(team_id)
+    .fetch_all(pool)
+    .await?;
+    Ok(keys)
+}
+
 pub async fn get_active_keys(pool: &PgPool) -> anyhow::Result<Vec<VirtualKey>> {
     let keys = sqlx::query_as::<_, VirtualKey>(
         "SELECT v.* FROM virtual_keys v \
@@ -86,6 +96,24 @@ pub async fn revoke_key(pool: &PgPool, key_id: Uuid) -> anyhow::Result<bool> {
     Ok(result.rows_affected() > 0)
 }
 
+pub async fn update_key(
+    pool: &PgPool,
+    key_id: Uuid,
+    user_id: Option<Uuid>,
+    team_id: Option<Uuid>,
+) -> anyhow::Result<bool> {
+    let result = sqlx::query("UPDATE virtual_keys SET user_id = $2, team_id = $3 WHERE id = $1")
+        .bind(key_id)
+        .bind(user_id)
+        .bind(team_id)
+        .execute(pool)
+        .await?;
+    if result.rows_affected() > 0 {
+        bump_cache_version(pool).await?;
+    }
+    Ok(result.rows_affected() > 0)
+}
+
 pub async fn delete_key(pool: &PgPool, key_id: Uuid) -> anyhow::Result<bool> {
     let result = sqlx::query("DELETE FROM virtual_keys WHERE id = $1")
         .bind(key_id)
@@ -95,4 +123,73 @@ pub async fn delete_key(pool: &PgPool, key_id: Uuid) -> anyhow::Result<bool> {
         bump_cache_version(pool).await?;
     }
     Ok(result.rows_affected() > 0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_hash_key_deterministic() {
+        let h1 = hash_key("sk-proxy-abc123");
+        let h2 = hash_key("sk-proxy-abc123");
+        assert_eq!(h1, h2);
+    }
+
+    #[test]
+    fn test_hash_key_different_inputs() {
+        let h1 = hash_key("sk-proxy-abc123");
+        let h2 = hash_key("sk-proxy-xyz789");
+        assert_ne!(h1, h2);
+    }
+
+    #[test]
+    fn test_hash_key_hex_output() {
+        let h = hash_key("test");
+        assert!(h.chars().all(|c| c.is_ascii_hexdigit()));
+        assert_eq!(h.len(), 64); // SHA-256 = 32 bytes = 64 hex chars
+    }
+
+    #[test]
+    fn test_generate_key_format() {
+        let key = generate_key();
+        assert!(key.starts_with("sk-proxy-"));
+        assert!(key.len() > 16);
+    }
+
+    #[test]
+    fn test_generate_key_unique() {
+        let k1 = generate_key();
+        let k2 = generate_key();
+        assert_ne!(k1, k2);
+    }
+
+    #[test]
+    fn test_key_prefix_long_key() {
+        let key = "sk-proxy-abcdefghijklmnopqrstuvwxyz";
+        let prefix = key_prefix(key);
+        assert_eq!(prefix, "sk-proxy-abcdefg...");
+        assert_eq!(prefix.len(), 19); // 16 chars + "..."
+    }
+
+    #[test]
+    fn test_key_prefix_short_key() {
+        let key = "short";
+        let prefix = key_prefix(key);
+        assert_eq!(prefix, "short");
+    }
+
+    #[test]
+    fn test_key_prefix_exactly_16_chars() {
+        let key = "1234567890123456";
+        let prefix = key_prefix(key);
+        assert_eq!(prefix, "1234567890123456");
+    }
+
+    #[test]
+    fn test_key_prefix_17_chars_gets_truncated() {
+        let key = "12345678901234567";
+        let prefix = key_prefix(key);
+        assert_eq!(prefix, "1234567890123456...");
+    }
 }

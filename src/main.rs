@@ -3,7 +3,7 @@ use ccag::auth;
 use ccag::budget;
 use ccag::config;
 use ccag::db;
-
+use ccag::pricing;
 use ccag::proxy;
 use ccag::ratelimit;
 use ccag::spend;
@@ -51,6 +51,14 @@ async fn main() -> anyhow::Result<()> {
     let service_quotas_client = aws_sdk_servicequotas::Client::new(&aws_config);
     let quota_cache = Arc::new(ccag::quota::QuotaCache::new(service_quotas_client));
     let model_cache = translate::models::ModelCache::new();
+
+    // Pricing API is only available in us-east-1 (and ap-south-1).
+    // Pin to us-east-1 regardless of gateway region.
+    let pricing_aws_config = aws_config::from_env()
+        .region(aws_config::Region::new("us-east-1"))
+        .load()
+        .await;
+    let pricing_client = Arc::new(aws_sdk_pricing::Client::new(&pricing_aws_config));
 
     // Startup probe: verify Bedrock connectivity (non-blocking)
     {
@@ -196,6 +204,10 @@ async fn main() -> anyhow::Result<()> {
     let iam_db_name = config.database_name.clone();
     let iam_db_user = config.database_user.clone();
 
+    // Save pricing refresh config before config is moved into state
+    let pricing_refresh_enabled = config.pricing_refresh_enabled;
+    let pricing_refresh_interval = config.pricing_refresh_interval;
+
     // Load IDPs into validator
     let idp_count = idp_configs.len();
     idp_validator.load_idps(idp_configs).await;
@@ -244,6 +256,7 @@ async fn main() -> anyhow::Result<()> {
         aws_config: aws_config.clone(),
         started_at: std::time::Instant::now(),
         login_attempts: tokio::sync::Mutex::new(Vec::new()),
+        pricing_client: Arc::clone(&pricing_client),
     });
 
     // Load endpoints into pool
@@ -413,6 +426,51 @@ async fn main() -> anyhow::Result<()> {
             .await;
         });
         tracing::info!("Budget notification delivery loop started");
+    }
+
+    // Start pricing refresh loop (daily by default; runs once on startup then on interval)
+    if pricing_refresh_enabled {
+        let pricing_pool = state.db_pool.clone();
+        let pricing_http = state.http_client.clone();
+        let pricing_client_bg = Arc::clone(&state.pricing_client);
+        tokio::spawn(async move {
+            // Run once on startup (best-effort — log errors, do not panic)
+            {
+                let pool = pricing_pool.read().await.clone();
+                match pricing::refresh_pricing(&pool, &pricing_client_bg, &pricing_http).await {
+                    Ok(report) => tracing::info!(
+                        updated = report.updated,
+                        skipped_manual = report.skipped_manual,
+                        errors = report.errors.len(),
+                        "Startup pricing refresh complete"
+                    ),
+                    Err(e) => tracing::warn!(%e, "Startup pricing refresh failed"),
+                }
+            }
+
+            let mut interval =
+                tokio::time::interval(std::time::Duration::from_secs(pricing_refresh_interval));
+            interval.tick().await; // skip the first tick (already ran above)
+            loop {
+                interval.tick().await;
+                let pool = pricing_pool.read().await.clone();
+                match pricing::refresh_pricing(&pool, &pricing_client_bg, &pricing_http).await {
+                    Ok(report) => tracing::info!(
+                        updated = report.updated,
+                        skipped_manual = report.skipped_manual,
+                        errors = report.errors.len(),
+                        "Scheduled pricing refresh complete"
+                    ),
+                    Err(e) => tracing::warn!(%e, "Scheduled pricing refresh failed"),
+                }
+            }
+        });
+        tracing::info!(
+            interval_secs = pricing_refresh_interval,
+            "Pricing refresh loop started"
+        );
+    } else {
+        tracing::info!("Pricing refresh disabled (PRICING_REFRESH_ENABLED=false)");
     }
 
     let app = api::router(state);

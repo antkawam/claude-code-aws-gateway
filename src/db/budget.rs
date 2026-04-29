@@ -162,6 +162,7 @@ pub struct TeamSpendSummary {
     pub team_name: String,
     pub budget_amount_usd: Option<f64>,
     pub budget_period: String,
+    pub default_user_budget_usd: Option<f64>,
     pub current_spend_usd: Option<f64>,
     pub user_count: Option<i64>,
 }
@@ -173,6 +174,7 @@ pub async fn get_analytics_overview(pool: &PgPool) -> anyhow::Result<Vec<TeamSpe
             t.name as team_name,
             t.budget_amount_usd,
             t.budget_period,
+            t.default_user_budget_usd,
             COALESCE(
                 SUM(estimate_cost_usd(sl.model, sl.input_tokens, sl.output_tokens, sl.cache_read_tokens, sl.cache_write_tokens)),
                 0
@@ -189,7 +191,7 @@ pub async fn get_analytics_overview(pool: &PgPool) -> anyhow::Result<Vec<TeamSpe
                 END,
                 now() AT TIME ZONE 'UTC'
             )
-        GROUP BY t.id, t.name, t.budget_amount_usd, t.budget_period
+        GROUP BY t.id, t.name, t.budget_amount_usd, t.budget_period, t.default_user_budget_usd
         ORDER BY current_spend_usd DESC NULLS LAST"#,
     )
     .fetch_all(pool)
@@ -200,6 +202,7 @@ pub async fn get_analytics_overview(pool: &PgPool) -> anyhow::Result<Vec<TeamSpe
 /// Get team analytics detail: per-user spend breakdown.
 #[derive(Debug, sqlx::FromRow, Serialize)]
 pub struct UserSpendInTeam {
+    pub user_id: Uuid,
     pub email: String,
     pub spend_limit_monthly_usd: Option<f64>,
     pub budget_period: String,
@@ -213,6 +216,7 @@ pub async fn get_team_analytics(
 ) -> anyhow::Result<Vec<UserSpendInTeam>> {
     let rows = sqlx::query_as::<_, UserSpendInTeam>(
         r#"SELECT
+            u.id as user_id,
             u.email,
             u.spend_limit_monthly_usd,
             u.budget_period,

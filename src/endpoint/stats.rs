@@ -190,4 +190,154 @@ mod tests {
         assert_eq!(snaps.get(&ep1).unwrap().request_count, 1);
         assert_eq!(snaps.get(&ep2).unwrap().request_count, 2);
     }
+
+    /// Two `record_throttle` calls made within the same 60-second window must
+    /// be aggregated into a single bucket. The snapshot must report
+    /// `throttle_count_1h == 2` (sum of both increments in the one bucket),
+    /// confirming that the bucket accumulates rather than creating a second entry.
+    ///
+    /// Expected to PASS.
+    #[tokio::test]
+    async fn test_throttle_same_bucket_aggregates() {
+        let stats = EndpointStats::new();
+        let ep_id = Uuid::new_v4();
+
+        // Both calls happen within milliseconds of each other — well within the
+        // 60-second BUCKET_WINDOW_SECS threshold — so they must land in the same bucket.
+        stats.record_throttle(ep_id).await;
+        stats.record_throttle(ep_id).await;
+
+        let snaps = stats.get_all_stats().await;
+        let snap = snaps.get(&ep_id).unwrap();
+
+        // The 1-hour sum must reflect both increments.
+        assert_eq!(
+            snap.throttle_count_1h, 2,
+            "Two throttle calls within the same bucket window must aggregate to a count of 2"
+        );
+
+        // Verify there is exactly one bucket by reading the internal map directly.
+        // A count of 2 from a single `get_all_stats` call is only possible when both
+        // increments are in the same bucket (i.e., not two separate buckets each
+        // contributing 1). We confirm this by checking the raw bucket vec length.
+        //
+        // `inner` is accessible here because this test lives in the same module
+        // (`#[cfg(test)] mod tests` inside stats.rs).
+        let map = stats.inner.read().await;
+        let counters = map.get(&ep_id).unwrap();
+        assert_eq!(
+            counters.throttle_buckets.len(),
+            1,
+            "Both throttle calls within 60 s must be stored in exactly one bucket"
+        );
+    }
+
+    /// Calling `record_request` for a brand-new endpoint ID must create a fresh
+    /// entry with `request_count == 1` and zeroed throttle/error counters.
+    ///
+    /// Expected to PASS.
+    #[tokio::test]
+    async fn test_record_request_creates_entry_for_new_endpoint() {
+        let stats = EndpointStats::new();
+        let ep_id = Uuid::new_v4();
+
+        stats.record_request(ep_id).await;
+
+        let snaps = stats.get_all_stats().await;
+        let snap = snaps
+            .get(&ep_id)
+            .expect("get_all_stats must contain an entry after record_request");
+
+        assert_eq!(
+            snap.request_count, 1,
+            "request_count must be 1 after a single record_request call"
+        );
+        assert_eq!(
+            snap.throttle_count_1h, 0,
+            "throttle_count_1h must be 0 for a freshly created entry"
+        );
+        assert_eq!(
+            snap.error_count_1h, 0,
+            "error_count_1h must be 0 for a freshly created entry"
+        );
+    }
+
+    /// Two `record_error` calls within the same 60-second bucket window must
+    /// aggregate into a single bucket, yielding `error_count_1h == 2`.
+    ///
+    /// Expected to PASS.
+    #[tokio::test]
+    async fn test_error_same_bucket_aggregates() {
+        let stats = EndpointStats::new();
+        let ep_id = Uuid::new_v4();
+
+        // Both calls happen within milliseconds — well inside the 60-second window.
+        stats.record_error(ep_id).await;
+        stats.record_error(ep_id).await;
+
+        let snaps = stats.get_all_stats().await;
+        let snap = snaps
+            .get(&ep_id)
+            .expect("get_all_stats must contain an entry after record_error");
+
+        assert_eq!(
+            snap.error_count_1h, 2,
+            "Two error calls within the same bucket window must sum to error_count_1h == 2"
+        );
+
+        // Verify the two increments landed in exactly one bucket.
+        let map = stats.inner.read().await;
+        let counters = map.get(&ep_id).unwrap();
+        assert_eq!(
+            counters.error_buckets.len(),
+            1,
+            "Both error calls within 60 s must be stored in exactly one bucket"
+        );
+    }
+
+    /// `get_all_stats` on a freshly created `EndpointStats` must return an
+    /// empty HashMap — no entries exist before any recording takes place.
+    ///
+    /// Expected to PASS.
+    #[tokio::test]
+    async fn test_get_all_stats_empty() {
+        let stats = EndpointStats::new();
+
+        let snaps = stats.get_all_stats().await;
+
+        assert!(
+            snaps.is_empty(),
+            "get_all_stats on a new EndpointStats must return an empty map"
+        );
+    }
+
+    /// `cleanup` evicts stale throttle/error buckets but must NOT reset the
+    /// atomic `request_count`. After recording 3 requests and calling `cleanup`,
+    /// the snapshot must still report `request_count == 3`.
+    ///
+    /// Expected to PASS.
+    #[tokio::test]
+    async fn test_cleanup_preserves_request_count() {
+        let stats = EndpointStats::new();
+        let ep_id = Uuid::new_v4();
+
+        stats.record_request(ep_id).await;
+        stats.record_request(ep_id).await;
+        stats.record_request(ep_id).await;
+
+        // Run cleanup — all buckets are recent so nothing is evicted, but the
+        // atomic counter must be unaffected regardless.
+        stats.cleanup().await;
+
+        let snaps = stats.get_all_stats().await;
+        let snap = snaps
+            .get(&ep_id)
+            .expect("entry must exist after recording requests");
+
+        assert_eq!(
+            snap.request_count, 3,
+            "cleanup must not modify the atomic request_count; expected 3"
+        );
+    }
 }
+// #[cfg(test)] block above

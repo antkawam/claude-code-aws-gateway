@@ -14,6 +14,7 @@ pub struct CachedKey {
     pub id: Uuid,
     pub name: Option<String>,
     pub user_id: Option<Uuid>,
+    pub user_email: Option<String>,
     pub team_id: Option<Uuid>,
     pub rate_limit_rpm: Option<i32>,
 }
@@ -42,6 +43,8 @@ impl KeyCache {
     pub async fn load_from_db(&self, pool: &sqlx::PgPool) -> anyhow::Result<usize> {
         let keys = db::keys::get_active_keys(pool).await?;
         let count = keys.len();
+        let user_ids: Vec<Uuid> = keys.iter().filter_map(|k| k.user_id).collect();
+        let email_map = db::users::get_emails_by_ids(pool, &user_ids).await?;
         let mut map = self.inner.write().await;
         map.clear();
         for key in keys {
@@ -51,6 +54,7 @@ impl KeyCache {
                     id: key.id,
                     name: key.name,
                     user_id: key.user_id,
+                    user_email: key.user_id.and_then(|id| email_map.get(&id).cloned()),
                     team_id: key.team_id,
                     rate_limit_rpm: key.rate_limit_rpm,
                 },
@@ -108,6 +112,7 @@ mod tests {
                     id,
                     name: None,
                     user_id: None,
+                    user_email: None,
                     team_id: None,
                     rate_limit_rpm: None,
                 },
@@ -140,6 +145,7 @@ mod tests {
                     id,
                     name: Some("test-key".to_string()),
                     user_id: Some(user_id),
+                    user_email: None,
                     team_id: Some(team_id),
                     rate_limit_rpm: Some(100),
                 },
@@ -168,6 +174,7 @@ mod tests {
                         id: ids[i],
                         name: Some(format!("key-{}", i)),
                         user_id: None,
+                        user_email: None,
                         team_id: None,
                         rate_limit_rpm: None,
                     },
@@ -200,6 +207,7 @@ mod tests {
                         id: Uuid::new_v4(),
                         name: None,
                         user_id: None,
+                        user_email: None,
                         team_id: None,
                         rate_limit_rpm: None,
                     },

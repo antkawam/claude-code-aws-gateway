@@ -5,7 +5,7 @@ pub mod config;
 pub mod db;
 pub mod detection;
 pub mod endpoint;
-
+pub mod pricing;
 pub mod proxy;
 pub mod quota;
 pub mod ratelimit;

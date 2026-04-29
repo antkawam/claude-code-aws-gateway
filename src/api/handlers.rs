@@ -300,7 +300,7 @@ pub async fn messages(
     let identity = match &auth_result {
         AuthResult::VirtualKey(k) => AuthIdentity {
             key_id: Some(k.id),
-            user_identity: k.name.clone(),
+            user_identity: k.user_email.clone().or_else(|| k.name.clone()),
             user_id: k.user_id,
         },
         AuthResult::Oidc(id) => {
@@ -317,9 +317,22 @@ pub async fn messages(
         }
     };
 
-    // Budget check for OIDC users (replaces old spend limit check)
-    let budget_status = if let AuthResult::Oidc(ref oidc) = auth_result {
-        match check_budget(&state, oidc.user_id()).await {
+    // Resolve budget identity: OIDC email, or virtual key's assigned user email
+    let budget_identity = match &auth_result {
+        AuthResult::Oidc(oidc) => Some(oidc.user_id().to_string()),
+        AuthResult::VirtualKey(key) => key.user_email.clone(),
+    };
+
+    let budget_status = if let Some(ref identity) = budget_identity {
+        match check_budget(&state, identity).await {
+            Ok(status) => status,
+            Err(resp) => return resp,
+        }
+    } else if let AuthResult::VirtualKey(ref key) = auth_result
+        && let Some(team_id) = key.team_id
+    {
+        // Key assigned to a team but no user -- check team budget only
+        match check_team_budget_only(&state, team_id).await {
             Ok(status) => status,
             Err(resp) => return resp,
         }
@@ -1044,7 +1057,12 @@ async fn handle_non_streaming(
             state
                 .metrics
                 .record_error("bedrock_invoke", ep_str.as_deref());
-            let (status, message, is_throttle) = map_bedrock_error(&e);
+            let model_prefix = bedrock_model
+                .find('.')
+                .map(|i| &bedrock_model[..i])
+                .unwrap_or(bedrock_model);
+            let (status, message, is_throttle) =
+                map_bedrock_error(&e, Some((original_model, model_prefix)));
             if is_throttle {
                 state
                     .metrics
@@ -1230,7 +1248,13 @@ async fn handle_streaming(
             state
                 .metrics
                 .record_error("bedrock_stream", ep_str.as_deref());
-            let (status, message, is_throttle) = map_bedrock_error(&e);
+            let (status, message, is_throttle) = {
+                let model_prefix = bedrock_model
+                    .find('.')
+                    .map(|i| &bedrock_model[..i])
+                    .unwrap_or(bedrock_model);
+                map_bedrock_error(&e, Some((original_model, model_prefix)))
+            };
             if is_throttle {
                 state
                     .metrics
@@ -1348,7 +1372,7 @@ async fn handle_with_web_search(
             },
             Err(e) => {
                 tracing::error!(%e, "Bedrock call failed (web search loop)");
-                let (status, message, is_throttle) = map_bedrock_error(&e);
+                let (status, message, is_throttle) = map_bedrock_error(&e, None);
                 if is_throttle {
                     state.metrics.record_bedrock_throttle(
                         original_model,
@@ -1770,6 +1794,8 @@ async fn check_budget(
     };
 
     // Evaluate team budget (if set)
+    // Hoist team values so we can use them in the block response if team is the binding constraint.
+    let mut team_binding: Option<(f64, f64, BudgetPeriod)> = None;
     if let Some(ref team) = team
         && let Some(team_limit) = team.budget_amount_usd
     {
@@ -1823,11 +1849,20 @@ async fn check_budget(
             _ => {}
         }
 
-        decision = budget::most_restrictive(decision, team_decision);
+        // If team blocks but user doesn't, record team as the binding constraint
+        let prev_decision = decision.clone();
+        decision = budget::most_restrictive(decision, team_decision.clone());
+        if matches!(team_decision, BudgetDecision::Block { .. })
+            && !matches!(prev_decision, BudgetDecision::Block { .. })
+        {
+            team_binding = Some((team_spend, team_limit, team_period));
+        }
     }
 
-    // Build budget status for headers
-    let (status_limit, status_spend, status_period) = if let Some(limit) = user_limit {
+    // Build budget status for headers -- use team values when team is the binding constraint
+    let (status_limit, status_spend, status_period) = if let Some((ts, tl, tp)) = team_binding {
+        (tl, ts, tp)
+    } else if let Some(limit) = user_limit {
         (limit, user_spend, effective_period)
     } else if let Some(ref team) = team {
         if let Some(team_limit) = team.budget_amount_usd {
@@ -1883,7 +1918,7 @@ async fn check_budget(
                 percent,
                 remaining_usd: remaining,
                 status: "shaped",
-                resets: status_period.period_start().to_rfc3339(),
+                resets: status_period.period_next_start().to_rfc3339(),
                 shaped_rpm: Some(rpm),
             }))
         }
@@ -1891,21 +1926,137 @@ async fn check_budget(
             percent,
             remaining_usd: remaining,
             status: "warning",
-            resets: status_period.period_start().to_rfc3339(),
+            resets: status_period.period_next_start().to_rfc3339(),
             shaped_rpm: None,
         })),
         BudgetDecision::Allow => Ok(Some(BudgetStatus {
             percent,
             remaining_usd: remaining,
             status: "ok",
-            resets: status_period.period_start().to_rfc3339(),
+            resets: status_period.period_next_start().to_rfc3339(),
+            shaped_rpm: None,
+        })),
+    }
+}
+
+/// Check team budget for a virtual key that has only team_id (no user assignment).
+async fn check_team_budget_only(
+    state: &GatewayState,
+    team_id: Uuid,
+) -> Result<Option<BudgetStatus>, Response> {
+    use crate::budget::{self, BudgetDecision, BudgetPeriod, PolicyRule};
+
+    let pool = state.db().await;
+    let pool = &pool;
+
+    let team = match crate::db::teams::get_team(pool, team_id).await {
+        Ok(Some(t)) => t,
+        _ => return Ok(None),
+    };
+    let Some(team_limit) = team.budget_amount_usd else {
+        return Ok(None);
+    };
+
+    let team_period = BudgetPeriod::parse(&team.budget_period);
+    let team_spend = match state.budget_cache.get_team_spend(team_id).await {
+        Some(s) => s,
+        None => {
+            let s = crate::db::budget::get_team_spend(pool, team_id, team_period)
+                .await
+                .unwrap_or(0.0);
+            state.budget_cache.set_team_spend(team_id, s).await;
+            s
+        }
+    };
+
+    let team_policy: Vec<PolicyRule> = team
+        .budget_policy
+        .as_ref()
+        .and_then(|v| serde_json::from_value(v.clone()).ok())
+        .unwrap_or_else(budget::preset_standard);
+
+    let decision = budget::evaluate(&team_policy, team_spend, team_limit);
+
+    match &decision {
+        BudgetDecision::Notify { threshold_percent }
+        | BudgetDecision::Shape {
+            threshold_percent, ..
+        }
+        | BudgetDecision::Block { threshold_percent } => {
+            let event_type = match &decision {
+                BudgetDecision::Notify { .. } => "team_notify",
+                BudgetDecision::Shape { .. } => "team_shape",
+                BudgetDecision::Block { .. } => "team_block",
+                _ => unreachable!(),
+            };
+            let _ = crate::db::budget::insert_event(
+                pool,
+                None,
+                Some(team_id),
+                event_type,
+                *threshold_percent as i32,
+                team_spend,
+                team_limit,
+                (team_spend / team_limit) * 100.0,
+                team_period.as_str(),
+                team_period.period_start(),
+            )
+            .await;
+        }
+        _ => {}
+    }
+
+    let percent = (team_spend / team_limit) * 100.0;
+    let remaining = (team_limit - team_spend).max(0.0);
+
+    match decision {
+        BudgetDecision::Block { threshold_percent } => {
+            tracing::warn!(
+                %team_id,
+                spend = team_spend,
+                limit = team_limit,
+                threshold = threshold_percent,
+                "Team budget blocked (virtual key)"
+            );
+            Err(budget_block_response(team_spend, team_limit, team_period))
+        }
+        BudgetDecision::Shape {
+            threshold_percent,
+            rpm,
+        } => {
+            tracing::info!(
+                %team_id,
+                rpm,
+                threshold = threshold_percent,
+                "Team budget shaping active (virtual key)"
+            );
+            Ok(Some(BudgetStatus {
+                percent,
+                remaining_usd: remaining,
+                status: "shaped",
+                resets: team_period.period_next_start().to_rfc3339(),
+                shaped_rpm: Some(rpm),
+            }))
+        }
+        BudgetDecision::Notify { .. } => Ok(Some(BudgetStatus {
+            percent,
+            remaining_usd: remaining,
+            status: "warning",
+            resets: team_period.period_next_start().to_rfc3339(),
+            shaped_rpm: None,
+        })),
+        BudgetDecision::Allow => Ok(Some(BudgetStatus {
+            percent,
+            remaining_usd: remaining,
+            status: "ok",
+            resets: team_period.period_next_start().to_rfc3339(),
             shaped_rpm: None,
         })),
     }
 }
 
 fn budget_block_response(spend: f64, limit: f64, period: crate::budget::BudgetPeriod) -> Response {
-    let resets = period.period_start().to_rfc3339();
+    let resets = period.period_next_start().to_rfc3339();
     Response::builder()
         .status(StatusCode::TOO_MANY_REQUESTS)
         .header("content-type", "application/json")
@@ -2188,6 +2339,7 @@ fn error_response(status: StatusCode, error_type: &str, message: &str) -> Respon
 /// Returns `(status, message, is_throttle)` so callers can record throttle metrics.
 fn map_bedrock_error<E: std::fmt::Debug + std::fmt::Display>(
     error: &E,
+    model_context: Option<(&str, &str)>,
 ) -> (StatusCode, String, bool) {
     let debug_msg = format!("{error:?}");
     tracing::error!(details = %debug_msg, "Bedrock error details");
@@ -2207,6 +2359,17 @@ fn map_bedrock_error<E: std::fmt::Debug + std::fmt::Display>(
         StatusCode::SERVICE_UNAVAILABLE
     } else {
         StatusCode::BAD_GATEWAY
+    };
+    let message = if status == StatusCode::BAD_REQUEST
+        && message.contains("model identifier is invalid")
+        && let Some((model, prefix)) = model_context
+    {
+        format!(
+            "{model} is not available on your endpoint ({prefix} region). \
+             Use /model to select a different model, or ask your admin to add a global endpoint."
+        )
+    } else {
+        message
     };
     (status, message, is_throttle)
 }
