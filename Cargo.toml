@@ -71,7 +71,7 @@ jsonwebtoken = "9"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
 
 # TLS (self-signed for local dev)
-rcgen = "0.13"
+rcgen = "0.14"
 rustls = "0.23"
 rustls-pemfile = "2"
 tokio-rustls = "0.26"
