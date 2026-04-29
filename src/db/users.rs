@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -26,6 +28,22 @@ pub async fn list_users(pool: &PgPool) -> anyhow::Result<Vec<User>> {
         .fetch_all(pool)
         .await?;
     Ok(users)
+}
+
+/// Fetch a map of user id -> email for the given set of ids.
+pub async fn get_emails_by_ids(
+    pool: &PgPool,
+    ids: &[Uuid],
+) -> anyhow::Result<HashMap<Uuid, String>> {
+    if ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let rows =
+        sqlx::query_as::<_, (Uuid, String)>("SELECT id, email FROM users WHERE id = ANY($1)")
+            .bind(ids)
+            .fetch_all(pool)
+            .await?;
+    Ok(rows.into_iter().collect())
 }
 
 pub async fn get_user_by_email(pool: &PgPool, email: &str) -> anyhow::Result<Option<User>> {

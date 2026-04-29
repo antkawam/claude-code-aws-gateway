@@ -63,6 +63,8 @@ pub struct GatewayState {
     pub started_at: Instant,
     /// Rate limiting for admin login attempts (global, in-memory)
     pub login_attempts: tokio::sync::Mutex<Vec<Instant>>,
+    /// AWS Pricing API client (always us-east-1 — Pricing API is only in us-east-1 and ap-south-1).
+    pub pricing_client: Arc<aws_sdk_pricing::Client>,
 }
 
 impl GatewayState {

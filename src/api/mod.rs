@@ -12,7 +12,7 @@ use axum::{
     extract::State,
     http::Method,
     response::{Html, IntoResponse, Redirect},
-    routing::{delete, get, post, put},
+    routing::{delete, get, patch, post, put},
 };
 use subtle::ConstantTimeEq;
 use tower_http::cors::{AllowHeaders, AllowOrigin, CorsLayer};
@@ -29,11 +29,19 @@ pub fn router(state: Arc<GatewayState>) -> Router {
         .route("/v1/messages", post(handlers::messages))
         .route("/v1/messages/count_tokens", post(handlers::count_tokens))
         .route("/v1/models", get(handlers::list_models))
+        // Admin API — Pricing
+        .route("/admin/pricing", get(admin::list_pricing))
+        .route("/admin/pricing/refresh", post(admin::refresh_pricing))
+        .route(
+            "/admin/pricing/{prefix}",
+            put(admin::upsert_pricing).delete(admin::delete_pricing),
+        )
         // Admin API — Keys
         .route("/admin/keys", post(admin::create_key))
         .route("/admin/keys", get(admin::list_keys))
         .route("/admin/keys/{key_id}/revoke", post(admin::revoke_key))
         .route("/admin/keys/{key_id}", delete(admin::delete_key))
+        .route("/admin/keys/{key_id}", patch(admin::update_key))
         .route(
             "/admin/keys/{key_id}/setup-token",
             post(admin::create_setup_token),
@@ -109,6 +117,7 @@ pub fn router(state: Arc<GatewayState>) -> Router {
             "/admin/teams/{team_id}/members/{user_id}",
             delete(admin::remove_team_member),
         )
+        .route("/admin/teams/{team_id}/keys", get(admin::list_team_keys))
         // Admin API — Endpoints
         .route("/admin/endpoints", get(admin::list_endpoints))
         .route("/admin/endpoints", post(admin::create_endpoint))

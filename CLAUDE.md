@@ -11,7 +11,10 @@ make lint                # Format check + clippy
 make test-integration    # Integration tests (needs Docker)
 make check               # All of the above (what CI runs)
 make test-e2e            # E2E HTTP tests (needs AWS credentials)
-make dev                 # Start Postgres, then cargo run
+make dev                 # Start Postgres + gateway (auto-detects free ports)
+make dev-seed            # Start with mock analytics data
+make dev-reset           # Wipe Postgres and start fresh
+make dev-down            # Stop local dev environment
 ```
 
 ## Project Structure
@@ -102,12 +105,3 @@ Full list: see `docs/configuration.md`
 - Beta flags: ALLOWLIST approach (only forward betas Bedrock accepts)
 - Bedrock SDK `Display` impl is terse. Use `Debug` format for error messages.
 
-## Testing Rules
-
-- **Two-agent TDD workflow**: `@test` writes tests, `@builder` writes implementation. Both are defined in `.claude/agents/`.
-- **Default session is a coordinator**: Do not write production code or tests directly. Delegate to `@builder` for implementation and `@test` for test writing. The default session should focus on understanding requirements, planning, reviewing agent output, and orchestrating the TDD cycle.
-- The builder agent MUST NOT modify files in `tests/` or `#[cfg(test)]` blocks (enforced by PreToolUse hook).
-- The test agent MUST NOT modify production code outside `#[cfg(test)]` blocks (enforced by PreToolUse hook).
-- If tests fail during implementation, fix the production code — never the tests.
-- Run `make check` before marking any task complete.
-- New modules MUST include `#[cfg(test)]` with meaningful coverage.

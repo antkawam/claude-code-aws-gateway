@@ -149,7 +149,7 @@ impl EndpointPool {
             let default_id = self.default_endpoint_id.read().await;
             return default_id
                 .and_then(|id| clients.get(&id))
-                .filter(|c| c.healthy.load(Ordering::Relaxed))
+                .filter(|c| c.config.enabled && c.healthy.load(Ordering::Relaxed))
                 .map(Arc::clone);
         }
 
@@ -164,6 +164,7 @@ impl EndpointPool {
                 && last_seen.elapsed().as_secs() < AFFINITY_TTL_SECS
                 && candidate_ids.contains(ep_id)
                 && let Some(client) = clients.get(ep_id)
+                && client.config.enabled
                 && client.healthy.load(Ordering::Relaxed)
             {
                 return Some(Arc::clone(client));
@@ -188,7 +189,7 @@ impl EndpointPool {
             "round_robin" => {
                 let healthy: Vec<_> = candidates
                     .into_iter()
-                    .filter(|c| c.healthy.load(Ordering::Relaxed))
+                    .filter(|c| c.config.enabled && c.healthy.load(Ordering::Relaxed))
                     .collect();
                 if healthy.is_empty() {
                     return None;
@@ -199,7 +200,7 @@ impl EndpointPool {
             // Unknown strategy — fall through to primary_fallback.
             _ => candidates
                 .into_iter()
-                .find(|c| c.healthy.load(Ordering::Relaxed)),
+                .find(|c| c.config.enabled && c.healthy.load(Ordering::Relaxed)),
         }
     }
 
@@ -222,7 +223,7 @@ impl EndpointPool {
             .iter()
             .filter(|id| **id != primary_id)
             .filter_map(|id| clients.get(id).map(Arc::clone))
-            .filter(|c| c.healthy.load(Ordering::Relaxed))
+            .filter(|c| c.config.enabled && c.healthy.load(Ordering::Relaxed))
             .collect();
         fallbacks.sort_by_key(|c| {
             team_endpoints
@@ -767,6 +768,494 @@ mod tests {
             "Expired entry should be removed"
         );
     }
+
+    // ── Slice 1: new tests ──
+
+    /// `get_fallback_endpoints` returns endpoints in the order they appear in
+    /// `team_endpoints`, which represents team-assignment priority. The first
+    /// entry in `team_endpoints` is the highest-priority primary; fallbacks are
+    /// the remaining entries in that same order.
+    #[tokio::test]
+    async fn test_fallback_ordering_matches_priority() {
+        let pool = EndpointPool::new();
+
+        // Create 3 endpoints. We add them to the pool in reverse priority order
+        // (lowest priority first) to prove that fallback order is driven by
+        // team_endpoints position, not insertion order.
+        let id_high = Uuid::new_v4();
+        let id_mid = Uuid::new_v4();
+        let id_low = Uuid::new_v4();
+
+        for (id, name) in [
+            (id_low, "low-priority"),
+            (id_mid, "mid-priority"),
+            (id_high, "high-priority"),
+        ] {
+            let ep = make_test_endpoint(id, name, false);
+            let client = make_test_client(ep);
+            client.healthy.store(true, Ordering::Relaxed);
+            insert_client(&pool, client).await;
+        }
+
+        // team_endpoints ordered high -> mid -> low (simulates DB priority sort)
+        let team_eps = vec![
+            make_test_endpoint(id_high, "high-priority", false),
+            make_test_endpoint(id_mid, "mid-priority", false),
+            make_test_endpoint(id_low, "low-priority", false),
+        ];
+
+        // Exclude id_high (the primary); expect fallbacks in mid -> low order
+        let fallbacks = pool.get_fallback_endpoints(id_high, &team_eps).await;
+
+        assert_eq!(fallbacks.len(), 2, "Should have 2 fallback endpoints");
+        assert_eq!(
+            fallbacks[0].config.id, id_mid,
+            "First fallback should be mid-priority"
+        );
+        assert_eq!(
+            fallbacks[1].config.id, id_low,
+            "Second fallback should be low-priority"
+        );
+    }
+
+    /// When a user has a valid, healthy affinity entry but the affinity endpoint
+    /// is NOT in the team's assigned endpoint list, `select_endpoint` must ignore
+    /// the affinity and fall through to `primary_fallback` behavior.
+    #[tokio::test]
+    async fn test_sticky_user_endpoint_not_in_team_falls_through() {
+        let pool = EndpointPool::new();
+
+        // Endpoint A: in pool, healthy, but NOT in the team's assigned list
+        let id_a = Uuid::new_v4();
+        let ep_a = make_test_endpoint(id_a, "endpoint-a", false);
+        let client_a = make_test_client(ep_a);
+        client_a.healthy.store(true, Ordering::Relaxed);
+        insert_client(&pool, client_a).await;
+
+        // Endpoints B and C: in pool, healthy, and in the team's assigned list
+        let id_b = Uuid::new_v4();
+        let id_c = Uuid::new_v4();
+        let mut team_eps = Vec::new();
+        for (id, name) in [(id_b, "endpoint-b"), (id_c, "endpoint-c")] {
+            let ep = make_test_endpoint(id, name, false);
+            team_eps.push(ep.clone());
+            let client = make_test_client(ep);
+            client.healthy.store(true, Ordering::Relaxed);
+            insert_client(&pool, client).await;
+        }
+
+        // Set affinity for the user to endpoint A (not in team list)
+        pool.update_affinity("user@example.com", id_a).await;
+
+        let selected = pool
+            .select_endpoint(&team_eps, Some("user@example.com"), "sticky_user")
+            .await
+            .unwrap();
+
+        // Affinity check fails (id_a not in candidate_ids); falls through to
+        // primary_fallback which picks the first healthy endpoint in team_eps.
+        assert_eq!(
+            selected.config.id, id_b,
+            "Should fall through to first healthy team endpoint when affinity endpoint is not in team list"
+        );
+    }
+
+    /// Calling `update_affinity` twice for the same user must overwrite the
+    /// existing entry (both the endpoint ID and the timestamp are updated).
+    #[tokio::test]
+    async fn test_update_affinity_overwrites_entry() {
+        let pool = EndpointPool::new();
+        let id_a = Uuid::new_v4();
+        let id_b = Uuid::new_v4();
+
+        pool.update_affinity("user1", id_a).await;
+
+        // Capture the timestamp of the first write
+        let ts_after_first = {
+            let affinity = pool.user_affinity.read().await;
+            let (ep_id, ts) = affinity.get("user1").unwrap();
+            assert_eq!(*ep_id, id_a, "Should point to id_a after first write");
+            *ts
+        };
+
+        // Overwrite with id_b
+        pool.update_affinity("user1", id_b).await;
+
+        let affinity = pool.user_affinity.read().await;
+        assert_eq!(affinity.len(), 1, "Should still have exactly one entry");
+        let (ep_id, ts_after_second) = affinity.get("user1").unwrap();
+        assert_eq!(*ep_id, id_b, "Endpoint should now point to id_b");
+        assert!(
+            *ts_after_second >= ts_after_first,
+            "Timestamp after second write must be >= timestamp after first write"
+        );
+    }
+
+    /// The round-robin counter uses wrapping modular arithmetic. When the
+    /// counter is near `usize::MAX`, it must wrap to 0 without panicking and
+    /// still distribute requests across healthy endpoints.
+    #[tokio::test]
+    async fn test_round_robin_counter_wraparound() {
+        let pool = EndpointPool::new();
+        let mut ids = Vec::new();
+        let mut team_eps = Vec::new();
+
+        for i in 0..3 {
+            let id = Uuid::new_v4();
+            ids.push(id);
+            let ep = make_test_endpoint(id, &format!("ep-{i}"), false);
+            team_eps.push(ep.clone());
+            let client = make_test_client(ep);
+            client.healthy.store(true, Ordering::Relaxed);
+            insert_client(&pool, client).await;
+        }
+
+        // Seed counter at usize::MAX - 1 so the next fetch_add wraps around
+        pool.round_robin_counter
+            .store(usize::MAX - 1, Ordering::Relaxed);
+
+        // Call select_endpoint 6 times -- must not panic
+        let mut results = Vec::new();
+        for _ in 0..6 {
+            let selected = pool
+                .select_endpoint(&team_eps, None, "round_robin")
+                .await
+                .unwrap();
+            results.push(selected.config.id);
+        }
+
+        // All returned IDs must be valid team endpoint IDs
+        for id in &results {
+            assert!(
+                ids.contains(id),
+                "Selected endpoint must be one of the team endpoints"
+            );
+        }
+
+        assert_eq!(results.len(), 6, "Should have 6 results");
+    }
+
+    /// When `team_endpoints` contains UUIDs that are not loaded in the pool's
+    /// client map, `select_endpoint` must return `None` rather than panicking
+    /// or selecting from a different set of endpoints.
+    #[tokio::test]
+    async fn test_select_unknown_endpoint_ids_in_team_list() {
+        let pool = EndpointPool::new();
+
+        // Load one real endpoint into the pool (but NOT assigned to this team)
+        let real_id = Uuid::new_v4();
+        let real_ep = make_test_endpoint(real_id, "real-ep", false);
+        let real_client = make_test_client(real_ep);
+        real_client.healthy.store(true, Ordering::Relaxed);
+        insert_client(&pool, real_client).await;
+
+        // Build a team_endpoints list that references IDs NOT in the pool
+        let ghost_id_1 = Uuid::new_v4();
+        let ghost_id_2 = Uuid::new_v4();
+        let team_eps = vec![
+            make_test_endpoint(ghost_id_1, "ghost-1", false),
+            make_test_endpoint(ghost_id_2, "ghost-2", false),
+        ];
+
+        // primary_fallback: filter_map produces empty candidates -> None
+        let result_pf = pool
+            .select_endpoint(&team_eps, None, "primary_fallback")
+            .await;
+        assert!(
+            result_pf.is_none(),
+            "primary_fallback should return None when all team endpoint IDs are unknown"
+        );
+
+        // round_robin: healthy list is empty -> None
+        let result_rr = pool.select_endpoint(&team_eps, None, "round_robin").await;
+        assert!(
+            result_rr.is_none(),
+            "round_robin should return None when all team endpoint IDs are unknown"
+        );
+    }
+
+    /// When the default endpoint exists in the pool but has `enabled = false`,
+    /// `select_endpoint` with empty `team_endpoints` should return `None`.
+    ///
+    /// NOTE: This test is expected to FAIL until the builder adds an `enabled`
+    /// check in the default-endpoint path of `select_endpoint`. The current
+    /// implementation only checks `healthy`, not `enabled`.
+    #[tokio::test]
+    async fn test_default_endpoint_disabled_returns_none() {
+        let pool = EndpointPool::new();
+        let id = Uuid::new_v4();
+
+        // Create a default endpoint that is explicitly disabled
+        let mut ep = make_test_endpoint(id, "disabled-default", true);
+        ep.enabled = false;
+
+        let client = make_test_client(ep);
+        // Mark healthy so only the `enabled` flag should cause rejection
+        client.healthy.store(true, Ordering::Relaxed);
+        insert_client(&pool, client).await;
+        set_default(&pool, id).await;
+
+        let result = pool.select_endpoint(&[], None, "primary_fallback").await;
+        assert!(
+            result.is_none(),
+            "Disabled default endpoint must not be returned by select_endpoint"
+        );
+    }
+}
+
+// ── Slice 2: new tests ──
+
+#[cfg(test)]
+mod tests_slice2 {
+    use super::*;
+    use std::sync::atomic::Ordering;
+
+    fn make_test_endpoint(id: Uuid, name: &str, is_default: bool) -> Endpoint {
+        Endpoint {
+            id,
+            name: name.to_string(),
+            role_arn: None,
+            external_id: None,
+            inference_profile_arn: None,
+            region: "us-east-1".to_string(),
+            routing_prefix: "us".to_string(),
+            priority: 0,
+            is_default,
+            enabled: true,
+            created_at: chrono::Utc::now(),
+        }
+    }
+
+    fn make_test_client(ep: Endpoint) -> EndpointClient {
+        let runtime_client = aws_sdk_bedrockruntime::Client::from_conf(
+            aws_sdk_bedrockruntime::Config::builder()
+                .behavior_version(aws_sdk_bedrockruntime::config::BehaviorVersion::latest())
+                .region(aws_config::Region::new("us-east-1"))
+                .build(),
+        );
+        let control_client = aws_sdk_bedrock::Client::from_conf(
+            aws_sdk_bedrock::Config::builder()
+                .behavior_version(aws_sdk_bedrock::config::BehaviorVersion::latest())
+                .region(aws_config::Region::new("us-east-1"))
+                .build(),
+        );
+        let quota_client = aws_sdk_servicequotas::Client::from_conf(
+            aws_sdk_servicequotas::Config::builder()
+                .behavior_version(aws_sdk_servicequotas::config::BehaviorVersion::latest())
+                .region(aws_config::Region::new("us-east-1"))
+                .build(),
+        );
+        EndpointClient {
+            config: ep,
+            runtime_client,
+            control_client,
+            quota_cache: crate::quota::QuotaCache::new(quota_client),
+            healthy: AtomicBool::new(true),
+            last_health_check: AtomicI64::new(0),
+        }
+    }
+
+    async fn insert_client(pool: &EndpointPool, client: EndpointClient) {
+        let mut clients = pool.clients.write().await;
+        clients.insert(client.config.id, Arc::new(client));
+    }
+
+    /// `select_endpoint` with `"primary_fallback"` must skip team endpoints that
+    /// have `enabled = false`, even when those endpoints are healthy. The first
+    /// healthy AND enabled team endpoint must be returned.
+    ///
+    /// NOTE: Expected to FAIL until the builder adds an `enabled` check in the
+    /// team-endpoint path of `select_endpoint`.
+    #[tokio::test]
+    async fn test_select_team_endpoint_disabled_skipped_primary_fallback() {
+        let pool = EndpointPool::new();
+        let mut team_eps = Vec::new();
+        let mut ids = Vec::new();
+
+        for i in 0..3 {
+            let id = Uuid::new_v4();
+            ids.push(id);
+            let mut ep = make_test_endpoint(id, &format!("ep-{i}"), false);
+            if i == 0 {
+                // First endpoint: disabled but healthy — must be skipped
+                ep.enabled = false;
+            }
+            team_eps.push(ep.clone());
+            let client = make_test_client(ep);
+            client.healthy.store(true, Ordering::Relaxed);
+            insert_client(&pool, client).await;
+        }
+
+        let selected = pool
+            .select_endpoint(&team_eps, None, "primary_fallback")
+            .await
+            .unwrap();
+
+        assert_eq!(
+            selected.config.id, ids[1],
+            "primary_fallback must skip disabled first endpoint and pick the second (first healthy+enabled)"
+        );
+    }
+
+    /// `select_endpoint` with `"round_robin"` must never return a team endpoint
+    /// that has `enabled = false`, even when it is healthy.
+    ///
+    /// NOTE: Expected to FAIL until the builder adds an `enabled` check in the
+    /// round-robin path of `select_endpoint`.
+    #[tokio::test]
+    async fn test_select_team_endpoint_disabled_skipped_round_robin() {
+        let pool = EndpointPool::new();
+        let mut team_eps = Vec::new();
+        let disabled_id;
+        let enabled_id;
+
+        // Endpoint 0: disabled+healthy (must never be selected)
+        {
+            let id = Uuid::new_v4();
+            disabled_id = id;
+            let mut ep = make_test_endpoint(id, "ep-disabled", false);
+            ep.enabled = false;
+            team_eps.push(ep.clone());
+            let client = make_test_client(ep);
+            client.healthy.store(true, Ordering::Relaxed);
+            insert_client(&pool, client).await;
+        }
+
+        // Endpoint 1: enabled+healthy (must always be selected)
+        {
+            let id = Uuid::new_v4();
+            enabled_id = id;
+            let ep = make_test_endpoint(id, "ep-enabled", false);
+            team_eps.push(ep.clone());
+            let client = make_test_client(ep);
+            client.healthy.store(true, Ordering::Relaxed);
+            insert_client(&pool, client).await;
+        }
+
+        for _ in 0..10 {
+            let selected = pool
+                .select_endpoint(&team_eps, None, "round_robin")
+                .await
+                .unwrap();
+            assert_ne!(
+                selected.config.id, disabled_id,
+                "round_robin must never select the disabled endpoint"
+            );
+            assert_eq!(
+                selected.config.id, enabled_id,
+                "round_robin must always select the only enabled+healthy endpoint"
+            );
+        }
+    }
+
+    /// `get_fallback_endpoints` must exclude endpoints that are unhealthy.
+    /// When the second of three team endpoints is unhealthy, only the third
+    /// (healthy, non-primary) endpoint should appear in the fallback list.
+    ///
+    /// This test verifies existing health-filtering behaviour and is expected to PASS.
+    #[tokio::test]
+    async fn test_fallback_excludes_unhealthy() {
+        let pool = EndpointPool::new();
+        let mut team_eps = Vec::new();
+        let mut ids = Vec::new();
+
+        for i in 0..3 {
+            let id = Uuid::new_v4();
+            ids.push(id);
+            let ep = make_test_endpoint(id, &format!("ep-{i}"), false);
+            team_eps.push(ep.clone());
+            let client = make_test_client(ep);
+            // Mark the second endpoint (i == 1) as unhealthy
+            client.healthy.store(i != 1, Ordering::Relaxed);
+            insert_client(&pool, client).await;
+        }
+
+        // Use ids[0] as the primary; expect only ids[2] as the fallback
+        let fallbacks = pool.get_fallback_endpoints(ids[0], &team_eps).await;
+
+        assert_eq!(
+            fallbacks.len(),
+            1,
+            "Only one healthy non-primary fallback expected"
+        );
+        assert_eq!(
+            fallbacks[0].config.id, ids[2],
+            "The only fallback should be the third (healthy) endpoint"
+        );
+    }
+
+    /// `get_fallback_endpoints` must exclude team endpoints that have
+    /// `enabled = false`, even when those endpoints are healthy.
+    ///
+    /// NOTE: Expected to FAIL until the builder adds an `enabled` check in
+    /// `get_fallback_endpoints`.
+    #[tokio::test]
+    async fn test_fallback_excludes_disabled() {
+        let pool = EndpointPool::new();
+        let mut team_eps = Vec::new();
+        let mut ids = Vec::new();
+
+        for i in 0..3 {
+            let id = Uuid::new_v4();
+            ids.push(id);
+            let mut ep = make_test_endpoint(id, &format!("ep-{i}"), false);
+            if i == 1 {
+                // Second endpoint: disabled but healthy — must be excluded from fallbacks
+                ep.enabled = false;
+            }
+            team_eps.push(ep.clone());
+            let client = make_test_client(ep);
+            client.healthy.store(true, Ordering::Relaxed);
+            insert_client(&pool, client).await;
+        }
+
+        // Use ids[0] as primary; only ids[2] is enabled+healthy non-primary
+        let fallbacks = pool.get_fallback_endpoints(ids[0], &team_eps).await;
+
+        assert_eq!(
+            fallbacks.len(),
+            1,
+            "Disabled endpoint must be excluded; only one fallback expected"
+        );
+        assert_eq!(
+            fallbacks[0].config.id, ids[2],
+            "The only fallback should be the third (enabled+healthy) endpoint"
+        );
+    }
+
+    /// `get_client` returns `Some` for a known endpoint ID and `None` for an
+    /// unknown one. Verifies the basic map lookup contract.
+    ///
+    /// Expected to PASS.
+    #[tokio::test]
+    async fn test_get_client_existing_and_missing() {
+        let pool = EndpointPool::new();
+
+        let existing_id = Uuid::new_v4();
+        let ep = make_test_endpoint(existing_id, "known-ep", false);
+        let client = make_test_client(ep);
+        insert_client(&pool, client).await;
+
+        // Known ID: must return Some
+        let found = pool.get_client(existing_id).await;
+        assert!(
+            found.is_some(),
+            "get_client must return Some for a known ID"
+        );
+        assert_eq!(
+            found.unwrap().config.id,
+            existing_id,
+            "Returned client must have the requested ID"
+        );
+
+        // Unknown ID: must return None
+        let missing_id = Uuid::new_v4();
+        let not_found = pool.get_client(missing_id).await;
+        assert!(
+            not_found.is_none(),
+            "get_client must return None for an unknown ID"
+        );
+    }
 }
 
 /// STS AssumeRole credential provider.
@@ -824,5 +1313,596 @@ impl aws_credential_types::provider::ProvideCredentials for AssumeRoleProvider {
                 "ccag-assume-role",
             ))
         })
+    }
+}
+
+// ── Slice 3: new tests ──
+
+#[cfg(test)]
+mod tests_slice3 {
+    use super::*;
+    use std::sync::atomic::Ordering;
+
+    fn make_test_endpoint(id: Uuid, name: &str, is_default: bool) -> Endpoint {
+        Endpoint {
+            id,
+            name: name.to_string(),
+            role_arn: None,
+            external_id: None,
+            inference_profile_arn: None,
+            region: "us-east-1".to_string(),
+            routing_prefix: "us".to_string(),
+            priority: 0,
+            is_default,
+            enabled: true,
+            created_at: chrono::Utc::now(),
+        }
+    }
+
+    fn make_test_client(ep: Endpoint) -> EndpointClient {
+        let runtime_client = aws_sdk_bedrockruntime::Client::from_conf(
+            aws_sdk_bedrockruntime::Config::builder()
+                .behavior_version(aws_sdk_bedrockruntime::config::BehaviorVersion::latest())
+                .region(aws_config::Region::new("us-east-1"))
+                .build(),
+        );
+        let control_client = aws_sdk_bedrock::Client::from_conf(
+            aws_sdk_bedrock::Config::builder()
+                .behavior_version(aws_sdk_bedrock::config::BehaviorVersion::latest())
+                .region(aws_config::Region::new("us-east-1"))
+                .build(),
+        );
+        let quota_client = aws_sdk_servicequotas::Client::from_conf(
+            aws_sdk_servicequotas::Config::builder()
+                .behavior_version(aws_sdk_servicequotas::config::BehaviorVersion::latest())
+                .region(aws_config::Region::new("us-east-1"))
+                .build(),
+        );
+        EndpointClient {
+            config: ep,
+            runtime_client,
+            control_client,
+            quota_cache: crate::quota::QuotaCache::new(quota_client),
+            healthy: AtomicBool::new(true),
+            last_health_check: AtomicI64::new(0),
+        }
+    }
+
+    async fn insert_client(pool: &EndpointPool, client: EndpointClient) {
+        let mut clients = pool.clients.write().await;
+        clients.insert(client.config.id, Arc::new(client));
+    }
+
+    #[allow(dead_code)]
+    async fn set_default(pool: &EndpointPool, id: Uuid) {
+        let mut default_id = pool.default_endpoint_id.write().await;
+        *default_id = Some(id);
+    }
+
+    /// When a user has affinity set to an endpoint that is healthy but
+    /// `enabled = false`, `select_endpoint` with `"sticky_user"` must NOT
+    /// return that disabled endpoint. It should fall through to the first
+    /// healthy+enabled team endpoint instead.
+    ///
+    /// NOTE: This test is expected to FAIL. The sticky_user path at line ~167
+    /// only checks `client.healthy` but not `client.config.enabled`. The
+    /// builder must add an `enabled` check there.
+    #[tokio::test]
+    async fn test_sticky_user_disabled_affinity_falls_through() {
+        let pool = EndpointPool::new();
+
+        let id_a = Uuid::new_v4();
+        let id_b = Uuid::new_v4();
+        let id_c = Uuid::new_v4();
+
+        let mut team_eps = Vec::new();
+
+        // id_a: disabled but healthy — affinity points here, must be skipped
+        {
+            let mut ep = make_test_endpoint(id_a, "ep-a", false);
+            ep.enabled = false;
+            team_eps.push(ep.clone());
+            let client = make_test_client(ep);
+            client.healthy.store(true, Ordering::Relaxed);
+            insert_client(&pool, client).await;
+        }
+
+        // id_b: enabled+healthy — should be returned as the first valid fallback
+        {
+            let ep = make_test_endpoint(id_b, "ep-b", false);
+            team_eps.push(ep.clone());
+            let client = make_test_client(ep);
+            client.healthy.store(true, Ordering::Relaxed);
+            insert_client(&pool, client).await;
+        }
+
+        // id_c: enabled+healthy — also a candidate, but after id_b
+        {
+            let ep = make_test_endpoint(id_c, "ep-c", false);
+            team_eps.push(ep.clone());
+            let client = make_test_client(ep);
+            client.healthy.store(true, Ordering::Relaxed);
+            insert_client(&pool, client).await;
+        }
+
+        // Point the user's affinity to the disabled endpoint
+        pool.update_affinity("user@example.com", id_a).await;
+
+        let selected = pool
+            .select_endpoint(&team_eps, Some("user@example.com"), "sticky_user")
+            .await
+            .unwrap();
+
+        // The disabled affinity endpoint must be rejected; the first enabled+healthy
+        // endpoint in team order (id_b) must be returned.
+        assert_eq!(
+            selected.config.id, id_b,
+            "sticky_user must not return a disabled affinity endpoint; expected id_b (first healthy+enabled)"
+        );
+    }
+
+    /// When `team_endpoints` is empty and no default has been set on the pool,
+    /// `select_endpoint` must return `None` even when clients exist in the pool.
+    ///
+    /// Expected to PASS.
+    #[tokio::test]
+    async fn test_no_default_set_empty_team_returns_none() {
+        let pool = EndpointPool::new();
+
+        // Insert a client but do NOT call set_default
+        let id = Uuid::new_v4();
+        let ep = make_test_endpoint(id, "some-ep", false);
+        let client = make_test_client(ep);
+        client.healthy.store(true, Ordering::Relaxed);
+        insert_client(&pool, client).await;
+
+        // No team endpoints and no default endpoint registered
+        let result = pool.select_endpoint(&[], None, "primary_fallback").await;
+
+        assert!(
+            result.is_none(),
+            "select_endpoint must return None when team_endpoints is empty and no default is set"
+        );
+    }
+
+    /// With a single healthy+enabled team endpoint, `select_endpoint` with
+    /// `"round_robin"` must return that same endpoint on every call regardless
+    /// of how many times it is invoked.
+    ///
+    /// Expected to PASS.
+    #[tokio::test]
+    async fn test_single_endpoint_round_robin() {
+        let pool = EndpointPool::new();
+
+        let id = Uuid::new_v4();
+        let ep = make_test_endpoint(id, "only-ep", false);
+        let team_eps = vec![ep.clone()];
+        let client = make_test_client(ep);
+        client.healthy.store(true, Ordering::Relaxed);
+        insert_client(&pool, client).await;
+
+        for call_num in 1..=3 {
+            let selected = pool
+                .select_endpoint(&team_eps, None, "round_robin")
+                .await
+                .unwrap();
+            assert_eq!(
+                selected.config.id, id,
+                "Call {call_num}: round_robin with a single endpoint must always return that endpoint"
+            );
+        }
+    }
+
+    /// `is_empty` and `len` must accurately reflect the number of clients
+    /// currently loaded in the pool.
+    ///
+    /// Expected to PASS.
+    #[tokio::test]
+    async fn test_is_empty_and_len() {
+        let pool = EndpointPool::new();
+
+        // Fresh pool: no clients loaded
+        assert!(
+            pool.is_empty().await,
+            "Newly created pool must report is_empty() == true"
+        );
+        assert_eq!(
+            pool.len().await,
+            0,
+            "Newly created pool must report len() == 0"
+        );
+
+        // Insert first client
+        let id1 = Uuid::new_v4();
+        insert_client(
+            &pool,
+            make_test_client(make_test_endpoint(id1, "ep-1", false)),
+        )
+        .await;
+
+        assert!(
+            !pool.is_empty().await,
+            "Pool with one client must report is_empty() == false"
+        );
+        assert_eq!(
+            pool.len().await,
+            1,
+            "Pool with one client must report len() == 1"
+        );
+
+        // Insert second client
+        let id2 = Uuid::new_v4();
+        insert_client(
+            &pool,
+            make_test_client(make_test_endpoint(id2, "ep-2", false)),
+        )
+        .await;
+
+        assert_eq!(
+            pool.len().await,
+            2,
+            "Pool with two clients must report len() == 2"
+        );
+        assert!(
+            !pool.is_empty().await,
+            "Pool with two clients must report is_empty() == false"
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests_slice4 {
+    use super::*;
+    use std::sync::atomic::Ordering;
+
+    fn make_dummy_aws_config() -> aws_config::SdkConfig {
+        aws_config::SdkConfig::builder()
+            .behavior_version(aws_config::BehaviorVersion::latest())
+            .region(aws_config::Region::new("us-east-1"))
+            .build()
+    }
+
+    fn make_test_endpoint(id: Uuid, name: &str, is_default: bool) -> Endpoint {
+        Endpoint {
+            id,
+            name: name.to_string(),
+            role_arn: None,
+            external_id: None,
+            inference_profile_arn: None,
+            region: "us-east-1".to_string(),
+            routing_prefix: "us".to_string(),
+            priority: 0,
+            is_default,
+            enabled: true,
+            created_at: chrono::Utc::now(),
+        }
+    }
+
+    /// `load_endpoints` must populate the pool with one client per provided
+    /// `Endpoint` and make each accessible via `get_client`.
+    ///
+    /// Expected to PASS.
+    #[tokio::test]
+    async fn test_load_endpoints_populates_pool() {
+        let pool = EndpointPool::new();
+        let config = make_dummy_aws_config();
+
+        let id1 = Uuid::new_v4();
+        let id2 = Uuid::new_v4();
+        let id3 = Uuid::new_v4();
+
+        let ep1 = make_test_endpoint(id1, "ep-1", false);
+        let ep2 = make_test_endpoint(id2, "ep-2", false);
+        let ep3 = make_test_endpoint(id3, "ep-3", false);
+
+        pool.load_endpoints(vec![ep1, ep2, ep3], &config).await;
+
+        assert_eq!(
+            pool.len().await,
+            3,
+            "load_endpoints with 3 endpoints must produce pool.len() == 3"
+        );
+        assert!(
+            !pool.is_empty().await,
+            "pool must not be empty after loading 3 endpoints"
+        );
+        assert!(
+            pool.get_client(id1).await.is_some(),
+            "client for id1 must be present after load"
+        );
+        assert!(
+            pool.get_client(id2).await.is_some(),
+            "client for id2 must be present after load"
+        );
+        assert!(
+            pool.get_client(id3).await.is_some(),
+            "client for id3 must be present after load"
+        );
+    }
+
+    /// When one of the loaded endpoints has `is_default: true`, `select_endpoint`
+    /// with no team endpoints must return that default endpoint once it is healthy.
+    ///
+    /// Expected to PASS.
+    #[tokio::test]
+    async fn test_load_endpoints_sets_default() {
+        let pool = EndpointPool::new();
+        let config = make_dummy_aws_config();
+
+        let non_default_id = Uuid::new_v4();
+        let default_id = Uuid::new_v4();
+
+        let non_default_ep = make_test_endpoint(non_default_id, "non-default", false);
+        let default_ep = make_test_endpoint(default_id, "default-ep", true);
+
+        pool.load_endpoints(vec![non_default_ep, default_ep], &config)
+            .await;
+
+        // `create_client` initialises healthy = false; mark the default as healthy.
+        pool.get_client(default_id)
+            .await
+            .unwrap()
+            .healthy
+            .store(true, Ordering::Relaxed);
+
+        let selected = pool.select_endpoint(&[], None, "primary_fallback").await;
+
+        assert!(
+            selected.is_some(),
+            "select_endpoint must return the default endpoint when team_endpoints is empty"
+        );
+        assert_eq!(
+            selected.unwrap().config.id,
+            default_id,
+            "selected endpoint must be the one marked is_default"
+        );
+
+        // Non-default endpoint must also be accessible via get_client.
+        assert!(
+            pool.get_client(non_default_id).await.is_some(),
+            "non-default endpoint must still be reachable via get_client"
+        );
+    }
+
+    /// A second call to `load_endpoints` with a different set of endpoints must
+    /// completely replace the previous pool contents.
+    ///
+    /// Expected to PASS.
+    #[tokio::test]
+    async fn test_load_endpoints_reload_replaces() {
+        let pool = EndpointPool::new();
+        let config = make_dummy_aws_config();
+
+        let id_a = Uuid::new_v4();
+        let id_b = Uuid::new_v4();
+
+        pool.load_endpoints(
+            vec![
+                make_test_endpoint(id_a, "ep-a", false),
+                make_test_endpoint(id_b, "ep-b", false),
+            ],
+            &config,
+        )
+        .await;
+
+        assert_eq!(pool.len().await, 2, "initial load must produce 2 clients");
+
+        // Reload with a completely different endpoint.
+        let id_c = Uuid::new_v4();
+        pool.load_endpoints(vec![make_test_endpoint(id_c, "ep-c", false)], &config)
+            .await;
+
+        assert_eq!(
+            pool.len().await,
+            1,
+            "after reload with 1 endpoint, pool.len() must be 1"
+        );
+        assert!(
+            pool.get_client(id_a).await.is_none(),
+            "old endpoint id_a must not be present after reload"
+        );
+        assert!(
+            pool.get_client(id_b).await.is_none(),
+            "old endpoint id_b must not be present after reload"
+        );
+        assert!(
+            pool.get_client(id_c).await.is_some(),
+            "new endpoint id_c must be present after reload"
+        );
+    }
+
+    /// Calling `load_endpoints` with an empty slice must clear all existing pool
+    /// entries.
+    ///
+    /// Expected to PASS.
+    #[tokio::test]
+    async fn test_load_endpoints_empty_clears_pool() {
+        let pool = EndpointPool::new();
+        let config = make_dummy_aws_config();
+
+        let id1 = Uuid::new_v4();
+        let id2 = Uuid::new_v4();
+
+        pool.load_endpoints(
+            vec![
+                make_test_endpoint(id1, "ep-1", false),
+                make_test_endpoint(id2, "ep-2", false),
+            ],
+            &config,
+        )
+        .await;
+
+        assert_eq!(pool.len().await, 2, "initial load must produce 2 clients");
+
+        // Reload with an empty list — pool must be cleared.
+        pool.load_endpoints(vec![], &config).await;
+
+        assert!(
+            pool.is_empty().await,
+            "pool must be empty after load_endpoints(vec![])"
+        );
+        assert_eq!(
+            pool.len().await,
+            0,
+            "pool.len() must be 0 after load_endpoints(vec![])"
+        );
+    }
+}
+
+// ── Slice 5: edge-case tests ──
+
+#[cfg(test)]
+mod tests_slice5 {
+    use super::*;
+    use std::collections::HashSet;
+    use std::sync::atomic::Ordering;
+
+    fn make_test_endpoint(id: Uuid, name: &str, is_default: bool) -> Endpoint {
+        Endpoint {
+            id,
+            name: name.to_string(),
+            role_arn: None,
+            external_id: None,
+            inference_profile_arn: None,
+            region: "us-east-1".to_string(),
+            routing_prefix: "us".to_string(),
+            priority: 0,
+            is_default,
+            enabled: true,
+            created_at: chrono::Utc::now(),
+        }
+    }
+
+    fn make_test_client(ep: Endpoint) -> EndpointClient {
+        let runtime_client = aws_sdk_bedrockruntime::Client::from_conf(
+            aws_sdk_bedrockruntime::Config::builder()
+                .behavior_version(aws_sdk_bedrockruntime::config::BehaviorVersion::latest())
+                .region(aws_config::Region::new("us-east-1"))
+                .build(),
+        );
+        let control_client = aws_sdk_bedrock::Client::from_conf(
+            aws_sdk_bedrock::Config::builder()
+                .behavior_version(aws_sdk_bedrock::config::BehaviorVersion::latest())
+                .region(aws_config::Region::new("us-east-1"))
+                .build(),
+        );
+        let quota_client = aws_sdk_servicequotas::Client::from_conf(
+            aws_sdk_servicequotas::Config::builder()
+                .behavior_version(aws_sdk_servicequotas::config::BehaviorVersion::latest())
+                .region(aws_config::Region::new("us-east-1"))
+                .build(),
+        );
+        EndpointClient {
+            config: ep,
+            runtime_client,
+            control_client,
+            quota_cache: crate::quota::QuotaCache::new(quota_client),
+            healthy: AtomicBool::new(true),
+            last_health_check: AtomicI64::new(0),
+        }
+    }
+
+    async fn insert_client(pool: &EndpointPool, client: EndpointClient) {
+        let mut clients = pool.clients.write().await;
+        clients.insert(client.config.id, Arc::new(client));
+    }
+
+    /// `mark_unhealthy` sets `healthy` to `false`; `mark_healthy` restores it to
+    /// `true`. Both methods operate directly on the `EndpointClient` without
+    /// requiring pool involvement.
+    ///
+    /// Expected to PASS.
+    #[tokio::test]
+    async fn test_mark_healthy_and_unhealthy() {
+        let ep = make_test_endpoint(Uuid::new_v4(), "ep", false);
+        let client = make_test_client(ep);
+
+        // Starts healthy (make_test_client sets healthy = true)
+        assert!(
+            client.healthy.load(Ordering::Relaxed),
+            "client must start healthy"
+        );
+
+        EndpointPool::mark_unhealthy(&client);
+        assert!(
+            !client.healthy.load(Ordering::Relaxed),
+            "mark_unhealthy must set healthy to false"
+        );
+
+        EndpointPool::mark_healthy(&client);
+        assert!(
+            client.healthy.load(Ordering::Relaxed),
+            "mark_healthy must set healthy to true"
+        );
+    }
+
+    /// `get_all_clients` must return all clients currently in the pool.
+    ///
+    /// Expected to PASS.
+    #[tokio::test]
+    async fn test_get_all_clients() {
+        let pool = EndpointPool::new();
+
+        let id1 = Uuid::new_v4();
+        let id2 = Uuid::new_v4();
+        let id3 = Uuid::new_v4();
+
+        for (id, name) in [(id1, "ep-1"), (id2, "ep-2"), (id3, "ep-3")] {
+            let ep = make_test_endpoint(id, name, false);
+            insert_client(&pool, make_test_client(ep)).await;
+        }
+
+        let all = pool.get_all_clients().await;
+
+        assert_eq!(all.len(), 3, "get_all_clients must return all 3 clients");
+
+        let returned_ids: HashSet<Uuid> = all.iter().map(|c| c.config.id).collect();
+        assert!(
+            returned_ids.contains(&id1),
+            "get_all_clients must include id1"
+        );
+        assert!(
+            returned_ids.contains(&id2),
+            "get_all_clients must include id2"
+        );
+        assert!(
+            returned_ids.contains(&id3),
+            "get_all_clients must include id3"
+        );
+    }
+
+    /// An unknown routing strategy must fall through to the `_` arm of the match,
+    /// which behaves identically to `"primary_fallback"`: it returns the first
+    /// healthy+enabled endpoint in team order.
+    ///
+    /// Expected to PASS.
+    #[tokio::test]
+    async fn test_select_endpoint_unknown_strategy_uses_primary_fallback() {
+        let pool = EndpointPool::new();
+        let mut team_eps = Vec::new();
+        let mut ids = Vec::new();
+
+        for i in 0..3 {
+            let id = Uuid::new_v4();
+            ids.push(id);
+            let ep = make_test_endpoint(id, &format!("ep-{i}"), false);
+            team_eps.push(ep.clone());
+            let client = make_test_client(ep);
+            client.healthy.store(true, Ordering::Relaxed);
+            insert_client(&pool, client).await;
+        }
+
+        // Use a strategy name that does not match any known arm
+        let selected = pool
+            .select_endpoint(&team_eps, None, "some_future_strategy")
+            .await
+            .unwrap();
+
+        // The `_` arm is identical to primary_fallback: returns the first healthy+enabled
+        // endpoint in team_endpoints order, which is ids[0].
+        assert_eq!(
+            selected.config.id, ids[0],
+            "unknown strategy must fall through to primary_fallback behavior (first healthy endpoint)"
+        );
     }
 }
