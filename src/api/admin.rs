@@ -1651,11 +1651,11 @@ pub async fn export_org_csv(
     };
 
     let mut csv = String::from(
-        "recorded_at,user,team,model,input_tokens,output_tokens,cache_read,cache_write,cost_usd,duration_ms,tool_count,endpoint\n",
+        "recorded_at,user,team,model,input_tokens,output_tokens,cache_read,cache_write,cost_usd,duration_ms,tool_count,endpoint,project_key,client_tag\n",
     );
     for row in &rows {
         csv.push_str(&format!(
-            "{},{},{},{},{},{},{},{},{:.4},{},{},{}\n",
+            "{},{},{},{},{},{},{},{},{:.4},{},{},{},{},{}\n",
             row.recorded_at.to_rfc3339(),
             row.user_identity.as_deref().unwrap_or(""),
             row.team_name.as_deref().unwrap_or(""),
@@ -1668,6 +1668,8 @@ pub async fn export_org_csv(
             row.duration_ms.unwrap_or(0),
             row.tool_count,
             row.endpoint_name.as_deref().unwrap_or(""),
+            row.project_key.as_deref().unwrap_or(""),
+            row.client_tag.as_deref().unwrap_or(""),
         ));
     }
 

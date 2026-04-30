@@ -27,6 +27,7 @@ pub struct RequestLogEntry {
     pub system_prompt_hash: Option<String>,
     pub detection_flags: Option<serde_json::Value>,
     pub endpoint_id: Option<Uuid>,
+    pub client_tag: Option<String>,
 }
 
 pub async fn insert_batch(pool: &PgPool, entries: &[RequestLogEntry]) -> anyhow::Result<()> {
@@ -38,10 +39,11 @@ pub async fn insert_batch(pool: &PgPool, entries: &[RequestLogEntry]) -> anyhow:
         "INSERT INTO spend_log (key_id, user_identity, request_id, model, streaming, duration_ms, \
          input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, \
          stop_reason, tool_count, tool_names, turn_count, thinking_enabled, has_system_prompt, \
-         session_id, project_key, tool_errors, has_correction, content_block_types, system_prompt_hash, detection_flags, endpoint_id) VALUES ",
+         session_id, project_key, tool_errors, has_correction, content_block_types, system_prompt_hash, \
+         detection_flags, endpoint_id, client_tag) VALUES ",
     );
 
-    let cols = 24;
+    let cols = 25;
     for (i, _) in entries.iter().enumerate() {
         if i > 0 {
             query.push_str(", ");
@@ -83,7 +85,8 @@ pub async fn insert_batch(pool: &PgPool, entries: &[RequestLogEntry]) -> anyhow:
             .bind(&entry.content_block_types)
             .bind(&entry.system_prompt_hash)
             .bind(&entry.detection_flags)
-            .bind(entry.endpoint_id);
+            .bind(entry.endpoint_id)
+            .bind(&entry.client_tag);
     }
 
     q.execute(pool).await?;
