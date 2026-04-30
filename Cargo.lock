@@ -900,7 +900,7 @@ dependencies = [
 
 [[package]]
 name = "ccag"
-version = "1.5.1"
+version = "1.5.3"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -960,7 +960,7 @@ dependencies = [
 
 [[package]]
 name = "ccag-cli"
-version = "1.5.1"
+version = "1.5.3"
 dependencies = [
  "anyhow",
  "clap",
