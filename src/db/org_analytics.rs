@@ -428,6 +428,8 @@ pub struct OrgExportRow {
     pub duration_ms: Option<i32>,
     pub tool_count: i16,
     pub endpoint_name: Option<String>,
+    pub project_key: Option<String>,
+    pub client_tag: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1258,7 +1260,9 @@ pub async fn org_export(
             estimate_cost_usd(sl.model, sl.input_tokens, sl.output_tokens, sl.cache_read_tokens, sl.cache_write_tokens)::float8 AS cost_usd,
             sl.duration_ms,
             sl.tool_count,
-            e.name AS endpoint_name
+            e.name AS endpoint_name,
+            sl.project_key,
+            sl.client_tag
         FROM spend_log sl
         LEFT JOIN users u ON sl.user_identity = u.email
         LEFT JOIN teams t ON u.team_id = t.id

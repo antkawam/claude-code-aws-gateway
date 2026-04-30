@@ -2544,6 +2544,34 @@ input[type="date"].oa-filter-select { background-image: none; padding-right: 8px
               </tbody>
             </table>
           </div>
+          <div class="card" style="margin-top:16px">
+            <div class="card-header"><h3>Client Attribution</h3></div>
+            <table class="settings-table">
+              <tbody>
+                <tr>
+                  <td style="width:200px"><strong>Project Key Depth</strong></td>
+                  <td>
+                    <div style="display:flex;align-items:center;gap:8px">
+                      <input class="form-input" id="project-key-depth-input" type="number" min="0" max="10" style="width:70px">
+                      <span style="color:var(--text-secondary)">path components</span>
+                      <button class="btn btn-primary btn-sm" onclick="saveProjectKeyDepth()">Save</button>
+                    </div>
+                    <div class="form-hint" style="margin-top:4px">Number of trailing path components stored as <code>project_key</code> in spend_log. 0 = full path. Default: 2.</div>
+                  </td>
+                </tr>
+                <tr>
+                  <td><strong>Client Path Marker</strong></td>
+                  <td>
+                    <div style="display:flex;align-items:center;gap:8px">
+                      <input class="form-input" id="client-path-marker-input" type="text" placeholder="e.g. clients" style="width:160px">
+                      <button class="btn btn-primary btn-sm" onclick="saveClientPathMarker()">Save</button>
+                    </div>
+                    <div class="form-hint" style="margin-top:4px">Directory name that marks the client boundary. The segment immediately after it is stored as <code>client_tag</code>. Leave blank to disable.</div>
+                  </td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
         </div>
 
         <div id="settings-status" style="display:none">
@@ -2552,6 +2580,8 @@ input[type="date"].oa-filter-select { background-image: none; padding-right: 8px
             <table>
               <tbody>
                 <tr><td style="width:200px;color:var(--text-muted)">Proxy URL</td><td id="info-url" style="font-family:var(--font-mono);font-size:12px"></td></tr>
+                <tr><td style="color:var(--text-muted)">Version</td><td id="info-version" style="font-family:var(--font-mono);font-size:12px">—</td></tr>
+                <tr><td style="color:var(--text-muted)">Uptime</td><td id="info-uptime">—</td></tr>
                 <tr><td style="color:var(--text-muted)">Health</td><td id="info-health"><span class="badge badge-green"><span class="badge-dot"></span>Healthy</span></td></tr>
                 <tr><td style="color:var(--text-muted)">Database</td><td id="info-db"><span class="badge badge-green"><span class="badge-dot"></span>Connected</span></td></tr>
                 <tr><td style="color:var(--text-muted)">Authentication</td><td id="info-auth-summary"></td></tr>
@@ -5679,6 +5709,8 @@ function renderSettings() {
     : '<span class="badge badge-yellow">None configured</span>';
 
   document.getElementById('session-ttl-input').value = data.settings.session_token_ttl_hours || 24;
+  document.getElementById('project-key-depth-input').value = data.settings.project_key_depth !== undefined ? data.settings.project_key_depth : 2;
+  document.getElementById('client-path-marker-input').value = data.settings.client_path_marker || '';
 
   // Hide Web Search nav item when websearch mode is disabled
   const wsNav = document.querySelector('.nav-item[data-page="websearch"]');
@@ -5813,6 +5845,25 @@ async function saveSessionTtl() {
   }
   const res = await api('PUT', '/admin/settings/session_token_ttl_hours', { value: String(num) });
   if (res.updated) { toast('Session TTL updated to ' + num + 'h', 'success'); loadAll(); }
+  else toast(res.error?.message || 'Failed to update setting', 'error');
+}
+
+async function saveProjectKeyDepth() {
+  const val = document.getElementById('project-key-depth-input').value;
+  const num = parseInt(val, 10);
+  if (isNaN(num) || num < 0 || num > 10) {
+    toast('Depth must be between 0 and 10', 'error');
+    return;
+  }
+  const res = await api('PUT', '/admin/settings/project_key_depth', { value: String(num) });
+  if (res.updated) { toast('Project key depth updated to ' + num, 'success'); loadAll(); }
+  else toast(res.error?.message || 'Failed to update setting', 'error');
+}
+
+async function saveClientPathMarker() {
+  const val = document.getElementById('client-path-marker-input').value.trim();
+  const res = await api('PUT', '/admin/settings/client_path_marker', { value: val });
+  if (res.updated) { toast(val ? 'Client path marker set to "' + val + '"' : 'Client path marker cleared', 'success'); loadAll(); }
   else toast(res.error?.message || 'Failed to update setting', 'error');
 }
 
@@ -6236,6 +6287,36 @@ function showSettingsTab(name, el) {
   document.getElementById('settings-' + name).style.display = 'block';
   document.querySelectorAll('#page-settings > .main-content > .tab-bar > .tab-item').forEach(t => t.classList.remove('active'));
   if (el) el.classList.add('active');
+  if (name === 'status') loadStatusInfo();
+}
+
+async function loadStatusInfo() {
+  try {
+    const s = await api('GET', '/admin/health/status');
+    if (!s || !s.gateway) return;
+    const vEl = document.getElementById('info-version');
+    if (vEl) vEl.textContent = s.gateway.version || '—';
+    const uEl = document.getElementById('info-uptime');
+    if (uEl) {
+      const secs = s.gateway.uptime_seconds || 0;
+      const h = Math.floor(secs / 3600), m = Math.floor((secs % 3600) / 60), sec = secs % 60;
+      uEl.textContent = h > 0 ? `${h}h ${m}m` : m > 0 ? `${m}m ${sec}s` : `${sec}s`;
+    }
+    const hEl = document.getElementById('info-health');
+    if (hEl) {
+      const ok = s.gateway.status === 'ok';
+      hEl.innerHTML = ok
+        ? '<span class="badge badge-green"><span class="badge-dot"></span>Healthy</span>'
+        : '<span class="badge badge-red"><span class="badge-dot"></span>Degraded</span>';
+    }
+    const dbEl = document.getElementById('info-db');
+    if (dbEl) {
+      const ok = s.database && s.database.status === 'ok';
+      dbEl.innerHTML = ok
+        ? '<span class="badge badge-green"><span class="badge-dot"></span>Connected</span>'
+        : '<span class="badge badge-red"><span class="badge-dot"></span>Error</span>';
+    }
+  } catch {}
 }
 
 // ---- IDP Modal ----

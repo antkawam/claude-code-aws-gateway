@@ -1651,11 +1651,11 @@ pub async fn export_org_csv(
     };
 
     let mut csv = String::from(
-        "recorded_at,user,team,model,input_tokens,output_tokens,cache_read,cache_write,cost_usd,duration_ms,tool_count,endpoint\n",
+        "recorded_at,user,team,model,input_tokens,output_tokens,cache_read,cache_write,cost_usd,duration_ms,tool_count,endpoint,project_key,client_tag\n",
     );
     for row in &rows {
         csv.push_str(&format!(
-            "{},{},{},{},{},{},{},{},{:.4},{},{},{}\n",
+            "{},{},{},{},{},{},{},{},{:.4},{},{},{},{},{}\n",
             row.recorded_at.to_rfc3339(),
             row.user_identity.as_deref().unwrap_or(""),
             row.team_name.as_deref().unwrap_or(""),
@@ -1668,6 +1668,8 @@ pub async fn export_org_csv(
             row.duration_ms.unwrap_or(0),
             row.tool_count,
             row.endpoint_name.as_deref().unwrap_or(""),
+            row.project_key.as_deref().unwrap_or(""),
+            row.client_tag.as_deref().unwrap_or(""),
         ));
     }
 
@@ -1858,11 +1860,24 @@ pub async fn get_settings(State(state): State<Arc<GatewayState>>, headers: Heade
         .ok()
         .flatten()
         .unwrap_or_else(|| "enabled".to_string());
+    let project_key_depth = db::settings::get_setting(&pool, "project_key_depth")
+        .await
+        .ok()
+        .flatten()
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(2);
+    let client_path_marker = db::settings::get_setting(&pool, "client_path_marker")
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or_default();
     Json(json!({
         "virtual_keys_enabled": state.virtual_keys_enabled(),
         "admin_login_enabled": state.admin_login_enabled(),
         "session_token_ttl_hours": state.session_token_ttl_hours.load(std::sync::atomic::Ordering::Relaxed),
         "websearch_mode": websearch_mode,
+        "project_key_depth": project_key_depth,
+        "client_path_marker": client_path_marker,
     }))
     .into_response()
 }
@@ -1895,6 +1910,13 @@ pub async fn update_setting(
                 );
             }
         },
+        "project_key_depth" => match body.value.parse::<usize>() {
+            Ok(_) => {}
+            _ => {
+                return error_response(StatusCode::BAD_REQUEST, "Value must be a non-negative integer");
+            }
+        },
+        "client_path_marker" => {}
         _ => return error_response(StatusCode::BAD_REQUEST, &format!("Unknown setting: {key}")),
     }
 
@@ -3072,7 +3094,7 @@ pub async fn get_health_status(
     };
 
     Json(json!({
-        "gateway": { "status": gateway_status, "uptime_seconds": uptime_seconds },
+        "gateway": { "status": gateway_status, "uptime_seconds": uptime_seconds, "version": env!("CARGO_PKG_VERSION") },
         "database": { "status": db_status, "pool_size": db_pool_size, "pool_idle": db_pool_idle },
         "bedrock": { "status": bedrock_status, "last_check": bedrock_last_check },
         "endpoints": endpoints,

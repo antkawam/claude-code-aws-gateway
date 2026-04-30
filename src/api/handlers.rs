@@ -63,6 +63,7 @@ struct RequestInfo {
     // Session tracking fields
     session_id: Option<String>,
     project_key: Option<String>,
+    client_tag: Option<String>,
     tool_errors: Option<Value>,
     has_correction: bool,
     content_block_types: Vec<String>,
@@ -381,7 +382,18 @@ pub async fn messages(
     }
 
     // Extract request metadata before translation
-    let req_info = extract_request_info(&body);
+    let project_key_depth = crate::db::settings::get_setting(&state.db().await, "project_key_depth")
+        .await
+        .ok()
+        .flatten()
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(2);
+    let client_path_marker =
+        crate::db::settings::get_setting(&state.db().await, "client_path_marker")
+            .await
+            .ok()
+            .flatten();
+    let req_info = extract_request_info(&body, project_key_depth, client_path_marker.as_deref());
 
     let is_streaming = body.stream.unwrap_or(false);
     let original_model = body.model.clone();
@@ -555,6 +567,7 @@ pub async fn messages(
             system_prompt_hash: req_info.system_prompt_hash.clone(),
             detection_flags: None,
             endpoint_id,
+            client_tag: req_info.client_tag.clone(),
         };
 
         let mock_resp = if is_streaming {
@@ -771,7 +784,11 @@ fn reprefix_model(model: &str, old_prefix: &str, new_prefix: &str) -> String {
     }
 }
 
-fn extract_request_info(req: &request::AnthropicRequest) -> RequestInfo {
+fn extract_request_info(
+    req: &request::AnthropicRequest,
+    project_key_depth: usize,
+    client_path_marker: Option<&str>,
+) -> RequestInfo {
     // Extract actual tool invocations from assistant messages (tool_use content blocks),
     // not from the tools array (which is just tool definitions sent every request).
     let mut tool_names: Vec<String> = Vec::new();
@@ -857,7 +874,8 @@ fn extract_request_info(req: &request::AnthropicRequest) -> RequestInfo {
         .map(String::from);
 
     // Project key: extract git remote from system prompt if present
-    let project_key = extract_project_key(&req.system);
+    let project_key = extract_project_key(&req.system, project_key_depth);
+    let client_tag = extract_client_tag(&req.system, client_path_marker);
 
     // System prompt hash for dedup/change detection
     let system_prompt_hash = req.system.as_ref().map(|sys| {
@@ -885,6 +903,7 @@ fn extract_request_info(req: &request::AnthropicRequest) -> RequestInfo {
         has_system_prompt: req.system.is_some(),
         session_id,
         project_key,
+        client_tag,
         tool_errors: if tool_errors.is_empty() {
             None
         } else {
@@ -897,9 +916,8 @@ fn extract_request_info(req: &request::AnthropicRequest) -> RequestInfo {
     }
 }
 
-/// Extract project key from system prompt. CC includes an <env> block with the
-/// working directory path. We use that as a project identifier.
-fn extract_project_key(system: &Option<Value>) -> Option<String> {
+/// Extract the working directory path from CC's system prompt <env> block.
+fn extract_working_dir(system: &Option<Value>) -> Option<String> {
     let sys = system.as_ref()?;
     let text = match sys {
         Value::String(s) => s.clone(),
@@ -910,22 +928,41 @@ fn extract_project_key(system: &Option<Value>) -> Option<String> {
             .join("\n"),
         _ => return None,
     };
-    // Look for working directory in CC's <env> block
-    // Pattern: "Primary working directory: /path/to/project"
     for line in text.lines() {
         let trimmed = line.trim().trim_start_matches("- ");
         if let Some(path) = trimmed.strip_prefix("Primary working directory: ") {
-            // Normalize: take last 2 path components as project key
-            let parts: Vec<&str> = path.trim().split('/').filter(|s| !s.is_empty()).collect();
-            if parts.len() >= 2 {
-                return Some(format!(
-                    "{}/{}",
-                    parts[parts.len() - 2],
-                    parts[parts.len() - 1]
-                ));
-            } else if !parts.is_empty() {
-                return Some(parts.last().unwrap().to_string());
-            }
+            return Some(path.trim().to_string());
+        }
+    }
+    None
+}
+
+/// Extract project key from system prompt. CC includes an <env> block with the
+/// working directory path. `depth` controls how many trailing path components to
+/// keep (0 = full path, default 2 preserves the original two-component behaviour).
+fn extract_project_key(system: &Option<Value>, depth: usize) -> Option<String> {
+    let path = extract_working_dir(system)?;
+    if depth == 0 {
+        return Some(path);
+    }
+    let parts: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+    if parts.is_empty() {
+        return None;
+    }
+    let take = depth.min(parts.len());
+    Some(parts[parts.len() - take..].join("/"))
+}
+
+/// Extract client tag from system prompt. Scans the working directory path for
+/// `marker` (e.g. "clients") and returns the immediately following path segment.
+/// Configured via the `client_path_marker` proxy setting.
+fn extract_client_tag(system: &Option<Value>, marker: Option<&str>) -> Option<String> {
+    let marker = marker?;
+    let path = extract_working_dir(system)?;
+    let parts: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+    for (i, part) in parts.iter().enumerate() {
+        if part.eq_ignore_ascii_case(marker) {
+            return parts.get(i + 1).map(|s| s.to_string());
         }
     }
     None
@@ -1024,6 +1061,7 @@ async fn handle_non_streaming(
                             system_prompt_hash: req_info.system_prompt_hash,
                             detection_flags: req_info.detection_flags,
                             endpoint_id,
+                            client_tag: req_info.client_tag,
                         })
                         .await;
 
@@ -1215,6 +1253,7 @@ async fn handle_streaming(
                     system_prompt_hash: req_info.system_prompt_hash,
                     detection_flags: req_info.detection_flags,
                     endpoint_id,
+                    client_tag: req_info.client_tag,
                 }).await;
 
                 metrics.record_tokens(&model_for_spend, input_tokens as u64, output_tokens as u64, cache_read_tokens as u64, cache_write_tokens as u64);
@@ -1538,6 +1577,7 @@ async fn handle_with_web_search(
             system_prompt_hash: req_info.system_prompt_hash,
             detection_flags: req_info.detection_flags,
             endpoint_id,
+            client_tag: req_info.client_tag,
         })
         .await;
 
@@ -2415,7 +2455,7 @@ mod tests {
             "text": "Environment info:\n - Primary working directory: /Users/dev/projects/my-app\n - Is a git repository: true"
         }]));
         assert_eq!(
-            extract_project_key(&system),
+            extract_project_key(&system, 2),
             Some("projects/my-app".to_string())
         );
     }
@@ -2426,15 +2466,15 @@ mod tests {
             "Primary working directory: /home/user/code/repo-name"
         ));
         assert_eq!(
-            extract_project_key(&system),
+            extract_project_key(&system, 2),
             Some("code/repo-name".to_string())
         );
     }
 
     #[test]
     fn test_extract_project_key_none() {
-        assert_eq!(extract_project_key(&None), None);
-        assert_eq!(extract_project_key(&Some(json!("no path here"))), None);
+        assert_eq!(extract_project_key(&None, 2), None);
+        assert_eq!(extract_project_key(&Some(json!("no path here")), 2), None);
     }
 
     #[test]
@@ -2449,7 +2489,7 @@ mod tests {
             ]}),
         ]);
 
-        let info = extract_request_info(&req);
+        let info = extract_request_info(&req, 2, None);
         assert_eq!(info.tool_count, 1);
         assert_eq!(info.tool_names, vec!["Bash"]);
         assert!(info.tool_errors.is_some());
@@ -2468,7 +2508,7 @@ mod tests {
             json!({"role": "user", "content": [{"type": "text", "text": "no, use pytest not unittest"}]}),
         ]);
 
-        let info = extract_request_info(&req);
+        let info = extract_request_info(&req, 2, None);
         assert!(info.has_correction);
     }
 
@@ -2484,7 +2524,7 @@ mod tests {
             ]}),
         ]);
 
-        let info = extract_request_info(&req);
+        let info = extract_request_info(&req, 2, None);
         assert!(!info.has_correction);
     }
 
@@ -2493,7 +2533,7 @@ mod tests {
         let mut req = make_request(vec![json!({"role": "user", "content": "hello"})]);
         req.metadata = Some(json!({"user_id": "session-abc-123"}));
 
-        let info = extract_request_info(&req);
+        let info = extract_request_info(&req, 2, None);
         assert_eq!(info.session_id, Some("session-abc-123".to_string()));
     }
 
@@ -2511,7 +2551,7 @@ mod tests {
             ]}),
         ]);
 
-        let info = extract_request_info(&req);
+        let info = extract_request_info(&req, 2, None);
         let mut types = info.content_block_types.clone();
         types.sort();
         assert_eq!(types, vec!["text", "thinking", "tool_result", "tool_use"]);
@@ -2522,7 +2562,7 @@ mod tests {
         let mut req = make_request(vec![json!({"role": "user", "content": "hello"})]);
         req.system = Some(json!("You are helpful."));
 
-        let info = extract_request_info(&req);
+        let info = extract_request_info(&req, 2, None);
         assert!(info.system_prompt_hash.is_some());
         assert_eq!(info.system_prompt_hash.as_ref().unwrap().len(), 16);
     }
