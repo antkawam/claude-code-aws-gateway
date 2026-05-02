@@ -1601,6 +1601,7 @@ input[type="date"].oa-filter-select { background-image: none; padding-right: 8px
     <div class="sidebar-brand">
       <h1>Claude Code <span style="color:var(--accent)">AWS</span> Gateway</h1>
       <div class="brand-sub" id="brand-host"></div>
+      <div class="brand-sub" id="brand-version" style="opacity:0.5"></div>
     </div>
     <nav class="sidebar-nav">
       <div class="nav-section">
@@ -2551,7 +2552,8 @@ input[type="date"].oa-filter-select { background-image: none; padding-right: 8px
             <div class="card-header"><h3>Proxy Status</h3></div>
             <table>
               <tbody>
-                <tr><td style="width:200px;color:var(--text-muted)">Proxy URL</td><td id="info-url" style="font-family:var(--font-mono);font-size:12px"></td></tr>
+                <tr><td style="width:200px;color:var(--text-muted)">Version</td><td id="info-version" style="font-family:var(--font-mono);font-size:12px"></td></tr>
+                <tr><td style="color:var(--text-muted)">Proxy URL</td><td id="info-url" style="font-family:var(--font-mono);font-size:12px"></td></tr>
                 <tr><td style="color:var(--text-muted)">Health</td><td id="info-health"><span class="badge badge-green"><span class="badge-dot"></span>Healthy</span></td></tr>
                 <tr><td style="color:var(--text-muted)">Database</td><td id="info-db"><span class="badge badge-green"><span class="badge-dot"></span>Connected</span></td></tr>
                 <tr><td style="color:var(--text-muted)">Authentication</td><td id="info-auth-summary"></td></tr>
@@ -3399,11 +3401,13 @@ function navigate(page) {
 // ---- Load all data ----
 async function loadAll() {
   try {
-    // User-accessible endpoints (keys + analytics)
-    const [keys] = await Promise.all([
+    // User-accessible endpoints (keys + analytics + health)
+    const [keys, health] = await Promise.all([
       api('GET', '/admin/keys'),
+      fetch(proxyUrl + '/health').then(r => r.json()).catch(() => ({})),
     ]);
     data.keys = keys.keys || [];
+    data.health = health;
 
     // Admin-only endpoints
     if (currentUserRole === 'admin') {
@@ -5650,6 +5654,9 @@ async function wsCardTest(type) {
 // ---- Settings ----
 function renderSettings() {
   document.getElementById('brand-host').textContent = window.location.host;
+  const version = (data.health && data.health.version) || '';
+  document.getElementById('brand-version').textContent = version ? 'v' + version : '';
+  document.getElementById('info-version').textContent = version;
   document.getElementById('info-url').textContent = proxyUrl;
 
   const vkEnabled = data.settings.virtual_keys_enabled !== false && data.settings.virtual_keys_enabled !== 'false';
@@ -5680,7 +5687,11 @@ function renderSettings() {
 
   document.getElementById('session-ttl-input').value = data.settings.session_token_ttl_hours || 24;
 
-  // Hide Web Search nav item when websearch mode is disabled
+  // Hide nav items when their features are disabled
+  const vkNav = document.querySelector('.nav-item[data-page="keys"]');
+  if (vkNav) {
+    vkNav.style.display = (data.settings.virtual_keys_enabled === false || data.settings.virtual_keys_enabled === 'false') ? 'none' : '';
+  }
   const wsNav = document.querySelector('.nav-item[data-page="websearch"]');
   if (wsNav) {
     wsNav.style.display = data.settings.websearch_mode === 'disabled' ? 'none' : '';
