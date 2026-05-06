@@ -1,6 +1,6 @@
 [package]
 name = "ccag-cli"
-version = "1.5.2"
+version = "1.6.0"
 edition = "2024"
 description = "CLI management tool for Claude Code AWS Gateway — manage keys, users, teams, and budgets"
 repository = "https://github.com/antkawam/claude-code-aws-gateway"
