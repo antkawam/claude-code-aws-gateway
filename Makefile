@@ -20,6 +20,7 @@ fmt: ## Auto-format code
 	cargo fmt --all
 
 test-integration: ## Run integration tests (requires Docker)
+	@docker compose -f docker-compose.yml down 2>/dev/null || true
 	@docker compose -f docker-compose.test.yml up -d --wait 2>/dev/null || \
 		(docker-compose -f docker-compose.test.yml up -d 2>/dev/null && \
 		echo "Waiting for postgres..." && \
