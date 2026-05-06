@@ -18,6 +18,22 @@ pub struct EndpointClient {
     pub quota_cache: crate::quota::QuotaCache,
     pub healthy: AtomicBool,
     pub last_health_check: AtomicI64,
+    /// Bedrock inference profile IDs available on this endpoint (e.g. `us.anthropic.claude-opus-4-7`).
+    /// Populated by the health check loop; empty until the first successful tick.
+    pub available_models: Arc<RwLock<Vec<String>>>,
+}
+
+impl EndpointClient {
+    /// Returns `true` if any entry in `available_models` ends with `bedrock_model_id`.
+    ///
+    /// Uses suffix matching so callers can query with a short suffix like
+    /// `"anthropic.claude-opus-4-7"` and still match the full profile ID
+    /// `"us.anthropic.claude-opus-4-7"`.  Using `ends_with` (not `contains`)
+    /// avoids false positives where a shorter partial ID would match a longer one.
+    pub async fn supports_model(&self, bedrock_model_id: &str) -> bool {
+        let models = self.available_models.read().await;
+        models.iter().any(|m| m.ends_with(bedrock_model_id))
+    }
 }
 
 /// Manages multiple Bedrock clients and request routing.
@@ -31,6 +47,9 @@ pub struct EndpointPool {
     max_affinity_entries: usize,
     /// Counter for round-robin strategy.
     round_robin_counter: AtomicUsize,
+    /// Bedrock inference profile IDs available on the gateway's default Bedrock endpoint.
+    /// Populated by the health check loop every 60s; empty until the first successful tick.
+    pub default_available_models: RwLock<Vec<String>>,
 }
 
 /// Affinity TTL: 30 minutes of inactivity.
@@ -50,6 +69,7 @@ impl EndpointPool {
             user_affinity: RwLock::new(HashMap::new()),
             max_affinity_entries: 10_000,
             round_robin_counter: AtomicUsize::new(0),
+            default_available_models: RwLock::new(vec![]),
         }
     }
 
@@ -124,6 +144,7 @@ impl EndpointPool {
             quota_cache: crate::quota::QuotaCache::new(quota_client),
             healthy: AtomicBool::new(false),
             last_health_check: AtomicI64::new(0),
+            available_models: Arc::new(RwLock::new(vec![])),
         })
     }
 
@@ -234,6 +255,39 @@ impl EndpointPool {
         fallbacks
     }
 
+    /// Filter `team_endpoints` to those whose `EndpointClient` supports `bedrock_model`.
+    ///
+    /// Uses `EndpointClient::supports_model` (suffix matching) so callers can pass
+    /// either the full profile ID (`us.anthropic.claude-sonnet-4-6`) or just the
+    /// suffix (`anthropic.claude-sonnet-4-6`).
+    ///
+    /// Endpoints whose client is not loaded in the pool are excluded.
+    /// Endpoints with an empty `available_models` list (not yet health-checked) are excluded.
+    pub async fn filter_by_model(
+        &self,
+        team_endpoints: &[Endpoint],
+        bedrock_model: &str,
+    ) -> Vec<Endpoint> {
+        // Collect (id, Arc<EndpointClient>) pairs under the lock, then drop the lock
+        // before any await points to avoid holding a read-lock across awaits.
+        let clients_snapshot: std::collections::HashMap<_, _> = {
+            let guard = self.clients.read().await;
+            guard
+                .iter()
+                .map(|(id, client)| (*id, Arc::clone(client)))
+                .collect()
+        };
+        let mut result = Vec::new();
+        for ep in team_endpoints {
+            if let Some(client) = clients_snapshot.get(&ep.id)
+                && client.supports_model(bedrock_model).await
+            {
+                result.push(ep.clone());
+            }
+        }
+        result
+    }
+
     /// Update user affinity after a successful request.
     pub async fn update_affinity(&self, user_identity: &str, endpoint_id: Uuid) {
         let mut affinity = self.user_affinity.write().await;
@@ -341,6 +395,7 @@ mod tests {
             quota_cache: crate::quota::QuotaCache::new(quota_client),
             healthy: AtomicBool::new(true),
             last_health_check: AtomicI64::new(0),
+            available_models: Arc::new(RwLock::new(vec![])),
         }
     }
 
@@ -703,6 +758,7 @@ mod tests {
             user_affinity: RwLock::new(HashMap::new()),
             max_affinity_entries: 3,
             round_robin_counter: AtomicUsize::new(0),
+            default_available_models: RwLock::new(vec![]),
         };
 
         let ep_id = Uuid::new_v4();
@@ -976,10 +1032,6 @@ mod tests {
 
     /// When the default endpoint exists in the pool but has `enabled = false`,
     /// `select_endpoint` with empty `team_endpoints` should return `None`.
-    ///
-    /// NOTE: This test is expected to FAIL until the builder adds an `enabled`
-    /// check in the default-endpoint path of `select_endpoint`. The current
-    /// implementation only checks `healthy`, not `enabled`.
     #[tokio::test]
     async fn test_default_endpoint_disabled_returns_none() {
         let pool = EndpointPool::new();
@@ -1052,6 +1104,7 @@ mod tests_slice2 {
             quota_cache: crate::quota::QuotaCache::new(quota_client),
             healthy: AtomicBool::new(true),
             last_health_check: AtomicI64::new(0),
+            available_models: Arc::new(RwLock::new(vec![])),
         }
     }
 
@@ -1063,9 +1116,6 @@ mod tests_slice2 {
     /// `select_endpoint` with `"primary_fallback"` must skip team endpoints that
     /// have `enabled = false`, even when those endpoints are healthy. The first
     /// healthy AND enabled team endpoint must be returned.
-    ///
-    /// NOTE: Expected to FAIL until the builder adds an `enabled` check in the
-    /// team-endpoint path of `select_endpoint`.
     #[tokio::test]
     async fn test_select_team_endpoint_disabled_skipped_primary_fallback() {
         let pool = EndpointPool::new();
@@ -1099,9 +1149,6 @@ mod tests_slice2 {
 
     /// `select_endpoint` with `"round_robin"` must never return a team endpoint
     /// that has `enabled = false`, even when it is healthy.
-    ///
-    /// NOTE: Expected to FAIL until the builder adds an `enabled` check in the
-    /// round-robin path of `select_endpoint`.
     #[tokio::test]
     async fn test_select_team_endpoint_disabled_skipped_round_robin() {
         let pool = EndpointPool::new();
@@ -1186,9 +1233,6 @@ mod tests_slice2 {
 
     /// `get_fallback_endpoints` must exclude team endpoints that have
     /// `enabled = false`, even when those endpoints are healthy.
-    ///
-    /// NOTE: Expected to FAIL until the builder adds an `enabled` check in
-    /// `get_fallback_endpoints`.
     #[tokio::test]
     async fn test_fallback_excludes_disabled() {
         let pool = EndpointPool::new();
@@ -1365,6 +1409,7 @@ mod tests_slice3 {
             quota_cache: crate::quota::QuotaCache::new(quota_client),
             healthy: AtomicBool::new(true),
             last_health_check: AtomicI64::new(0),
+            available_models: Arc::new(RwLock::new(vec![])),
         }
     }
 
@@ -1749,6 +1794,503 @@ mod tests_slice4 {
     }
 }
 
+// ── Dynamic Model Availability — Slice 1 tests ──
+
+#[cfg(test)]
+mod tests_dynamic_model_slice1 {
+    use super::*;
+
+    fn make_test_endpoint(
+        id: uuid::Uuid,
+        name: &str,
+        is_default: bool,
+    ) -> crate::db::schema::Endpoint {
+        crate::db::schema::Endpoint {
+            id,
+            name: name.to_string(),
+            role_arn: None,
+            external_id: None,
+            inference_profile_arn: None,
+            region: "us-east-1".to_string(),
+            routing_prefix: "us".to_string(),
+            priority: 0,
+            is_default,
+            enabled: true,
+            created_at: chrono::Utc::now(),
+        }
+    }
+
+    fn make_test_client_with_models(
+        ep: crate::db::schema::Endpoint,
+        models: Vec<String>,
+    ) -> EndpointClient {
+        let runtime_client = aws_sdk_bedrockruntime::Client::from_conf(
+            aws_sdk_bedrockruntime::Config::builder()
+                .behavior_version(aws_sdk_bedrockruntime::config::BehaviorVersion::latest())
+                .region(aws_config::Region::new("us-east-1"))
+                .build(),
+        );
+        let control_client = aws_sdk_bedrock::Client::from_conf(
+            aws_sdk_bedrock::Config::builder()
+                .behavior_version(aws_sdk_bedrock::config::BehaviorVersion::latest())
+                .region(aws_config::Region::new("us-east-1"))
+                .build(),
+        );
+        let quota_client = aws_sdk_servicequotas::Client::from_conf(
+            aws_sdk_servicequotas::Config::builder()
+                .behavior_version(aws_sdk_servicequotas::config::BehaviorVersion::latest())
+                .region(aws_config::Region::new("us-east-1"))
+                .build(),
+        );
+        EndpointClient {
+            config: ep,
+            runtime_client,
+            control_client,
+            quota_cache: crate::quota::QuotaCache::new(quota_client),
+            healthy: AtomicBool::new(true),
+            last_health_check: AtomicI64::new(0),
+            available_models: Arc::new(tokio::sync::RwLock::new(models)),
+        }
+    }
+
+    /// `supports_model` returns `true` when the exact profile ID is in the list.
+    #[tokio::test]
+    async fn test_supports_model_returns_true_for_exact_match() {
+        let ep = make_test_endpoint(uuid::Uuid::new_v4(), "ep", false);
+        let client = make_test_client_with_models(
+            ep,
+            vec![
+                "us.anthropic.claude-opus-4-7".to_string(),
+                "us.anthropic.claude-sonnet-4-6-20250514".to_string(),
+            ],
+        );
+
+        assert!(
+            client.supports_model("us.anthropic.claude-opus-4-7").await,
+            "supports_model must return true for an exact match in available_models"
+        );
+    }
+
+    /// `supports_model` returns `false` when the model ID is not in the list.
+    #[tokio::test]
+    async fn test_supports_model_returns_false_for_absent_model() {
+        let ep = make_test_endpoint(uuid::Uuid::new_v4(), "ep", false);
+        let client = make_test_client_with_models(
+            ep,
+            vec!["us.anthropic.claude-sonnet-4-6-20250514".to_string()],
+        );
+
+        assert!(
+            !client.supports_model("us.anthropic.claude-opus-4-7").await,
+            "supports_model must return false when the model ID is not in available_models"
+        );
+    }
+
+    /// `supports_model` returns `false` when `available_models` is empty.
+    #[tokio::test]
+    async fn test_supports_model_empty_list_returns_false() {
+        let ep = make_test_endpoint(uuid::Uuid::new_v4(), "ep", false);
+        let client = make_test_client_with_models(ep, vec![]);
+
+        assert!(
+            !client.supports_model("us.anthropic.claude-opus-4-7").await,
+            "supports_model must return false when available_models is empty"
+        );
+    }
+
+    /// `supports_model` uses contains-based (substring) matching so that a
+    /// caller can query with the suffix portion of the profile ID (without the
+    /// region prefix) and still get a match.
+    ///
+    /// Health loop stores full IDs like `us.anthropic.claude-opus-4-7`.
+    /// Routing code may construct the suffix `anthropic.claude-opus-4-7` from
+    /// the model mapping. The method must match both forms.
+    #[tokio::test]
+    async fn test_supports_model_contains_suffix_match() {
+        let ep = make_test_endpoint(uuid::Uuid::new_v4(), "ep", false);
+        let client =
+            make_test_client_with_models(ep, vec!["us.anthropic.claude-opus-4-7".to_string()]);
+
+        // Query with the suffix (no region prefix)
+        assert!(
+            client.supports_model("anthropic.claude-opus-4-7").await,
+            "supports_model must match when the query is a suffix of a stored profile ID"
+        );
+    }
+
+    /// `supports_model` must NOT match a different model just because it shares a
+    /// common prefix with a stored ID.
+    ///
+    /// E.g. `us.anthropic.claude-opus-4` should NOT match
+    /// `us.anthropic.claude-opus-4-7`.
+    #[tokio::test]
+    async fn test_supports_model_no_false_positive_partial_prefix() {
+        let ep = make_test_endpoint(uuid::Uuid::new_v4(), "ep", false);
+        let client =
+            make_test_client_with_models(ep, vec!["us.anthropic.claude-opus-4-7".to_string()]);
+
+        // A shorter string that is a prefix of the stored ID should NOT match
+        assert!(
+            !client.supports_model("anthropic.claude-opus-4").await,
+            "supports_model must not return a false positive for a partial/shorter model ID"
+        );
+    }
+
+    /// `available_models` starts empty on a fresh `EndpointClient` (before the
+    /// health loop populates it).
+    #[tokio::test]
+    async fn test_available_models_starts_empty_on_new_client() {
+        // Build a client the same way `create_client` will (no models supplied).
+        let ep = make_test_endpoint(uuid::Uuid::new_v4(), "ep", false);
+        let client = make_test_client_with_models(ep, vec![]);
+
+        let models = client.available_models.read().await;
+        assert!(
+            models.is_empty(),
+            "available_models must be empty before the health loop populates it"
+        );
+    }
+
+    /// Writing to `available_models` is reflected in subsequent `supports_model`
+    /// calls, simulating the health loop storing the profile list.
+    #[tokio::test]
+    async fn test_supports_model_reflects_update_after_write() {
+        let ep = make_test_endpoint(uuid::Uuid::new_v4(), "ep", false);
+        let client = make_test_client_with_models(ep, vec![]);
+
+        // Sanity: absent before write
+        assert!(
+            !client
+                .supports_model("us.anthropic.claude-sonnet-4-6-20250514")
+                .await,
+            "model must not be found before the list is populated"
+        );
+
+        // Simulate health loop storing profiles
+        {
+            let mut models = client.available_models.write().await;
+            models.push("us.anthropic.claude-sonnet-4-6-20250514".to_string());
+        }
+
+        assert!(
+            client
+                .supports_model("us.anthropic.claude-sonnet-4-6-20250514")
+                .await,
+            "supports_model must return true after available_models is updated"
+        );
+    }
+}
+
+// ── Dynamic Model Availability — Slice 3 tests ──
+// Tests for model-based filtering of endpoint candidates at request time.
+
+#[cfg(test)]
+mod tests_model_filtering_slice3 {
+    use super::*;
+
+    // ── helpers ────────────────────────────────────────────────────────────
+
+    fn make_test_endpoint(id: Uuid, name: &str) -> Endpoint {
+        Endpoint {
+            id,
+            name: name.to_string(),
+            role_arn: None,
+            external_id: None,
+            inference_profile_arn: None,
+            region: "us-east-1".to_string(),
+            routing_prefix: "us".to_string(),
+            priority: 0,
+            is_default: false,
+            enabled: true,
+            created_at: chrono::Utc::now(),
+        }
+    }
+
+    fn make_test_client_with_models(ep: Endpoint, models: Vec<String>) -> EndpointClient {
+        let runtime_client = aws_sdk_bedrockruntime::Client::from_conf(
+            aws_sdk_bedrockruntime::Config::builder()
+                .behavior_version(aws_sdk_bedrockruntime::config::BehaviorVersion::latest())
+                .region(aws_config::Region::new("us-east-1"))
+                .build(),
+        );
+        let control_client = aws_sdk_bedrock::Client::from_conf(
+            aws_sdk_bedrock::Config::builder()
+                .behavior_version(aws_sdk_bedrock::config::BehaviorVersion::latest())
+                .region(aws_config::Region::new("us-east-1"))
+                .build(),
+        );
+        let quota_client = aws_sdk_servicequotas::Client::from_conf(
+            aws_sdk_servicequotas::Config::builder()
+                .behavior_version(aws_sdk_servicequotas::config::BehaviorVersion::latest())
+                .region(aws_config::Region::new("us-east-1"))
+                .build(),
+        );
+        EndpointClient {
+            config: ep,
+            runtime_client,
+            control_client,
+            quota_cache: crate::quota::QuotaCache::new(quota_client),
+            healthy: AtomicBool::new(true),
+            last_health_check: AtomicI64::new(0),
+            available_models: Arc::new(RwLock::new(models)),
+        }
+    }
+
+    async fn insert_client(pool: &EndpointPool, client: EndpointClient) {
+        let mut clients = pool.clients.write().await;
+        clients.insert(client.config.id, Arc::new(client));
+    }
+
+    // ── Test 1 ─────────────────────────────────────────────────────────────
+
+    /// `filter_by_model` must return only those endpoints whose `EndpointClient`
+    /// has the requested model in `available_models`.
+    ///
+    /// Given 3 endpoints where only 2 support `"anthropic.claude-sonnet-4-6-20250514"`,
+    /// the filter must return exactly those 2 and exclude the third.
+    #[tokio::test]
+    async fn test_filter_returns_only_matching_endpoints() {
+        let pool = EndpointPool::new();
+
+        let id_a = Uuid::new_v4();
+        let id_b = Uuid::new_v4();
+        let id_c = Uuid::new_v4();
+
+        let target_model = "us.anthropic.claude-sonnet-4-6-20250514";
+
+        // Endpoint A: supports the target model
+        insert_client(
+            &pool,
+            make_test_client_with_models(
+                make_test_endpoint(id_a, "ep-a"),
+                vec![
+                    target_model.to_string(),
+                    "us.anthropic.claude-opus-4-7".to_string(),
+                ],
+            ),
+        )
+        .await;
+
+        // Endpoint B: supports the target model (only)
+        insert_client(
+            &pool,
+            make_test_client_with_models(
+                make_test_endpoint(id_b, "ep-b"),
+                vec![target_model.to_string()],
+            ),
+        )
+        .await;
+
+        // Endpoint C: does NOT support the target model
+        insert_client(
+            &pool,
+            make_test_client_with_models(
+                make_test_endpoint(id_c, "ep-c"),
+                vec!["us.anthropic.claude-opus-4-7".to_string()],
+            ),
+        )
+        .await;
+
+        let team_eps = vec![
+            make_test_endpoint(id_a, "ep-a"),
+            make_test_endpoint(id_b, "ep-b"),
+            make_test_endpoint(id_c, "ep-c"),
+        ];
+
+        let filtered = pool
+            .filter_by_model(&team_eps, "anthropic.claude-sonnet-4-6-20250514")
+            .await;
+
+        assert_eq!(
+            filtered.len(),
+            2,
+            "filter_by_model must return exactly 2 endpoints that support the model"
+        );
+
+        let filtered_ids: Vec<Uuid> = filtered.iter().map(|e| e.id).collect();
+        assert!(
+            filtered_ids.contains(&id_a),
+            "endpoint A (supports model) must be in the filtered result"
+        );
+        assert!(
+            filtered_ids.contains(&id_b),
+            "endpoint B (supports model) must be in the filtered result"
+        );
+        assert!(
+            !filtered_ids.contains(&id_c),
+            "endpoint C (does not support model) must be excluded from the filtered result"
+        );
+    }
+
+    // ── Test 2 ─────────────────────────────────────────────────────────────
+
+    /// `filter_by_model` must return an empty vec when no endpoint in
+    /// `team_endpoints` supports the requested model.
+    #[tokio::test]
+    async fn test_filter_returns_empty_when_no_endpoint_supports_model() {
+        let pool = EndpointPool::new();
+
+        let id_a = Uuid::new_v4();
+        let id_b = Uuid::new_v4();
+
+        // Both endpoints only have claude-opus-4-7 — not the requested sonnet model
+        insert_client(
+            &pool,
+            make_test_client_with_models(
+                make_test_endpoint(id_a, "ep-a"),
+                vec!["us.anthropic.claude-opus-4-7".to_string()],
+            ),
+        )
+        .await;
+        insert_client(
+            &pool,
+            make_test_client_with_models(
+                make_test_endpoint(id_b, "ep-b"),
+                vec!["us.anthropic.claude-opus-4-7".to_string()],
+            ),
+        )
+        .await;
+
+        let team_eps = vec![
+            make_test_endpoint(id_a, "ep-a"),
+            make_test_endpoint(id_b, "ep-b"),
+        ];
+
+        let filtered = pool
+            .filter_by_model(&team_eps, "anthropic.claude-sonnet-4-6-20250514")
+            .await;
+
+        assert!(
+            filtered.is_empty(),
+            "filter_by_model must return empty vec when no endpoint supports the model"
+        );
+    }
+
+    // ── Test 3 ─────────────────────────────────────────────────────────────
+
+    /// Endpoints with an empty `available_models` list (not yet health-checked)
+    /// must be excluded from `filter_by_model` results. An empty model list means
+    /// the endpoint hasn't received its first health check yet and we cannot
+    /// confirm model availability.
+    #[tokio::test]
+    async fn test_filter_excludes_endpoints_with_empty_available_models() {
+        let pool = EndpointPool::new();
+
+        let id_a = Uuid::new_v4();
+        let id_b = Uuid::new_v4();
+
+        // Both endpoints have empty available_models (startup state, no health tick yet)
+        insert_client(
+            &pool,
+            make_test_client_with_models(make_test_endpoint(id_a, "ep-a"), vec![]),
+        )
+        .await;
+        insert_client(
+            &pool,
+            make_test_client_with_models(make_test_endpoint(id_b, "ep-b"), vec![]),
+        )
+        .await;
+
+        let team_eps = vec![
+            make_test_endpoint(id_a, "ep-a"),
+            make_test_endpoint(id_b, "ep-b"),
+        ];
+
+        let filtered = pool
+            .filter_by_model(&team_eps, "anthropic.claude-sonnet-4-6-20250514")
+            .await;
+
+        assert!(
+            filtered.is_empty(),
+            "filter_by_model must return empty vec for endpoints with empty available_models (not yet health-checked)"
+        );
+    }
+
+    // ── Test 4 ─────────────────────────────────────────────────────────────
+
+    /// When only endpoint B supports the requested model, `select_endpoint`
+    /// (called on the pre-filtered list) must route to B even if the normal
+    /// routing strategy (e.g. `primary_fallback`) would have preferred A.
+    ///
+    /// This test exercises the full Slice 3 flow:
+    ///   1. Build `team_endpoints` with A first, B second.
+    ///   2. Call `filter_by_model` → returns only [B].
+    ///   3. Call `select_endpoint` on the filtered list → must pick B.
+    #[tokio::test]
+    async fn test_select_endpoint_routes_to_model_supporting_endpoint() {
+        let pool = EndpointPool::new();
+
+        let id_a = Uuid::new_v4();
+        let id_b = Uuid::new_v4();
+
+        let target_model = "us.anthropic.claude-sonnet-4-6-20250514";
+
+        // Endpoint A: healthy, but does NOT support the requested model.
+        // Under normal `primary_fallback` without filtering this would be chosen first.
+        insert_client(
+            &pool,
+            make_test_client_with_models(
+                make_test_endpoint(id_a, "ep-a"),
+                vec!["us.anthropic.claude-opus-4-7".to_string()],
+            ),
+        )
+        .await;
+
+        // Endpoint B: healthy, supports the target model.
+        insert_client(
+            &pool,
+            make_test_client_with_models(
+                make_test_endpoint(id_b, "ep-b"),
+                vec![target_model.to_string()],
+            ),
+        )
+        .await;
+
+        // team_endpoints: A has higher priority (index 0), B is index 1
+        let team_eps = vec![
+            make_test_endpoint(id_a, "ep-a"),
+            make_test_endpoint(id_b, "ep-b"),
+        ];
+
+        // Step 1: filter — only B remains
+        let filtered = pool
+            .filter_by_model(&team_eps, "anthropic.claude-sonnet-4-6-20250514")
+            .await;
+
+        assert_eq!(
+            filtered.len(),
+            1,
+            "only endpoint B supports the model; filtered list must have exactly 1 entry"
+        );
+        assert_eq!(
+            filtered[0].id, id_b,
+            "the single filtered endpoint must be B"
+        );
+
+        // Step 2: select from the filtered list — must pick B, not A
+        let selected = pool
+            .select_endpoint(&filtered, None, "primary_fallback")
+            .await
+            .expect("select_endpoint must return Some when filtered list has a healthy endpoint");
+
+        assert_eq!(
+            selected.config.id, id_b,
+            "select_endpoint on the filtered list must route to endpoint B (the only one supporting the model)"
+        );
+    }
+
+    // ── Test 5: clear error response (see src/api/handlers.rs) ────────────
+    //
+    // Belongs in src/api/handlers.rs #[cfg(test)] mod tests_model_filtering_slice3
+    // because the `handlers` module is private and cannot be accessed from here.
+    //
+    // That test calls `build_model_unavailable_error(model_name)` — a new
+    // `pub(crate)` function the builder must add to handlers.rs — and asserts:
+    //   • HTTP 400 status
+    //   • JSON body: error.type == "invalid_request_error"
+    //   • error.message contains the model name
+}
+
 // ── Slice 5: edge-case tests ──
 
 #[cfg(test)]
@@ -1799,6 +2341,7 @@ mod tests_slice5 {
             quota_cache: crate::quota::QuotaCache::new(quota_client),
             healthy: AtomicBool::new(true),
             last_health_check: AtomicI64::new(0),
+            available_models: Arc::new(RwLock::new(vec![])),
         }
     }
 
