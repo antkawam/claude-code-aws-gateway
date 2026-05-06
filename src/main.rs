@@ -336,14 +336,31 @@ async fn main() -> anyhow::Result<()> {
             loop {
                 interval.tick().await;
 
-                // Check gateway's default Bedrock client
-                let ok = state_for_health
+                // Check gateway's default Bedrock client — retrieve full profile list
+                let default_profiles_result = state_for_health
                     .bedrock_control_client
                     .list_inference_profiles()
-                    .max_results(1)
                     .send()
-                    .await
-                    .is_ok();
+                    .await;
+
+                let ok = default_profiles_result.is_ok();
+
+                // On success, cache available model IDs filtered by the gateway's routing prefix.
+                if let Ok(ref resp) = default_profiles_result {
+                    let prefix_dot = format!("{}.", state_for_health.config.bedrock_routing_prefix);
+                    let profile_ids: Vec<String> = resp
+                        .inference_profile_summaries()
+                        .iter()
+                        .map(|p| p.inference_profile_id().to_string())
+                        .filter(|id| id.starts_with(&prefix_dot))
+                        .collect();
+                    let mut models = state_for_health
+                        .endpoint_pool
+                        .default_available_models
+                        .write()
+                        .await;
+                    *models = profile_ids;
+                }
 
                 if ok != was_healthy {
                     if ok {
@@ -371,14 +388,22 @@ async fn main() -> anyhow::Result<()> {
                             .await
                             .is_ok()
                     } else {
-                        // For standard CRI endpoints, check credentials/region reachability
-                        client
-                            .control_client
-                            .list_inference_profiles()
-                            .max_results(1)
-                            .send()
-                            .await
-                            .is_ok()
+                        // For standard CRI endpoints, fetch the full profile list and cache it.
+                        match client.control_client.list_inference_profiles().send().await {
+                            Ok(resp) => {
+                                let prefix_dot = format!("{}.", client.config.routing_prefix);
+                                let profile_ids: Vec<String> = resp
+                                    .inference_profile_summaries()
+                                    .iter()
+                                    .map(|p| p.inference_profile_id().to_string())
+                                    .filter(|id| id.starts_with(&prefix_dot))
+                                    .collect();
+                                let mut models = client.available_models.write().await;
+                                *models = profile_ids;
+                                true
+                            }
+                            Err(_) => false,
+                        }
                     };
 
                     let now_secs = std::time::SystemTime::now()

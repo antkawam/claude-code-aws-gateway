@@ -71,41 +71,119 @@ struct RequestInfo {
     detection_flags: Option<Value>,
 }
 
-/// GET /v1/models — List available Claude models (Anthropic API format).
-/// Required by Claude for Excel/PowerPoint add-ins.
-pub async fn list_models() -> Response {
-    let models = [
-        ("claude-opus-4-7", "Claude Opus 4.7"),
-        ("claude-opus-4-6-20250605", "Claude Opus 4.6"),
-        ("claude-sonnet-4-6-20250514", "Claude Sonnet 4.6"),
-        ("claude-opus-4-5-20251101", "Claude Opus 4.5"),
-        ("claude-sonnet-4-5-20250929", "Claude Sonnet 4.5"),
-        ("claude-sonnet-4-20250514", "Claude Sonnet 4"),
-        ("claude-haiku-4-5-20251001", "Claude Haiku 4.5"),
-    ];
+/// Derive a human-readable display name from an Anthropic model ID.
+///
+/// For known models we return the canonical name. For unknown/discovered models
+/// we generate a reasonable name from the ID by title-casing the parts.
+fn model_display_name(anthropic_id: &str) -> String {
+    // Known model display names
+    match anthropic_id {
+        s if s.starts_with("claude-opus-4-7") => "Claude Opus 4.7".to_string(),
+        s if s.starts_with("claude-opus-4-6") => "Claude Opus 4.6".to_string(),
+        s if s.starts_with("claude-sonnet-4-6") => "Claude Sonnet 4.6".to_string(),
+        s if s.starts_with("claude-opus-4-5") => "Claude Opus 4.5".to_string(),
+        s if s.starts_with("claude-sonnet-4-5") => "Claude Sonnet 4.5".to_string(),
+        s if s.starts_with("claude-sonnet-4-20") => "Claude Sonnet 4".to_string(),
+        s if s.starts_with("claude-haiku-4-5") => "Claude Haiku 4.5".to_string(),
+        other => {
+            // Strip date suffix and title-case the remaining parts.
+            // e.g. "claude-future-5-0-20260601" -> "Claude Future 5 0"
+            let base = crate::translate::models::strip_date_suffix(other);
+            // Remove ":0" or "-v1:0" style suffixes
+            let base = base.trim_end_matches(":0");
+            let base = if let Some(pos) = base.rfind("-v1") {
+                &base[..pos]
+            } else {
+                base
+            };
+            base.split('-')
+                .map(|part| {
+                    let mut c = part.chars();
+                    match c.next() {
+                        None => String::new(),
+                        Some(f) => f.to_uppercase().collect::<String>() + c.as_str(),
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(" ")
+        }
+    }
+}
 
-    let data: Vec<serde_json::Value> = models
+/// Build the JSON model list response from a slice of Anthropic model IDs.
+fn build_models_response(anthropic_ids: &[String]) -> serde_json::Value {
+    let data: Vec<serde_json::Value> = anthropic_ids
         .iter()
-        .map(|(id, name)| {
+        .map(|id| {
+            let display = model_display_name(id);
             json!({
                 "id": id,
-                "display_name": name,
+                "display_name": display,
                 "type": "model",
                 "created_at": "2025-01-01T00:00:00Z",
             })
         })
         .collect();
 
-    (
-        StatusCode::OK,
-        Json(json!({
-            "data": data,
-            "has_more": false,
-            "first_id": data.first().map(|m| m["id"].as_str().unwrap_or("")),
-            "last_id": data.last().map(|m| m["id"].as_str().unwrap_or("")),
-        })),
-    )
-        .into_response()
+    json!({
+        "data": data,
+        "has_more": false,
+        "first_id": data.first().map(|m| m["id"].as_str().unwrap_or("")),
+        "last_id": data.last().map(|m| m["id"].as_str().unwrap_or("")),
+    })
+}
+
+/// GET /v1/models — List available Claude models (Anthropic API format).
+/// Required by Claude for Excel/PowerPoint add-ins.
+///
+/// Returns models discovered from the endpoint pool's available model cache.
+/// Returns an empty list if the cache has not been populated yet
+/// (first tick of the health loop runs immediately on startup, so this window
+/// is typically very short).
+pub async fn list_models(State(state): State<Arc<GatewayState>>) -> Response {
+    // Collect Bedrock profile IDs from gateway-wide default available models
+    let mut bedrock_ids: Vec<String> = {
+        let guard = state.endpoint_pool.default_available_models.read().await;
+        guard.clone()
+    };
+
+    // Also collect from all endpoint clients in the pool
+    let clients = state.endpoint_pool.get_all_clients().await;
+    for client in &clients {
+        let models = client.available_models.read().await;
+        bedrock_ids.extend(models.iter().cloned());
+    }
+
+    // If the cache is empty, return an empty list
+    if bedrock_ids.is_empty() {
+        return (
+            StatusCode::OK,
+            Json(json!({
+                "data": [],
+                "has_more": false,
+                "first_id": null,
+                "last_id": null,
+            })),
+        )
+            .into_response();
+    }
+
+    // Map each Bedrock profile ID to Anthropic format, then deduplicate
+    let mut seen = std::collections::HashSet::new();
+    let mut anthropic_ids: Vec<String> = bedrock_ids
+        .iter()
+        .map(|bedrock_id| {
+            crate::translate::models::bedrock_to_anthropic(bedrock_id, Some(&state.model_cache))
+        })
+        .filter(|id| seen.insert(id.clone()))
+        .collect();
+
+    // Stable sort for deterministic output
+    anthropic_ids.sort();
+
+    let response = build_models_response(&anthropic_ids);
+
+    (StatusCode::OK, Json(response)).into_response()
 }
 
 pub async fn health(State(state): State<Arc<GatewayState>>) -> Response {
@@ -406,6 +484,46 @@ pub async fn messages(
         (endpoints, strategy)
     } else {
         (Vec::new(), "sticky_user".to_string())
+    };
+
+    // Filter team endpoints by model availability (only when team has endpoints configured).
+    // Uses suffix matching: pass just the suffix (e.g. "anthropic.claude-sonnet-4-6") so it
+    // matches full profile IDs like "us.anthropic.claude-sonnet-4-6" stored in available_models.
+    let team_endpoints = if !team_endpoints.is_empty() {
+        // Determine the Bedrock suffix for the requested model.
+        // Prefer the model cache (exact suffix); fall back to prefix-based translation
+        // and strip the region prefix so suffix matching works across regions.
+        let bedrock_suffix = if let Some(suffix) = state.model_cache.lookup_forward(&original_model)
+        {
+            suffix
+        } else {
+            // Use default routing prefix to resolve a full Bedrock model ID, then strip prefix.
+            let full = crate::translate::models::anthropic_to_bedrock(
+                &original_model,
+                &state.config.bedrock_routing_prefix,
+                Some(&state.model_cache),
+            );
+            // Strip the leading "<prefix>." component (e.g. "us.") to get the suffix.
+            if let Some(dot_pos) = full.find('.') {
+                full[dot_pos + 1..].to_string()
+            } else {
+                full
+            }
+        };
+
+        let filtered = state
+            .endpoint_pool
+            .filter_by_model(&team_endpoints, &bedrock_suffix)
+            .await;
+
+        if filtered.is_empty() {
+            // Team has endpoints but none support this model — return a clear error.
+            return build_model_unavailable_error(&original_model);
+        }
+
+        filtered
+    } else {
+        team_endpoints
     };
 
     let user_identity_str = identity.user_identity.as_deref();
@@ -2316,6 +2434,18 @@ async fn resolve_global_search_provider(state: &GatewayState) -> websearch::Sear
     }
 }
 
+/// Build a 400 response indicating the requested model is not available on any
+/// of the team's configured endpoints.
+pub(crate) fn build_model_unavailable_error(model: &str) -> Response {
+    error_response(
+        StatusCode::BAD_REQUEST,
+        "invalid_request_error",
+        &format!(
+            "Model '{model}' is not available on any of your team's configured endpoints. Contact your gateway administrator."
+        ),
+    )
+}
+
 fn error_response(status: StatusCode, error_type: &str, message: &str) -> Response {
     let request_id = format!("req_{}", uuid::Uuid::new_v4().simple());
     Response::builder()
@@ -2382,6 +2512,383 @@ fn extract_error_message(debug_msg: &str) -> Option<String> {
         }
     }
     None
+}
+
+// ── Slice 2: dynamic list_models tests ──
+
+#[cfg(test)]
+mod tests_list_models_slice2 {
+    use super::*;
+    use axum::extract::State;
+    use serde_json::Value;
+    use std::collections::HashMap;
+    use std::sync::atomic::{AtomicBool, AtomicI64};
+    use std::time::Instant;
+
+    /// Build a minimal GatewayState for unit-testing list_models.
+    ///
+    /// Only the fields that list_models actually reads are meaningful here:
+    /// - `endpoint_pool.default_available_models` — models returned for unauthenticated callers
+    /// - `endpoint_pool` clients — per-endpoint available_models
+    /// - `model_cache` — used by bedrock_to_anthropic for reverse mapping
+    ///
+    /// All other fields are zeroed/stubbed so we never touch the network or DB.
+    pub(super) fn make_test_state(default_models: Vec<String>) -> Arc<GatewayState> {
+        let (metrics, _provider) = crate::telemetry::Metrics::new(None).unwrap();
+        let metrics = Arc::new(metrics);
+        let db_pool = Arc::new(tokio::sync::RwLock::new(
+            // A deliberately invalid pool — list_models must not touch the DB for the
+            // unauthenticated path we're testing.
+            sqlx::postgres::PgPoolOptions::new()
+                .max_connections(1)
+                .connect_lazy("postgres://localhost/invalid_test_db")
+                .unwrap(),
+        ));
+        let spend_tracker = Arc::new(crate::spend::SpendTracker::new(
+            Arc::clone(&db_pool),
+            Arc::clone(&metrics),
+        ));
+        let endpoint_pool = Arc::new(crate::endpoint::EndpointPool::new());
+
+        // Pre-populate default_available_models synchronously via blocking write.
+        // We use `futures::executor::block_on` here to satisfy the async RwLock.
+        // This is acceptable inside a `#[cfg(test)]` helper that runs inside tokio.
+        let pool_clone = Arc::clone(&endpoint_pool);
+        let default_models_clone = default_models.clone();
+        // tokio::sync::RwLock::blocking_write is not available; use try_write since
+        // no contention exists yet.
+        {
+            let mut guard = pool_clone
+                .default_available_models
+                .try_write()
+                .expect("No contention expected in test setup");
+            *guard = default_models_clone;
+        }
+
+        let aws_config = aws_config::SdkConfig::builder()
+            .behavior_version(aws_config::BehaviorVersion::latest())
+            .region(aws_config::Region::new("us-east-1"))
+            .build();
+
+        let bedrock_client = aws_sdk_bedrockruntime::Client::from_conf(
+            aws_sdk_bedrockruntime::Config::builder()
+                .behavior_version(aws_sdk_bedrockruntime::config::BehaviorVersion::latest())
+                .region(aws_config::Region::new("us-east-1"))
+                .build(),
+        );
+        let bedrock_control_client = aws_sdk_bedrock::Client::from_conf(
+            aws_sdk_bedrock::Config::builder()
+                .behavior_version(aws_sdk_bedrock::config::BehaviorVersion::latest())
+                .region(aws_config::Region::new("us-east-1"))
+                .build(),
+        );
+        let pricing_client = Arc::new(aws_sdk_pricing::Client::from_conf(
+            aws_sdk_pricing::Config::builder()
+                .behavior_version(aws_sdk_pricing::config::BehaviorVersion::latest())
+                .region(aws_config::Region::new("us-east-1"))
+                .build(),
+        ));
+
+        Arc::new(GatewayState {
+            bedrock_client,
+            bedrock_control_client,
+            model_cache: crate::translate::models::ModelCache::new(),
+            config: crate::config::GatewayConfig {
+                host: "127.0.0.1".to_string(),
+                port: 8080,
+                admin_username: "admin".to_string(),
+                admin_password: "admin".to_string(),
+                bedrock_routing_prefix: "us".to_string(),
+                database_url: "postgres://localhost/test".to_string(),
+                admin_users: vec![],
+                notification_url: None,
+                rds_iam_auth: false,
+                database_host: None,
+                database_port: 5432,
+                database_name: "test".to_string(),
+                database_user: "test".to_string(),
+                pricing_refresh_interval: 86400,
+                pricing_refresh_enabled: false,
+            },
+            key_cache: crate::auth::KeyCache::new(),
+            rate_limiter: crate::ratelimit::RateLimiter::new(),
+            idp_validator: Arc::new(crate::auth::oidc::MultiIdpValidator::new()),
+            db_pool: Arc::clone(&db_pool),
+            spend_tracker,
+            metrics: Arc::clone(&metrics),
+            virtual_keys_enabled: AtomicBool::new(false),
+            admin_login_enabled: AtomicBool::new(false),
+            cache_version: AtomicI64::new(0),
+            session_token_ttl_hours: AtomicI64::new(24),
+            session_signing_key: "test-signing-key".to_string(),
+            cli_sessions: crate::api::cli_auth::new_session_store(),
+            setup_tokens: tokio::sync::RwLock::new(HashMap::new()),
+            http_client: reqwest::Client::new(),
+            budget_cache: Arc::new(crate::budget::BudgetSpendCache::new(30)),
+            sns_client: None,
+            eb_client: None,
+            quota_cache: None,
+            bedrock_health: tokio::sync::RwLock::new(None),
+            endpoint_pool,
+            endpoint_stats: Arc::new(crate::endpoint::stats::EndpointStats::new()),
+            aws_config,
+            started_at: Instant::now(),
+            login_attempts: tokio::sync::Mutex::new(vec![]),
+            pricing_client,
+        })
+    }
+
+    // ── Test 1: Unauthenticated request returns gateway-wide union ──────────────────
+    //
+    // When no Authorization / x-api-key header is provided, list_models must fall
+    // back to the gateway-wide union: models stored in
+    // `endpoint_pool.default_available_models`.
+    #[tokio::test]
+    async fn test_list_models_unauthenticated_returns_gateway_wide_union() {
+        let models = vec![
+            "us.anthropic.claude-sonnet-4-6-20250514".to_string(),
+            "us.anthropic.claude-opus-4-7".to_string(),
+        ];
+        let state = make_test_state(models);
+
+        let resp = list_models(State(state)).await;
+
+        assert_eq!(
+            resp.status(),
+            axum::http::StatusCode::OK,
+            "unauthenticated list_models must return 200"
+        );
+
+        let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+
+        let data = json["data"]
+            .as_array()
+            .expect("response must have 'data' array");
+        assert!(
+            !data.is_empty(),
+            "gateway-wide models must be present when default_available_models is populated"
+        );
+
+        // The two models we seeded should appear (after Bedrock → Anthropic mapping).
+        let ids: Vec<&str> = data.iter().map(|m| m["id"].as_str().unwrap()).collect();
+        assert!(
+            ids.contains(&"claude-sonnet-4-6-20250514"),
+            "us.anthropic.claude-sonnet-4-6-20250514 must map to claude-sonnet-4-6-20250514"
+        );
+        assert!(
+            ids.contains(&"claude-opus-4-7"),
+            "us.anthropic.claude-opus-4-7 must map to claude-opus-4-7"
+        );
+    }
+
+    // ── Test 2: Empty cache returns empty list ───────────────────────────────────────
+    //
+    // After Slice 4, when `default_available_models` is empty (before the health
+    // loop has run), list_models must return an empty data array rather than the
+    // old hardcoded fallback list.
+    //
+    // The health loop fires on its first tick immediately at startup, so the empty
+    // window is short in practice. Claude Code handles an empty list gracefully.
+    #[tokio::test]
+    async fn test_list_models_empty_cache_returns_empty_list() {
+        // Pass an empty default_available_models — simulates the cold-start window.
+        let state = make_test_state(vec![]);
+
+        let resp = list_models(State(state)).await;
+
+        assert_eq!(
+            resp.status(),
+            axum::http::StatusCode::OK,
+            "empty-cache list_models must still return 200"
+        );
+
+        let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        let data = json["data"]
+            .as_array()
+            .expect("response must have 'data' array");
+
+        // After Slice 4 the hardcoded fallback is gone: empty cache → empty list.
+        assert!(
+            data.is_empty(),
+            "list_models must return an empty list when default_available_models is empty (no hardcoded fallback)"
+        );
+
+        assert_eq!(json["has_more"], false, "has_more must be false");
+        assert!(
+            json["first_id"].is_null(),
+            "first_id must be null for empty list"
+        );
+        assert!(
+            json["last_id"].is_null(),
+            "last_id must be null for empty list"
+        );
+    }
+
+    // ── Test 3: Response format matches Anthropic API ────────────────────────────────
+    //
+    // The response envelope must match the Anthropic models API format exactly so
+    // Claude Code and other clients can parse it without modification.
+    #[tokio::test]
+    async fn test_list_models_response_format_matches_anthropic_api() {
+        let state = make_test_state(vec!["us.anthropic.claude-sonnet-4-6-20250514".to_string()]);
+
+        let resp = list_models(State(state)).await;
+
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+
+        let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+
+        // Top-level envelope fields
+        assert_eq!(
+            json["has_more"], false,
+            "has_more must be false (no pagination)"
+        );
+        assert!(
+            json["first_id"].is_string() || json["first_id"].is_null(),
+            "first_id must be a string or null"
+        );
+        assert!(
+            json["last_id"].is_string() || json["last_id"].is_null(),
+            "last_id must be a string or null"
+        );
+
+        let data = json["data"]
+            .as_array()
+            .expect("response must have 'data' array");
+        assert!(!data.is_empty());
+
+        // Each model object must have the required fields
+        for model in data {
+            assert!(
+                model["id"].is_string(),
+                "each model must have a string 'id' field"
+            );
+            assert!(
+                model["display_name"].is_string(),
+                "each model must have a string 'display_name' field"
+            );
+            assert_eq!(
+                model["type"], "model",
+                "each model must have type == \"model\""
+            );
+            assert!(
+                model["created_at"].is_string(),
+                "each model must have a string 'created_at' field"
+            );
+        }
+
+        // first_id and last_id must match the first and last data element
+        assert_eq!(
+            json["first_id"],
+            data.first().unwrap()["id"],
+            "first_id must equal the id of the first model in data"
+        );
+        assert_eq!(
+            json["last_id"],
+            data.last().unwrap()["id"],
+            "last_id must equal the id of the last model in data"
+        );
+    }
+
+    // ── Test 4: Models are deduplicated across endpoints ─────────────────────────────
+    //
+    // If the same Bedrock profile ID appears in multiple sources (e.g. the same
+    // model is available on two different endpoints), it must appear only once in
+    // the response.
+    #[tokio::test]
+    async fn test_list_models_deduplication() {
+        // Seed default_available_models with two identical Bedrock profile IDs.
+        // The new list_models implementation must return each Anthropic ID exactly once.
+        let state = make_test_state(vec![
+            "us.anthropic.claude-sonnet-4-6-20250514".to_string(),
+            "us.anthropic.claude-sonnet-4-6-20250514".to_string(), // exact duplicate
+            "eu.anthropic.claude-sonnet-4-6-20250514".to_string(), // same model, different region prefix
+        ]);
+
+        let resp = list_models(State(state)).await;
+
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+
+        let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        let data = json["data"]
+            .as_array()
+            .expect("response must have 'data' array");
+
+        let ids: Vec<&str> = data.iter().map(|m| m["id"].as_str().unwrap()).collect();
+
+        // Count how many times claude-sonnet-4-6-20250514 appears
+        let count = ids
+            .iter()
+            .filter(|&&id| id == "claude-sonnet-4-6-20250514")
+            .count();
+        assert_eq!(
+            count, 1,
+            "claude-sonnet-4-6-20250514 must appear exactly once even when \
+             present on multiple endpoints or under different region prefixes"
+        );
+    }
+
+    // ── Test 5: Bedrock IDs mapped back to Anthropic format ──────────────────────────
+    //
+    // The response must contain Anthropic-format model IDs (e.g. "claude-sonnet-4-6-20250514"),
+    // not raw Bedrock profile IDs (e.g. "us.anthropic.claude-sonnet-4-6-20250514").
+    #[tokio::test]
+    async fn test_list_models_bedrock_ids_mapped_to_anthropic_format() {
+        let state = make_test_state(vec![
+            // Full Bedrock cross-region inference profile IDs
+            "us.anthropic.claude-sonnet-4-6-20250514".to_string(),
+            "us.anthropic.claude-opus-4-7".to_string(),
+            "us.anthropic.claude-haiku-4-5-20251001-v1:0".to_string(),
+        ]);
+
+        let resp = list_models(State(state)).await;
+
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+
+        let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        let data = json["data"]
+            .as_array()
+            .expect("response must have 'data' array");
+
+        let ids: Vec<&str> = data.iter().map(|m| m["id"].as_str().unwrap()).collect();
+
+        // No raw Bedrock IDs (those contain dots) must appear in the response
+        for id in &ids {
+            assert!(
+                !id.starts_with("us.") && !id.starts_with("eu.") && !id.starts_with("ap."),
+                "response must not contain raw Bedrock profile IDs; found '{id}'"
+            );
+        }
+
+        // The mapped Anthropic IDs must be present
+        assert!(
+            ids.contains(&"claude-sonnet-4-6-20250514"),
+            "us.anthropic.claude-sonnet-4-6-20250514 must map to claude-sonnet-4-6-20250514"
+        );
+        assert!(
+            ids.contains(&"claude-opus-4-7"),
+            "us.anthropic.claude-opus-4-7 must map to claude-opus-4-7"
+        );
+        assert!(
+            ids.contains(&"claude-haiku-4-5-20251001"),
+            "us.anthropic.claude-haiku-4-5-20251001-v1:0 must map to claude-haiku-4-5-20251001"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -2527,9 +3034,116 @@ mod tests {
         assert_eq!(info.system_prompt_hash.as_ref().unwrap().len(), 16);
     }
 
+    /// Build a minimal GatewayState for tests that need to call list_models.
+    /// Pre-populates the endpoint pool with known models so list_models returns
+    /// a non-empty list (the hardcoded fallback was removed in Slice 4).
+    fn make_minimal_state_for_list_models() -> Arc<GatewayState> {
+        use std::collections::HashMap;
+        use std::sync::atomic::{AtomicBool, AtomicI64};
+        use std::time::Instant;
+
+        let (metrics, _provider) = crate::telemetry::Metrics::new(None).unwrap();
+        let metrics = Arc::new(metrics);
+        let db_pool = Arc::new(tokio::sync::RwLock::new(
+            sqlx::postgres::PgPoolOptions::new()
+                .max_connections(1)
+                .connect_lazy("postgres://localhost/invalid_test_db")
+                .unwrap(),
+        ));
+        let spend_tracker = Arc::new(crate::spend::SpendTracker::new(
+            Arc::clone(&db_pool),
+            Arc::clone(&metrics),
+        ));
+        let endpoint_pool = Arc::new(crate::endpoint::EndpointPool::new());
+
+        // Pre-populate the cache so list_models returns models (no hardcoded fallback).
+        {
+            let mut guard = endpoint_pool
+                .default_available_models
+                .try_write()
+                .expect("No contention expected in test setup");
+            *guard = vec![
+                "us.anthropic.claude-sonnet-4-6-20250514".to_string(),
+                "us.anthropic.claude-opus-4-6-20250605".to_string(),
+                "us.anthropic.claude-haiku-4-5-20251001".to_string(),
+            ];
+        }
+
+        let aws_config = aws_config::SdkConfig::builder()
+            .behavior_version(aws_config::BehaviorVersion::latest())
+            .region(aws_config::Region::new("us-east-1"))
+            .build();
+        let bedrock_client = aws_sdk_bedrockruntime::Client::from_conf(
+            aws_sdk_bedrockruntime::Config::builder()
+                .behavior_version(aws_sdk_bedrockruntime::config::BehaviorVersion::latest())
+                .region(aws_config::Region::new("us-east-1"))
+                .build(),
+        );
+        let bedrock_control_client = aws_sdk_bedrock::Client::from_conf(
+            aws_sdk_bedrock::Config::builder()
+                .behavior_version(aws_sdk_bedrock::config::BehaviorVersion::latest())
+                .region(aws_config::Region::new("us-east-1"))
+                .build(),
+        );
+        let pricing_client = Arc::new(aws_sdk_pricing::Client::from_conf(
+            aws_sdk_pricing::Config::builder()
+                .behavior_version(aws_sdk_pricing::config::BehaviorVersion::latest())
+                .region(aws_config::Region::new("us-east-1"))
+                .build(),
+        ));
+        Arc::new(GatewayState {
+            bedrock_client,
+            bedrock_control_client,
+            model_cache: crate::translate::models::ModelCache::new(),
+            config: crate::config::GatewayConfig {
+                host: "127.0.0.1".to_string(),
+                port: 8080,
+                admin_username: "admin".to_string(),
+                admin_password: "admin".to_string(),
+                bedrock_routing_prefix: "us".to_string(),
+                database_url: "postgres://localhost/test".to_string(),
+                admin_users: vec![],
+                notification_url: None,
+                rds_iam_auth: false,
+                database_host: None,
+                database_port: 5432,
+                database_name: "test".to_string(),
+                database_user: "test".to_string(),
+                pricing_refresh_interval: 86400,
+                pricing_refresh_enabled: false,
+            },
+            key_cache: crate::auth::KeyCache::new(),
+            rate_limiter: crate::ratelimit::RateLimiter::new(),
+            idp_validator: Arc::new(crate::auth::oidc::MultiIdpValidator::new()),
+            db_pool: Arc::clone(&db_pool),
+            spend_tracker,
+            metrics: Arc::clone(&metrics),
+            virtual_keys_enabled: AtomicBool::new(false),
+            admin_login_enabled: AtomicBool::new(false),
+            cache_version: AtomicI64::new(0),
+            session_token_ttl_hours: AtomicI64::new(24),
+            session_signing_key: "test-signing-key".to_string(),
+            cli_sessions: crate::api::cli_auth::new_session_store(),
+            setup_tokens: tokio::sync::RwLock::new(HashMap::new()),
+            http_client: reqwest::Client::new(),
+            budget_cache: Arc::new(crate::budget::BudgetSpendCache::new(30)),
+            sns_client: None,
+            eb_client: None,
+            quota_cache: None,
+            bedrock_health: tokio::sync::RwLock::new(None),
+            endpoint_pool,
+            endpoint_stats: Arc::new(crate::endpoint::stats::EndpointStats::new()),
+            aws_config,
+            started_at: Instant::now(),
+            login_attempts: tokio::sync::Mutex::new(vec![]),
+            pricing_client,
+        })
+    }
+
     #[tokio::test]
     async fn test_list_models_response() {
-        let response = list_models().await;
+        let state = make_minimal_state_for_list_models();
+        let response = list_models(State(state)).await;
         assert_eq!(response.status(), StatusCode::OK);
 
         let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
@@ -2557,7 +3171,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_list_models_contains_known_models() {
-        let response = list_models().await;
+        let state = make_minimal_state_for_list_models();
+        let response = list_models(State(state)).await;
         let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
             .await
             .unwrap();
@@ -2572,5 +3187,259 @@ mod tests {
         assert!(ids.contains(&"claude-sonnet-4-6-20250514"));
         assert!(ids.contains(&"claude-opus-4-6-20250605"));
         assert!(ids.contains(&"claude-haiku-4-5-20251001"));
+    }
+}
+
+// ── Dynamic Model Availability — Slice 3 tests ──
+// Test 5: clear error response when no endpoint supports the requested model.
+//
+// Depends on:
+//   • `EndpointPool::filter_by_model` (src/endpoint/mod.rs) — tests 1-4
+//   • `build_model_unavailable_error` — a new pub(crate) function in this file
+//     that returns HTTP 400 with body:
+//       {"error": {"type": "invalid_request_error", "message": "Model '<name>' is not available ..."}}
+#[cfg(test)]
+mod tests_model_filtering_slice3 {
+    use super::*;
+    use axum::body::to_bytes;
+    use serde_json::Value;
+
+    /// When no endpoint in the team supports the requested model, the messages
+    /// handler must return HTTP 400 with `"invalid_request_error"` and an error
+    /// message that names the model.
+    ///
+    /// This test calls `build_model_unavailable_error(model_name)` — a
+    /// `pub(crate)` function in `src/api/handlers.rs`.
+    #[tokio::test]
+    async fn test_model_unavailable_error_shape() {
+        let response = build_model_unavailable_error("claude-sonnet-4-6-20250514");
+
+        let (parts, body) = response.into_parts();
+
+        assert_eq!(
+            parts.status,
+            StatusCode::BAD_REQUEST,
+            "model unavailable error must use HTTP 400 status"
+        );
+
+        let body_bytes = to_bytes(body, usize::MAX)
+            .await
+            .expect("body must be readable");
+        let json: Value = serde_json::from_slice(&body_bytes).expect("body must be valid JSON");
+
+        assert_eq!(
+            json["error"]["type"].as_str(),
+            Some("invalid_request_error"),
+            "error type must be 'invalid_request_error'"
+        );
+
+        let message = json["error"]["message"]
+            .as_str()
+            .expect("error.message must be a string");
+        assert!(
+            message.contains("claude-sonnet-4-6-20250514"),
+            "error message must contain the model name; got: {message}"
+        );
+    }
+
+    /// The error message produced by `build_model_unavailable_error` must
+    /// direct the user to contact their gateway administrator, not just report
+    /// a bare model name. This validates the full guidance text per the spec.
+    #[tokio::test]
+    async fn test_model_unavailable_error_message_contains_guidance() {
+        let response = build_model_unavailable_error("claude-opus-4-7");
+
+        let (_, body) = response.into_parts();
+        let body_bytes = to_bytes(body, usize::MAX)
+            .await
+            .expect("body must be readable");
+        let json: Value = serde_json::from_slice(&body_bytes).expect("body must be valid JSON");
+
+        let message = json["error"]["message"]
+            .as_str()
+            .expect("error.message must be a string");
+
+        // Per spec: message should mention the model and guide users to contact admin
+        assert!(
+            message.contains("claude-opus-4-7"),
+            "error message must name the requested model; got: {message}"
+        );
+        assert!(
+            message.to_lowercase().contains("endpoint")
+                || message.to_lowercase().contains("administrator")
+                || message.to_lowercase().contains("admin"),
+            "error message must direct the user to contact an administrator or mention endpoints; got: {message}"
+        );
+    }
+}
+
+// ── Slice 4: Remove hardcoded model list ────────────────────────────────────────
+//
+// These tests verify the post-Slice-4 behavior:
+//   - When the cache is empty, list_models returns an empty data array (NOT the
+//     old 7-entry hardcoded list).
+//   - When the cache has exactly N entries, the response has exactly N models —
+//     proving no hardcoded fallback inflates the count.
+//   - A pre-populated cache is the sole source of truth; list_models does not
+//     fall back to any static data.
+#[cfg(test)]
+mod tests_slice4_no_hardcoded {
+    use super::*;
+    use axum::extract::State;
+    use serde_json::Value;
+
+    /// Build a minimal GatewayState for unit-testing list_models.
+    fn make_test_state(default_models: Vec<String>) -> Arc<GatewayState> {
+        super::tests_list_models_slice2::make_test_state(default_models)
+    }
+
+    // ── Test 1: Empty cache returns empty data array ─────────────────────────────
+    //
+    // After Slice 4, when both `default_available_models` and all endpoint client
+    // `available_models` are empty, `list_models` must return:
+    //   {"data": [], "has_more": false, "first_id": null, "last_id": null}
+    #[tokio::test]
+    async fn test_empty_cache_returns_empty_data_array() {
+        let state = make_test_state(vec![]); // no models in cache
+
+        let resp = list_models(State(state)).await;
+
+        assert_eq!(
+            resp.status(),
+            axum::http::StatusCode::OK,
+            "list_models must always return 200 even when cache is empty"
+        );
+
+        let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+
+        let data = json["data"]
+            .as_array()
+            .expect("response must have 'data' array");
+
+        assert_eq!(
+            data.len(),
+            0,
+            "empty cache must yield an empty data array; \
+             got {} entries (hardcoded fallback must be removed)",
+            data.len()
+        );
+
+        assert_eq!(
+            json["has_more"], false,
+            "has_more must be false when data is empty"
+        );
+
+        assert!(
+            json["first_id"].is_null(),
+            "first_id must be null when there are no models"
+        );
+        assert!(
+            json["last_id"].is_null(),
+            "last_id must be null when there are no models"
+        );
+    }
+
+    // ── Test 2: Cache with N models returns exactly N models ─────────────────────
+    //
+    // Seeding 3 distinct Bedrock profile IDs must produce exactly 3 models in the
+    // response — not 3 + 7 (the old hardcoded count) and not 10 or anything else.
+    //
+    // This proves the hardcoded list is not being appended or merged into the result
+    // even when the cache is non-empty.
+    #[tokio::test]
+    async fn test_cache_with_three_models_returns_exactly_three() {
+        let state = make_test_state(vec![
+            "us.anthropic.claude-sonnet-4-6-20250514".to_string(),
+            "us.anthropic.claude-opus-4-7".to_string(),
+            "us.anthropic.claude-haiku-4-5-20251001".to_string(),
+        ]);
+
+        let resp = list_models(State(state)).await;
+
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+
+        let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+
+        let data = json["data"]
+            .as_array()
+            .expect("response must have 'data' array");
+
+        assert_eq!(
+            data.len(),
+            3,
+            "seeding 3 Bedrock profile IDs must yield exactly 3 models in the response; \
+             got {} — the hardcoded 7-entry fallback must not contribute any entries",
+            data.len()
+        );
+    }
+
+    // ── Test 3: Pre-populated cache is the sole source of truth ──────────────────
+    //
+    // When the cache holds specific models, the response must contain exactly and
+    // only those models (mapped to Anthropic format). No extra models must appear
+    // from any static fallback.
+    //
+    // This test verifies both the positive (seeded models present) and negative
+    // (no unexpected extras from HARDCODED_MODELS) sides of the invariant.
+    #[tokio::test]
+    async fn test_prepopulated_cache_is_sole_source_of_truth() {
+        // Seed exactly two well-known models that happen to also be in
+        // HARDCODED_MODELS, so we can confirm the count doesn't double up.
+        let state = make_test_state(vec![
+            "us.anthropic.claude-sonnet-4-6-20250514".to_string(),
+            "us.anthropic.claude-opus-4-7".to_string(),
+        ]);
+
+        let resp = list_models(State(state)).await;
+
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+
+        let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+
+        let data = json["data"]
+            .as_array()
+            .expect("response must have 'data' array");
+
+        // Positive: both seeded models must be present (Bedrock → Anthropic mapped)
+        let ids: Vec<&str> = data.iter().map(|m| m["id"].as_str().unwrap()).collect();
+        assert!(
+            ids.contains(&"claude-sonnet-4-6-20250514"),
+            "cache-seeded claude-sonnet-4-6-20250514 must appear in response"
+        );
+        assert!(
+            ids.contains(&"claude-opus-4-7"),
+            "cache-seeded claude-opus-4-7 must appear in response"
+        );
+
+        // Negative: count must equal exactly 2 — the hardcoded list must not
+        // contribute any of the 5 remaining models it contains beyond these two.
+        assert_eq!(
+            data.len(),
+            2,
+            "response must contain exactly the 2 cache-seeded models; \
+             got {} — HARDCODED_MODELS must be fully removed as a data source \
+             (the old hardcoded list had 7 entries)",
+            data.len()
+        );
+
+        // Envelope integrity
+        assert_eq!(json["has_more"], false);
+        assert!(
+            json["first_id"].is_string(),
+            "first_id must be a non-null string when data is non-empty"
+        );
+        assert!(
+            json["last_id"].is_string(),
+            "last_id must be a non-null string when data is non-empty"
+        );
     }
 }
