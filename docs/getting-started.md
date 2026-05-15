@@ -11,7 +11,9 @@ This guide walks you through deploying Claude Code AWS Gateway (CCAG) and connec
 
 - **AWS account** with Bedrock model access enabled (Claude models must be enabled in the Bedrock console)
 - **AWS CLI v2** configured with credentials
-- **Docker** installed and running
+- **Docker** (or Podman) installed and running
+
+> **Podman users:** `podman-compose` works as a drop-in replacement for `docker compose`. If you encounter issues with rootless Podman (UID mapping errors, OCI runtime errors, or AWS credential failures), see the [Podman troubleshooting section](faq.md#podman) in the FAQ.
 
 ## Deployment Options
 
