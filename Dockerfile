@@ -24,6 +24,7 @@ COPY static/ static/
 COPY migrations/ migrations/
 COPY .sqlx/ .sqlx/
 COPY build.rs build.rs
+COPY model_seed.json model_seed.json
 ENV SQLX_OFFLINE=true
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
