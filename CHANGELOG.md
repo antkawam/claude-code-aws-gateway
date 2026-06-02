@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.7.0] - 2026-06-03
+
+### Fixed
+
+- **Model-mapping greedy-prefix misrouting** (the `claude-opus-4-8` → retired Opus 4.0 incident): the model cache matched requested IDs with `starts_with` ordered by prefix length, so a request for `claude-opus-4-8` could shadow-match a row keyed `claude-opus-4` and silently route to a retired inference profile, causing Bedrock 400s. Hardened across the read and write paths so the bug class cannot recur.
+
+### Changed
+
+- **Exact-match model cache** (Slice 1): `ModelCache` now stores mappings in a `HashMap` and looks them up by exact equality (O(1)), not prefix matching. The hardcoded fallback was likewise converted from greedy `starts_with` catch-alls to exact-match arms — a future `claude-sonnet-4-8` now passes through to discovery instead of misrouting to retired Sonnet 4.0.
+- **Read-time date-suffix fallback** (Slice 2): on an exact miss, the cache retries once against the date-stripped form, but only when the stripped form is minor-version-bearing (e.g. `claude-opus-4-8`), never a bare major (`claude-opus-4`) — so dated aliases resolve without reopening the greedy shadow.
+- **`discover_model` persists the exact requested model ID** (Slice 3) as `anthropic_prefix`, not the lossy date-stripped form (the root cause of the original incident). Profile selection now runs three ordered passes — exact stem, versioned stem, fuzzy contains — to disambiguate variants like `claude-opus-4-8-thinking`.
+
+### Added
+
+- **Cold-start model seed** (Slice 4): a curated `model_seed.json` is embedded at compile time and inserted at startup with `ON CONFLICT DO NOTHING`, so a request for a known model succeeds on a fresh deploy before any discovery tick. It is a floor, not a ceiling — discovery still handles anything unseeded. Explicitly not a runtime/call-home fetch.
+
 ## [1.2.0] - 2026-03-30
 
 ### Added
