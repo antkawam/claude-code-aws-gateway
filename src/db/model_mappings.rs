@@ -7,13 +7,12 @@ pub struct ModelMappingRow {
     pub anthropic_display: Option<String>,
 }
 
-/// Load all model mappings ordered by prefix length descending (longest first).
+/// Load all model mappings (order is irrelevant; uses HashMap exact-match lookup).
 pub async fn get_all_mappings(pool: &PgPool) -> Result<Vec<ModelMappingRow>, sqlx::Error> {
     sqlx::query_as!(
         ModelMappingRow,
         r#"SELECT anthropic_prefix, bedrock_suffix, anthropic_display
-           FROM model_mappings
-           ORDER BY length(anthropic_prefix) DESC"#
+           FROM model_mappings"#
     )
     .fetch_all(pool)
     .await
