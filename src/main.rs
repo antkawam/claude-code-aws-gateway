@@ -186,6 +186,23 @@ async fn main() -> anyhow::Result<()> {
         Err(e) => tracing::warn!(%e, "Failed to load model mappings from database"),
     }
 
+    // Seed missing model mappings from embedded JSON
+    let seed_rows = crate::translate::model_seed::parse_seed();
+    match crate::db::model_mappings::seed_missing(&pool, seed_rows).await {
+        Ok(count) => {
+            if count > 0 {
+                tracing::info!(count, "Seeded missing model mappings");
+                // Reload cache to pick up the new rows
+                if let Err(e) = model_cache.load_from_db(&pool).await {
+                    tracing::error!(%e, "Failed to reload model cache after seeding");
+                }
+            }
+        }
+        Err(e) => {
+            tracing::error!(%e, "Failed to seed model mappings (non-fatal, continuing)");
+        }
+    }
+
     // Wrap pool in Arc<RwLock> so background tasks (spend tracker, delivery loop)
     // always read the current pool after IAM auth refreshes it.
     let db_pool = Arc::new(tokio::sync::RwLock::new(pool));

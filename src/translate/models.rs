@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use tokio::sync::RwLock;
@@ -10,11 +11,12 @@ pub struct CachedMapping {
     pub anthropic_display: Option<String>,
 }
 
-/// In-memory model mapping cache. Entries are ordered by prefix length descending
-/// (longest first) so that `starts_with` matching picks the most specific prefix.
+/// In-memory model mapping cache. Uses exact-match lookup by anthropic_prefix
+/// (the column name is retained for DB compatibility but semantics changed from
+/// "prefix to match" to "exact key").
 #[derive(Clone)]
 pub struct ModelCache {
-    inner: Arc<RwLock<Vec<CachedMapping>>>,
+    inner: Arc<RwLock<HashMap<String, CachedMapping>>>,
 }
 
 impl Default for ModelCache {
@@ -26,7 +28,7 @@ impl Default for ModelCache {
 impl ModelCache {
     pub fn new() -> Self {
         Self {
-            inner: Arc::new(RwLock::new(Vec::new())),
+            inner: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -34,36 +36,67 @@ impl ModelCache {
     pub async fn load_from_db(&self, pool: &sqlx::PgPool) -> Result<usize, sqlx::Error> {
         let rows = crate::db::model_mappings::get_all_mappings(pool).await?;
         let count = rows.len();
-        let mappings: Vec<CachedMapping> = rows
-            .into_iter()
-            .map(|r| CachedMapping {
+        let mut map = HashMap::new();
+        for r in rows {
+            let key = r.anthropic_prefix.clone();
+            let mapping = CachedMapping {
                 anthropic_prefix: r.anthropic_prefix,
                 bedrock_suffix: r.bedrock_suffix,
                 anthropic_display: r.anthropic_display,
-            })
-            .collect();
-        // Already ordered by length DESC from DB query
-        *self.inner.write().await = mappings;
+            };
+            map.insert(key, mapping);
+        }
+        *self.inner.write().await = map;
         Ok(count)
     }
 
     /// Forward lookup: anthropic model ID -> bedrock suffix.
+    /// Uses exact-match lookup against the cache. No prefix matching.
     /// Uses `try_read()` to avoid blocking; returns None on contention.
     pub fn lookup_forward(&self, anthropic_model: &str) -> Option<String> {
         let guard = self.inner.try_read().ok()?;
-        for m in guard.iter() {
-            if anthropic_model.starts_with(&m.anthropic_prefix) {
-                return Some(m.bedrock_suffix.clone());
-            }
+        guard.get(anthropic_model).map(|m| m.bedrock_suffix.clone())
+    }
+
+    /// Forward lookup with a read-time date-suffix fallback.
+    /// 1. Exact match on `model`.
+    /// 2. On miss, if `model` carries a date suffix, retry once against the
+    ///    date-stripped form — but ONLY when the stripped form is
+    ///    minor-version-bearing (ends with two numeric dash-segments, e.g.
+    ///    `claude-opus-4-8`), never a bare major (`claude-opus-4`). This guard
+    ///    prevents recreating the greedy-prefix bug Slice 1 eliminated.
+    pub fn lookup_forward_with_fallback(&self, model: &str) -> Option<String> {
+        if let Some(hit) = self.lookup_forward(model) {
+            return Some(hit);
+        }
+        let stripped = strip_date_suffix(model);
+        if stripped != model && is_minor_version_bearing(stripped) {
+            return self.lookup_forward(stripped);
         }
         None
     }
 
     /// Reverse lookup: bedrock model ID -> anthropic display name.
+    /// First tries an exact-match fast path against known bedrock_suffix values,
+    /// then falls back to the existing `contains` scan (for rows where the suffix
+    /// doesn't appear verbatim in the profile ID).
     /// Uses `try_read()` to avoid blocking; returns None on contention.
     pub fn lookup_reverse(&self, bedrock_model: &str) -> Option<String> {
         let guard = self.inner.try_read().ok()?;
-        for m in guard.iter() {
+
+        // Fast path: exact match against bedrock_suffix values (zero-allocation)
+        for m in guard.values() {
+            let suffix = &m.bedrock_suffix;
+            let dotted_match = bedrock_model.len() > suffix.len()
+                && bedrock_model.ends_with(suffix.as_str())
+                && bedrock_model.as_bytes()[bedrock_model.len() - suffix.len() - 1] == b'.';
+            if bedrock_model == suffix.as_str() || dotted_match {
+                return m.anthropic_display.clone();
+            }
+        }
+
+        // Fallback: contains scan (existing behaviour)
+        for m in guard.values() {
             if bedrock_model.contains(&m.bedrock_suffix)
                 || bedrock_model.contains(&m.anthropic_prefix)
             {
@@ -73,17 +106,10 @@ impl ModelCache {
         None
     }
 
-    /// Insert a mapping into the cache in sorted position (by prefix length desc).
+    /// Insert a mapping into the cache (upsert by anthropic_prefix).
     pub async fn insert(&self, mapping: CachedMapping) {
         let mut guard = self.inner.write().await;
-        // Remove existing entry with same prefix
-        guard.retain(|m| m.anthropic_prefix != mapping.anthropic_prefix);
-        // Find insertion point (maintain descending length order)
-        let pos = guard
-            .iter()
-            .position(|m| m.anthropic_prefix.len() < mapping.anthropic_prefix.len())
-            .unwrap_or(guard.len());
-        guard.insert(pos, mapping);
+        guard.insert(mapping.anthropic_prefix.clone(), mapping);
     }
 }
 
@@ -98,6 +124,87 @@ pub fn strip_date_suffix(model: &str) -> &str {
         }
     }
     model
+}
+
+/// True when `s` ends with two numeric dash-segments (`…-<major>-<minor>`),
+/// e.g. `claude-opus-4-8` -> true, `claude-opus-4` -> false.
+/// Used to gate the date-strip fallback so a dated bare-major input
+/// (`claude-opus-4-20250514`) never resolves to a `claude-opus-4` row.
+fn is_minor_version_bearing(s: &str) -> bool {
+    // Split on '-'; the last two segments must both be all-ASCII-digits.
+    let mut segs = s.rsplit('-');
+    let last = segs.next();
+    let second_last = segs.next();
+    matches!(
+        (last, second_last),
+        (Some(a), Some(b))
+            if !a.is_empty() && a.bytes().all(|c| c.is_ascii_digit())
+            && !b.is_empty() && b.bytes().all(|c| c.is_ascii_digit())
+    )
+}
+
+/// Select the best matching inference profile ID using three ordered passes:
+/// 1. Exact stem: profile_id ends with `.anthropic.{stripped}`.
+/// 2. Versioned stem: profile_id matches `\.anthropic\.{stripped}-v\d+(:\d+)?$`.
+/// 3. Fuzzy contains: first profile_id containing `stripped` (legacy behaviour).
+///
+/// First match within the earliest non-empty pass wins.
+fn select_profile_id<'a>(profile_ids: &'a [String], stripped: &str) -> Option<&'a str> {
+    // Pass 1: exact stem
+    let exact = format!(".anthropic.{stripped}");
+    for id in profile_ids {
+        if id.ends_with(&exact) {
+            return Some(id.as_str());
+        }
+    }
+    // Pass 2: versioned stem  (.anthropic.{stripped}-v<digits>(:<digits>)? at end)
+    // Build the regex from an ESCAPED stripped value (stripped contains '-' and could
+    // in theory contain regex metachars; escape defensively).
+    let pattern = format!(r"\.anthropic\.{}-v\d+(:\d+)?$", regex::escape(stripped));
+    if let Ok(re) = regex::Regex::new(&pattern) {
+        for id in profile_ids {
+            if re.is_match(id) {
+                return Some(id.as_str());
+            }
+        }
+    }
+    // Pass 3: fuzzy contains (legacy)
+    for id in profile_ids {
+        if id.contains(stripped) {
+            return Some(id.as_str());
+        }
+    }
+    None
+}
+
+/// Build discover_model's return tuple from the chosen profile id.
+/// KEY FIX: anthropic_prefix is the EXACT requested model id, NOT the stripped form.
+/// Returns (anthropic_prefix, bedrock_suffix, anthropic_display, profile_prefix).
+fn build_mapping_row(
+    anthropic_model: &str,
+    stripped: &str,
+    chosen_profile_id: &str,
+) -> (String, String, Option<String>, String) {
+    // profile_prefix = before first '.', bedrock_suffix = after first '.'
+    let (profile_prefix, bedrock_suffix) = match chosen_profile_id.find('.') {
+        Some(i) => (
+            chosen_profile_id[..i].to_string(),
+            chosen_profile_id[i + 1..].to_string(),
+        ),
+        None => (chosen_profile_id.to_string(), chosen_profile_id.to_string()),
+    };
+    let anthropic_prefix = anthropic_model.to_string();
+    let anthropic_display = if anthropic_model != stripped {
+        Some(anthropic_model.to_string())
+    } else {
+        None
+    };
+    (
+        anthropic_prefix,
+        bedrock_suffix,
+        anthropic_display,
+        profile_prefix,
+    )
 }
 
 /// Discover a model by calling Bedrock ListInferenceProfiles and fuzzy-matching.
@@ -141,61 +248,42 @@ pub async fn discover_model(
 
     tracing::debug!(count = profiles.len(), "Listed inference profiles");
 
-    // Find a profile whose ID contains the stripped prefix
-    // e.g. stripped="claude-sonnet-5-0" matches "us.anthropic.claude-sonnet-5-0-v1"
-    for profile in &profiles {
-        let profile_id = profile.inference_profile_id();
-        if profile_id.contains(stripped) {
-            let profile_id = profile_id.to_string();
+    // Build profile_ids list for selection
+    let profile_ids: Vec<String> = profiles
+        .iter()
+        .map(|p| p.inference_profile_id().to_string())
+        .collect();
 
-            // Extract the profile prefix (region): everything before the first '.'
-            // e.g. "global.anthropic.claude-opus-4-7" -> "global"
-            let profile_prefix = profile_id
-                .find('.')
-                .map(|i| &profile_id[..i])
-                .unwrap_or(&profile_id)
-                .to_string();
-
-            // Extract the bedrock_suffix: everything after the first '.'
-            // e.g. "us.anthropic.claude-sonnet-5-0-v1" -> "anthropic.claude-sonnet-5-0-v1"
-            let bedrock_suffix = profile_id
-                .find('.')
-                .map(|i| &profile_id[i + 1..])
-                .unwrap_or(&profile_id)
-                .to_string();
-
-            // anthropic_prefix is the stripped model name (without date)
-            let anthropic_prefix = stripped.to_string();
-
-            // anthropic_display is the full model ID CC sent (with date)
-            let anthropic_display = if anthropic_model != stripped {
-                Some(anthropic_model.to_string())
-            } else {
-                None
-            };
-
-            tracing::info!(
-                anthropic_prefix = %anthropic_prefix,
-                bedrock_suffix = %bedrock_suffix,
-                profile_id = %profile_id,
-                "Discovered new model mapping"
+    // Three-pass selection: exact stem -> versioned stem -> fuzzy contains
+    let chosen = match select_profile_id(&profile_ids, stripped) {
+        Some(id) => id,
+        None => {
+            tracing::warn!(
+                model = %anthropic_model,
+                stripped = %stripped,
+                "No matching inference profile found"
             );
-
-            return Some((
-                anthropic_prefix,
-                bedrock_suffix,
-                anthropic_display,
-                profile_prefix,
-            ));
+            return None;
         }
-    }
+    };
 
-    tracing::warn!(
-        model = %anthropic_model,
-        stripped = %stripped,
-        "No matching inference profile found"
+    // Build the mapping row (anthropic_prefix = exact requested id, NOT stripped)
+    let (anthropic_prefix, bedrock_suffix, anthropic_display, profile_prefix) =
+        build_mapping_row(anthropic_model, stripped, chosen);
+
+    tracing::info!(
+        anthropic_prefix = %anthropic_prefix,
+        bedrock_suffix = %bedrock_suffix,
+        profile_id = %chosen,
+        "Discovered new model mapping"
     );
-    None
+
+    Some((
+        anthropic_prefix,
+        bedrock_suffix,
+        anthropic_display,
+        profile_prefix,
+    ))
 }
 
 /// Map Anthropic model IDs to Bedrock inference profile IDs.
@@ -212,7 +300,7 @@ pub fn anthropic_to_bedrock(model: &str, prefix: &str, model_cache: Option<&Mode
 
     // Try dynamic cache first (non-blocking)
     if let Some(cache) = model_cache
-        && let Some(suffix) = cache.lookup_forward(model)
+        && let Some(suffix) = cache.lookup_forward_with_fallback(model)
     {
         return format!("{prefix}.{suffix}");
     }
@@ -224,28 +312,27 @@ pub fn anthropic_to_bedrock(model: &str, prefix: &str, model_cache: Option<&Mode
 /// Hardcoded forward mapping (no-DB fallback).
 fn hardcoded_anthropic_to_bedrock(model: &str, prefix: &str) -> String {
     match model {
-        s if s.starts_with("claude-opus-4-7") => {
-            format!("{prefix}.anthropic.claude-opus-4-7")
-        }
-        s if s.starts_with("claude-opus-4-6") => {
+        "claude-opus-4-7" => format!("{prefix}.anthropic.claude-opus-4-7"),
+        "claude-opus-4-6" | "claude-opus-4-6-20250605" => {
             format!("{prefix}.anthropic.claude-opus-4-6-v1")
         }
-        s if s.starts_with("claude-sonnet-4-6") => {
+        "claude-sonnet-4-6" | "claude-sonnet-4-6-20250514" => {
             format!("{prefix}.anthropic.claude-sonnet-4-6")
         }
-        s if s.starts_with("claude-opus-4-5") => {
+        "claude-opus-4-5" | "claude-opus-4-5-20251101" => {
             format!("{prefix}.anthropic.claude-opus-4-5-20251101-v1:0")
         }
-        s if s.starts_with("claude-sonnet-4-5") => {
+        "claude-sonnet-4-5" | "claude-sonnet-4-5-20250929" => {
             format!("{prefix}.anthropic.claude-sonnet-4-5-20250929-v1:0")
         }
-        s if s.starts_with("claude-sonnet-4-") => {
+        "claude-sonnet-4" | "claude-sonnet-4-20250514" => {
             format!("{prefix}.anthropic.claude-sonnet-4-20250514-v1:0")
         }
-        s if s.starts_with("claude-haiku-4-5") => {
+        "claude-haiku-4-5" | "claude-haiku-4-5-20251001" => {
             format!("{prefix}.anthropic.claude-haiku-4-5-20251001-v1:0")
         }
-        // Fallback: pass through as-is
+        // Unknown / future variants (e.g. claude-sonnet-4-8): pass through dotless
+        // so the discovery-on-miss path in handlers.rs resolves them via Bedrock.
         other => other.to_string(),
     }
 }
@@ -378,10 +465,14 @@ mod tests {
     }
 
     // --- ModelCache tests ---
+    // #[cfg(test)] - all tests below are within the test module
 
+    /// Validates exact-match lookup semantics: a cache row keyed by one variant
+    /// will ONLY match an identical lookup key, not similar model IDs.
     #[tokio::test]
     async fn test_cache_forward_lookup() {
         let cache = ModelCache::new();
+        // Insert a bare-stem model ID as the key
         cache
             .insert(CachedMapping {
                 anthropic_prefix: "claude-sonnet-4-6".to_string(),
@@ -390,9 +481,18 @@ mod tests {
             })
             .await;
 
+        // Exact match: lookup with the same bare-stem key succeeds
+        assert_eq!(
+            cache.lookup_forward("claude-sonnet-4-6"),
+            Some("anthropic.claude-sonnet-4-6".to_string()),
+            "Exact-match lookup with bare-stem key should succeed"
+        );
+
+        // Non-exact match: lookup with dated variant MUST fail under exact-match semantics
         assert_eq!(
             cache.lookup_forward("claude-sonnet-4-6-20250514"),
-            Some("anthropic.claude-sonnet-4-6".to_string())
+            None,
+            "Exact-match lookup must NOT match dated variant against bare-stem key"
         );
     }
 
@@ -413,58 +513,43 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn test_cache_prefix_ordering() {
-        let cache = ModelCache::new();
-        // Insert in wrong order — cache should sort by length desc
-        cache
-            .insert(CachedMapping {
-                anthropic_prefix: "claude-sonnet-4-".to_string(),
-                bedrock_suffix: "anthropic.claude-sonnet-4-20250514-v1:0".to_string(),
-                anthropic_display: Some("claude-sonnet-4-20250514".to_string()),
-            })
-            .await;
-        cache
-            .insert(CachedMapping {
-                anthropic_prefix: "claude-sonnet-4-5".to_string(),
-                bedrock_suffix: "anthropic.claude-sonnet-4-5-20250929-v1:0".to_string(),
-                anthropic_display: Some("claude-sonnet-4-5-20250929".to_string()),
-            })
-            .await;
+    // #[cfg(test)] - test_cache_prefix_ordering deleted (obsolete under exact-match semantics)
 
-        // Specific prefix should match before catch-all
-        assert_eq!(
-            cache.lookup_forward("claude-sonnet-4-5-20250929"),
-            Some("anthropic.claude-sonnet-4-5-20250929-v1:0".to_string())
-        );
-        // Catch-all should still work for other sonnet-4 variants
-        assert_eq!(
-            cache.lookup_forward("claude-sonnet-4-20250514"),
-            Some("anthropic.claude-sonnet-4-20250514-v1:0".to_string())
-        );
-    }
-
+    /// Validates the integration of ModelCache exact-match semantics with anthropic_to_bedrock.
+    /// Cache hits require exact key match; cache misses fall back to hardcoded mappings.
     #[tokio::test]
     async fn test_cache_with_anthropic_to_bedrock() {
         let cache = ModelCache::new();
+        // Insert a dated model ID as the cache key
         cache
             .insert(CachedMapping {
-                anthropic_prefix: "claude-future-5-0".to_string(),
+                anthropic_prefix: "claude-future-5-0-20260601".to_string(),
                 bedrock_suffix: "anthropic.claude-future-5-0-v1".to_string(),
                 anthropic_display: Some("claude-future-5-0-20260601".to_string()),
             })
             .await;
 
-        // Dynamic cache hit
+        // Cache hit path: exact-match lookup succeeds when key matches exactly
         assert_eq!(
             anthropic_to_bedrock("claude-future-5-0-20260601", "us", Some(&cache)),
-            "us.anthropic.claude-future-5-0-v1"
+            "us.anthropic.claude-future-5-0-v1",
+            "Cache hit with exact key match should return cached suffix"
         );
 
-        // Hardcoded still works for known models via fallback
+        // Cache miss path: non-exact lookup falls back to hardcoded mapping
+        // (bare-stem "claude-future-5-0" doesn't match dated key "claude-future-5-0-20260601")
+        // Since there's no hardcoded mapping for claude-future-5-0, it passes through as-is
+        assert_eq!(
+            anthropic_to_bedrock("claude-future-5-0", "us", Some(&cache)),
+            "claude-future-5-0",
+            "Cache miss (non-exact key) with no hardcoded mapping should pass through"
+        );
+
+        // Cache miss path: known model falls back to hardcoded mapping
         assert_eq!(
             anthropic_to_bedrock("claude-sonnet-4-6-20250514", "us", Some(&cache)),
-            "us.anthropic.claude-sonnet-4-6"
+            "us.anthropic.claude-sonnet-4-6",
+            "Cache miss (model not in cache) should fall back to hardcoded mapping"
         );
     }
 
@@ -509,5 +594,537 @@ mod tests {
         assert_eq!(strip_date_suffix("short"), "short");
         assert_eq!(strip_date_suffix(""), "");
         assert_eq!(strip_date_suffix("12345678"), "12345678");
+    }
+
+    // --- Slice 1: AC1b - Exact-match hardcoded fallback (no greedy prefix) ---
+
+    /// AC1b: The hardcoded fallback MUST NOT use greedy prefix matching.
+    /// Future model IDs like 'claude-sonnet-4-8' MUST NOT match the greedy
+    /// 'starts_with("claude-sonnet-4-")' catch-all that routes to retired Sonnet 4.0.
+    /// This test MUST FAIL on the current code (line 247-249) to prove the bug.
+    #[test]
+    fn test_hardcoded_fallback_no_greedy_prefix() {
+        // AC1b guard: Future variant must NOT route to retired Sonnet 4.0 profile
+        let result = anthropic_to_bedrock("claude-sonnet-4-8", "us", None);
+        assert_ne!(
+            result, "us.anthropic.claude-sonnet-4-20250514-v1:0",
+            "GREEDY BUG: 'claude-sonnet-4-8' matched catch-all and routed to RETIRED Sonnet 4.0"
+        );
+        // Expected: dotless pass-through so discovery can fire
+        assert_eq!(
+            result, "claude-sonnet-4-8",
+            "Unknown future variant must pass through dotless for discovery"
+        );
+    }
+
+    /// AC1b regression safety: Canonical models still resolve after switching to exact-match.
+    /// These assertions should PASS before and after the builder's fix.
+    #[test]
+    fn test_hardcoded_fallback_canonical_mappings_survive() {
+        // Bare stem forms
+        assert_eq!(
+            anthropic_to_bedrock("claude-sonnet-4-6", "us", None),
+            "us.anthropic.claude-sonnet-4-6",
+            "Bare stem 'claude-sonnet-4-6' must resolve"
+        );
+        assert_eq!(
+            anthropic_to_bedrock("claude-opus-4-7", "us", None),
+            "us.anthropic.claude-opus-4-7",
+            "Bare stem 'claude-opus-4-7' must resolve"
+        );
+
+        // Canonical dated forms
+        assert_eq!(
+            anthropic_to_bedrock("claude-sonnet-4-6-20250514", "us", None),
+            "us.anthropic.claude-sonnet-4-6",
+            "Canonical dated 'claude-sonnet-4-6-20250514' must resolve"
+        );
+        assert_eq!(
+            anthropic_to_bedrock("claude-sonnet-4-20250514", "us", None),
+            "us.anthropic.claude-sonnet-4-20250514-v1:0",
+            "Canonical dated 'claude-sonnet-4-20250514' (retired Sonnet 4.0) must still resolve via EXACT match"
+        );
+        assert_eq!(
+            anthropic_to_bedrock("claude-opus-4-6-20250605", "us", None),
+            "us.anthropic.claude-opus-4-6-v1",
+            "Canonical dated 'claude-opus-4-6-20250605' must resolve"
+        );
+        assert_eq!(
+            anthropic_to_bedrock("claude-haiku-4-5-20251001", "us", None),
+            "us.anthropic.claude-haiku-4-5-20251001-v1:0",
+            "Canonical dated 'claude-haiku-4-5-20251001' must resolve"
+        );
+    }
+
+    // --- Slice 1: Exact-match cache lookup tests (#[cfg(test)]) ---
+
+    /// AC1: Regression test for the greedy prefix bug.
+    /// Given cache row ('claude-opus-4', ...), lookup of 'claude-opus-4-8' MUST return None.
+    /// This test MUST FAIL on the current starts_with code (it would incorrectly match).
+    #[tokio::test]
+    async fn test_cache_exact_match_no_greedy_prefix() {
+        let cache = ModelCache::new();
+        cache
+            .insert(CachedMapping {
+                anthropic_prefix: "claude-opus-4".to_string(),
+                bedrock_suffix: "anthropic.claude-opus-4-20250514-v1:0".to_string(),
+                anthropic_display: Some("claude-opus-4-20250514".to_string()),
+            })
+            .await;
+
+        // AC1: This MUST return None under exact-match semantics
+        // (currently fails because starts_with matches 'claude-opus-4')
+        assert_eq!(
+            cache.lookup_forward("claude-opus-4-8"),
+            None,
+            "lookup_forward must NOT match 'claude-opus-4-8' against row keyed 'claude-opus-4'"
+        );
+    }
+
+    /// AC2: Exact match returns the correct suffix.
+    #[tokio::test]
+    async fn test_cache_exact_match_found() {
+        let cache = ModelCache::new();
+        cache
+            .insert(CachedMapping {
+                anthropic_prefix: "claude-opus-4-8".to_string(),
+                bedrock_suffix: "anthropic.claude-opus-4-8".to_string(),
+                anthropic_display: None,
+            })
+            .await;
+
+        assert_eq!(
+            cache.lookup_forward("claude-opus-4-8"),
+            Some("anthropic.claude-opus-4-8".to_string())
+        );
+    }
+
+    /// AC3: Exact match on a dated model ID returns the correct suffix.
+    #[tokio::test]
+    async fn test_cache_exact_match_dated_model() {
+        let cache = ModelCache::new();
+        cache
+            .insert(CachedMapping {
+                anthropic_prefix: "claude-opus-4-20250514".to_string(),
+                bedrock_suffix: "anthropic.claude-opus-4-20250514-v1:0".to_string(),
+                anthropic_display: None,
+            })
+            .await;
+
+        assert_eq!(
+            cache.lookup_forward("claude-opus-4-20250514"),
+            Some("anthropic.claude-opus-4-20250514-v1:0".to_string())
+        );
+    }
+
+    /// AC4 (partial): Legacy rows are inert under exact-match.
+    /// A legacy row keyed 'claude-sonnet-4-' is never matched by a specific request
+    /// unless the request is exactly 'claude-sonnet-4-'.
+    #[tokio::test]
+    async fn test_cache_legacy_row_inert() {
+        let cache = ModelCache::new();
+        cache
+            .insert(CachedMapping {
+                anthropic_prefix: "claude-sonnet-4-".to_string(),
+                bedrock_suffix: "anthropic.claude-sonnet-4-20250514-v1:0".to_string(),
+                anthropic_display: Some("claude-sonnet-4-20250514".to_string()),
+            })
+            .await;
+
+        // Under exact-match, 'claude-sonnet-4-5-20250929' does NOT match 'claude-sonnet-4-'
+        assert_eq!(
+            cache.lookup_forward("claude-sonnet-4-5-20250929"),
+            None,
+            "lookup_forward must NOT match 'claude-sonnet-4-5-20250929' against row keyed 'claude-sonnet-4-'"
+        );
+    }
+
+    /// AC5: Reverse lookup with exact suffix match.
+    #[tokio::test]
+    async fn test_cache_reverse_exact_suffix() {
+        let cache = ModelCache::new();
+        cache
+            .insert(CachedMapping {
+                anthropic_prefix: "claude-opus-4-8".to_string(),
+                bedrock_suffix: "anthropic.claude-opus-4-8".to_string(),
+                anthropic_display: Some("claude-opus-4-8".to_string()),
+            })
+            .await;
+
+        assert_eq!(
+            cache.lookup_reverse("global.anthropic.claude-opus-4-8"),
+            Some("claude-opus-4-8".to_string())
+        );
+    }
+
+    /// Empty cache: lookup returns None.
+    #[tokio::test]
+    async fn test_cache_empty_lookup() {
+        let cache = ModelCache::new();
+        assert_eq!(cache.lookup_forward("claude-opus-4-8"), None);
+        assert_eq!(
+            cache.lookup_reverse("global.anthropic.claude-opus-4-8"),
+            None
+        );
+    }
+
+    // --- Slice 2: Read-time date-suffix fallback tests ---
+    // These tests are within #[cfg(test)] mod tests (defined at line 289)
+
+    /// AC6: Cache contains row for `claude-opus-4-8` (no date).
+    /// Lookup of `claude-opus-4-8-20260601` (WITH date) should return the cached suffix
+    /// via the fallback (strips date from input, re-tries exact lookup).
+    #[tokio::test]
+    async fn test_lookup_with_fallback_strips_date_from_input() {
+        let cache = ModelCache::new();
+        cache
+            .insert(CachedMapping {
+                anthropic_prefix: "claude-opus-4-8".to_string(),
+                bedrock_suffix: "anthropic.claude-opus-4-8".to_string(),
+                anthropic_display: None,
+            })
+            .await;
+
+        // Dated input strips to "claude-opus-4-8" which matches the cache row
+        assert_eq!(
+            cache.lookup_forward_with_fallback("claude-opus-4-8-20260601"),
+            Some("anthropic.claude-opus-4-8".to_string()),
+            "AC6: Dated input should strip and match the no-date cache row"
+        );
+    }
+
+    /// AC7: Cache contains row for `claude-opus-4-8-20260601` (WITH date).
+    /// Lookup of `claude-opus-4-8` (no date) should return None.
+    /// The fallback only strips dates from the INPUT; it never adds them.
+    #[tokio::test]
+    async fn test_lookup_with_fallback_does_not_add_dates() {
+        let cache = ModelCache::new();
+        cache
+            .insert(CachedMapping {
+                anthropic_prefix: "claude-opus-4-8-20260601".to_string(),
+                bedrock_suffix: "anthropic.claude-opus-4-8".to_string(),
+                anthropic_display: Some("claude-opus-4-8-20260601".to_string()),
+            })
+            .await;
+
+        // No-date input has no date to strip; exact miss on "claude-opus-4-8" returns None
+        assert_eq!(
+            cache.lookup_forward_with_fallback("claude-opus-4-8"),
+            None,
+            "AC7: Fallback must NOT add dates; no-date input against dated cache row returns None"
+        );
+    }
+
+    /// AC8: The anti-greedy guarantee.
+    /// Cache contains ONLY a bare-major row `claude-opus-4`.
+    /// Lookup of `claude-opus-4-20250514` (dated bare-major) MUST return None.
+    ///
+    /// INTENT: The fallback refuses to route a dated bare-major input (like
+    /// `claude-opus-4-20250514`) to a bare-major cache row (`claude-opus-4`),
+    /// because that would recreate the exact greedy prefix bug.
+    ///
+    /// IMPLEMENTATION NOTE (builder): The spec's "ends with a digit" guard is
+    /// insufficient to distinguish `claude-opus-4` (bare major, ends with `4`)
+    /// from `claude-opus-4-8` (minor-version-bearing, ends with `8`). Both end
+    /// with digits. You must implement a stricter guard that:
+    /// - ALLOWS the fallback for `claude-opus-4-8-20260601` → `claude-opus-4-8` (AC6)
+    /// - REJECTS the fallback for `claude-opus-4-20250514` → `claude-opus-4` (AC8)
+    ///
+    /// Suggested approach: after stripping, check that the stripped form contains
+    /// a minor-version segment (e.g., trailing pattern `-\d{1,2}$` indicating a
+    /// version like `-8`, NOT just ending at a bare major like `-4` where the `4`
+    /// is the major version itself). Alternatively: only allow the fallback when
+    /// `stripped.ends_with(char::is_ascii_digit)` AND `stripped` differs from input
+    /// by exactly 9 chars (the `-YYYYMMDD` suffix) AND the char before the removed
+    /// suffix was also a digit (meaning the stripped form has a trailing version segment).
+    #[tokio::test]
+    async fn test_lookup_with_fallback_refuses_bare_major_greedy_match() {
+        let cache = ModelCache::new();
+        cache
+            .insert(CachedMapping {
+                anthropic_prefix: "claude-opus-4".to_string(),
+                bedrock_suffix: "anthropic.claude-opus-4-20250514-v1:0".to_string(),
+                anthropic_display: Some("claude-opus-4-20250514".to_string()),
+            })
+            .await;
+
+        // AC8: This MUST return None — the fallback must NOT route dated bare-major
+        // input to a bare-major cache row (that's the greedy bug we're preventing)
+        assert_eq!(
+            cache.lookup_forward_with_fallback("claude-opus-4-20250514"),
+            None,
+            "AC8: Fallback must NOT match 'claude-opus-4-20250514' against bare-major row 'claude-opus-4'"
+        );
+    }
+
+    /// AC9: Reassert AC1 under the new fallback method.
+    /// Cache contains ONLY `claude-opus-4` (bare major).
+    /// Lookup of `claude-opus-4-8` (minor-version) MUST return None.
+    ///
+    /// `claude-opus-4-8` has no date suffix, so the fallback never strips anything
+    /// and never attempts a second lookup. Exact miss → None.
+    #[tokio::test]
+    async fn test_lookup_with_fallback_no_greedy_prefix_match() {
+        let cache = ModelCache::new();
+        cache
+            .insert(CachedMapping {
+                anthropic_prefix: "claude-opus-4".to_string(),
+                bedrock_suffix: "anthropic.claude-opus-4-20250514-v1:0".to_string(),
+                anthropic_display: Some("claude-opus-4-20250514".to_string()),
+            })
+            .await;
+
+        // AC9: This MUST return None — no date to strip, exact miss on "claude-opus-4-8"
+        assert_eq!(
+            cache.lookup_forward_with_fallback("claude-opus-4-8"),
+            None,
+            "AC9: Fallback must NOT match 'claude-opus-4-8' (no date) against bare-major row 'claude-opus-4'"
+        );
+    }
+
+    // --- Slice 3: discover_model three-pass selection + exact-key write ---
+    // Tests within #[cfg(test)] for Slice 3 acceptance criteria.
+    //
+    // BUILDER CONTRACT: These tests require two new pure functions that you MUST extract from
+    // `discover_model` to make the logic testable without a live Bedrock client:
+    //
+    // 1. `select_profile_id<'a>(profile_ids: &'a [String], stripped: &str) -> Option<&'a str>`
+    //    Implements the 3-pass selection logic:
+    //    - Pass 1 (exact stem): profile_id ends with `.anthropic.{stripped}`. First match wins.
+    //    - Pass 2 (versioned stem): profile_id matches regex `\.anthropic\.{stripped}-v\d+(:\d+)?$`. First match wins.
+    //    - Pass 3 (fuzzy contains): existing behavior — first profile_id that contains `stripped`.
+    //    Returns the chosen profile_id (full string like "global.anthropic.claude-opus-4-8").
+    //
+    // 2. `build_mapping_row(anthropic_model: &str, stripped: &str, chosen_profile_id: &str) -> (String, String, Option<String>, String)`
+    //    Builds the return tuple (anthropic_prefix, bedrock_suffix, anthropic_display, profile_prefix).
+    //    Key change: `anthropic_prefix` MUST be `anthropic_model` (the exact requested ID), NOT `stripped`.
+    //    `anthropic_display` is Some(anthropic_model) when anthropic_model != stripped, else None.
+    //    `profile_prefix` extracts the region (everything before first '.').
+    //    `bedrock_suffix` extracts everything after first '.'.
+    //
+    // Your implementation: call `select_profile_id` to pick the winner, then `build_mapping_row` to construct the result.
+
+    /// AC10: Exact stem beats variant.
+    /// Profile list contains both "global.anthropic.claude-opus-4-8" and
+    /// "global.anthropic.claude-opus-4-8-thinking". Pass 1 (exact stem) MUST win,
+    /// returning the base profile, NOT the `-thinking` variant.
+    #[test]
+    fn test_select_profile_exact_stem_beats_variant() {
+        let profiles = vec![
+            "global.anthropic.claude-opus-4-8".to_string(),
+            "global.anthropic.claude-opus-4-8-thinking".to_string(),
+        ];
+        let stripped = "claude-opus-4-8";
+
+        let chosen = select_profile_id(&profiles, stripped);
+        assert_eq!(
+            chosen,
+            Some("global.anthropic.claude-opus-4-8"),
+            "AC10: Exact stem '.anthropic.claude-opus-4-8' must beat '-thinking' variant"
+        );
+    }
+
+    /// AC10 (order independence): Exact stem wins regardless of list order.
+    /// Reversed profile list — exact stem still wins via pass 1, not position.
+    #[test]
+    fn test_select_profile_exact_stem_order_independent() {
+        let profiles = vec![
+            "global.anthropic.claude-opus-4-8-thinking".to_string(),
+            "global.anthropic.claude-opus-4-8".to_string(),
+        ];
+        let stripped = "claude-opus-4-8";
+
+        let chosen = select_profile_id(&profiles, stripped);
+        assert_eq!(
+            chosen,
+            Some("global.anthropic.claude-opus-4-8"),
+            "AC10: Exact stem must win even when it appears AFTER the variant in the list"
+        );
+    }
+
+    /// AC11: Versioned stem match (pass 2).
+    /// Profile list contains "global.anthropic.claude-opus-4-6-v1".
+    /// No exact stem match exists (`global.anthropic.claude-opus-4-6` is absent),
+    /// so pass 2 (versioned-stem regex) fires and returns the `-v1` profile.
+    #[test]
+    fn test_select_profile_versioned_stem() {
+        let profiles = vec!["global.anthropic.claude-opus-4-6-v1".to_string()];
+        let stripped = "claude-opus-4-6";
+
+        let chosen = select_profile_id(&profiles, stripped);
+        assert_eq!(
+            chosen,
+            Some("global.anthropic.claude-opus-4-6-v1"),
+            "AC11: Versioned-stem match (pass 2) must succeed when exact stem is absent"
+        );
+    }
+
+    /// AC11 (versioned stem with sub-version): Test `-v1:0` form.
+    /// The versioned-stem regex allows optional `:\d+` after `-v\d+`.
+    #[test]
+    fn test_select_profile_versioned_stem_with_subversion() {
+        let profiles = vec!["us.anthropic.claude-sonnet-4-6-v1:0".to_string()];
+        let stripped = "claude-sonnet-4-6";
+
+        let chosen = select_profile_id(&profiles, stripped);
+        assert_eq!(
+            chosen,
+            Some("us.anthropic.claude-sonnet-4-6-v1:0"),
+            "AC11: Versioned-stem match must accept `-v1:0` form (with sub-version)"
+        );
+    }
+
+    /// AC11 (pass-order priority): Exact stem beats versioned stem when both exist.
+    /// Profiles list contains BOTH `global.anthropic.claude-opus-4-6` (exact stem)
+    /// and `global.anthropic.claude-opus-4-6-v2` (versioned stem). Pass 1 must win.
+    #[test]
+    fn test_select_profile_exact_stem_beats_versioned_stem() {
+        let profiles = vec![
+            "global.anthropic.claude-opus-4-6-v2".to_string(),
+            "global.anthropic.claude-opus-4-6".to_string(),
+        ];
+        let stripped = "claude-opus-4-6";
+
+        let chosen = select_profile_id(&profiles, stripped);
+        assert_eq!(
+            chosen,
+            Some("global.anthropic.claude-opus-4-6"),
+            "Exact stem (pass 1) must beat versioned stem (pass 2) when both exist"
+        );
+    }
+
+    /// Fuzzy contains fallback (pass 3): when exact and versioned stem both miss.
+    /// This is the existing behavior — first profile whose id contains `stripped`.
+    #[test]
+    fn test_select_profile_fuzzy_contains_fallback() {
+        let profiles = vec![
+            "global.foo.claude-opus-4-8-experimental".to_string(),
+            "us.anthropic.claude-opus-4-8-custom".to_string(),
+        ];
+        let stripped = "claude-opus-4-8";
+
+        // Neither profile ends with `.anthropic.claude-opus-4-8` (exact stem miss)
+        // Neither matches versioned-stem regex (pass 2 miss)
+        // Both contain `claude-opus-4-8` → pass 3 takes the FIRST one
+        let chosen = select_profile_id(&profiles, stripped);
+        assert_eq!(
+            chosen,
+            Some("global.foo.claude-opus-4-8-experimental"),
+            "Pass 3 (fuzzy contains) must return the first profile whose id contains stripped"
+        );
+    }
+
+    /// No match: all three passes miss.
+    #[test]
+    fn test_select_profile_no_match() {
+        let profiles = vec![
+            "global.anthropic.claude-sonnet-4-6".to_string(),
+            "us.anthropic.claude-haiku-4-5".to_string(),
+        ];
+        let stripped = "claude-opus-4-8";
+
+        let chosen = select_profile_id(&profiles, stripped);
+        assert_eq!(
+            chosen, None,
+            "select_profile_id must return None when no profile matches"
+        );
+    }
+
+    /// AC12: THE PRINCIPAL REGRESSION GUARD — persisted prefix is the exact id.
+    /// After `discover_model("claude-opus-4-6-20250605", ...)` resolves, the persisted/returned
+    /// `anthropic_prefix` MUST equal `"claude-opus-4-6-20250605"` (the exact request), NOT
+    /// `"claude-opus-4-6"` (the stripped form). This is the core bug fix.
+    ///
+    /// Test via the pure `build_mapping_row` function.
+    #[test]
+    fn test_build_mapping_row_persists_exact_id_with_date() {
+        let anthropic_model = "claude-opus-4-6-20250605";
+        let stripped = "claude-opus-4-6";
+        let chosen_profile_id = "global.anthropic.claude-opus-4-6-v1";
+
+        let (anthropic_prefix, bedrock_suffix, anthropic_display, profile_prefix) =
+            build_mapping_row(anthropic_model, stripped, chosen_profile_id);
+
+        // AC12: The prefix MUST be the exact requested model ID
+        assert_eq!(
+            anthropic_prefix, "claude-opus-4-6-20250605",
+            "AC12: anthropic_prefix must be the EXACT requested model ID (with date), not stripped form"
+        );
+
+        // Verify the other fields for completeness
+        assert_eq!(
+            bedrock_suffix, "anthropic.claude-opus-4-6-v1",
+            "bedrock_suffix must extract everything after the first '.'"
+        );
+        assert_eq!(
+            anthropic_display,
+            Some("claude-opus-4-6-20250605".to_string()),
+            "anthropic_display must be Some(exact_id) when exact_id != stripped"
+        );
+        assert_eq!(
+            profile_prefix, "global",
+            "profile_prefix must extract the region before the first '.'"
+        );
+    }
+
+    /// AC13: No-date input — persisted prefix equals the input (which equals stripped).
+    /// When the input has no date suffix (input == stripped), `anthropic_prefix` still
+    /// equals the input, and `anthropic_display` is None (since input == stripped).
+    #[test]
+    fn test_build_mapping_row_persists_exact_id_no_date() {
+        let anthropic_model = "claude-opus-4-7";
+        let stripped = "claude-opus-4-7"; // No date, so stripped == input
+        let chosen_profile_id = "us.anthropic.claude-opus-4-7";
+
+        let (anthropic_prefix, bedrock_suffix, anthropic_display, profile_prefix) =
+            build_mapping_row(anthropic_model, stripped, chosen_profile_id);
+
+        // AC13: anthropic_prefix still equals the exact input (which happens to equal stripped)
+        assert_eq!(
+            anthropic_prefix, "claude-opus-4-7",
+            "AC13: anthropic_prefix must be the exact requested model ID (no date case)"
+        );
+
+        // When input == stripped, anthropic_display is None
+        assert_eq!(
+            anthropic_display, None,
+            "AC13: anthropic_display must be None when input == stripped (no date)"
+        );
+
+        // Verify the other fields
+        assert_eq!(
+            bedrock_suffix, "anthropic.claude-opus-4-7",
+            "bedrock_suffix must extract everything after the first '.'"
+        );
+        assert_eq!(
+            profile_prefix, "us",
+            "profile_prefix must extract the region before the first '.'"
+        );
+    }
+
+    /// Edge case: profile_id with no dot (malformed, but defensively handled).
+    /// `profile_prefix` should be the whole string, `bedrock_suffix` should be the whole string.
+    #[test]
+    fn test_build_mapping_row_no_dot_in_profile_id() {
+        let anthropic_model = "claude-test";
+        let stripped = "claude-test";
+        let chosen_profile_id = "malformed-profile-id";
+
+        let (anthropic_prefix, bedrock_suffix, anthropic_display, profile_prefix) =
+            build_mapping_row(anthropic_model, stripped, chosen_profile_id);
+
+        assert_eq!(
+            anthropic_prefix, "claude-test",
+            "anthropic_prefix is always the exact input"
+        );
+        assert_eq!(
+            bedrock_suffix, "malformed-profile-id",
+            "bedrock_suffix fallback: entire string when no dot found"
+        );
+        assert_eq!(anthropic_display, None, "input == stripped → None");
+        assert_eq!(
+            profile_prefix, "malformed-profile-id",
+            "profile_prefix fallback: entire string when no dot found"
+        );
     }
 }

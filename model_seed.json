@@ -1,0 +1,37 @@
+[
+  {
+    "anthropic_prefix": "claude-opus-4-8",
+    "bedrock_suffix": "anthropic.claude-opus-4-8",
+    "anthropic_display": "claude-opus-4-8"
+  },
+  {
+    "anthropic_prefix": "claude-opus-4-7",
+    "bedrock_suffix": "anthropic.claude-opus-4-7",
+    "anthropic_display": "claude-opus-4-7"
+  },
+  {
+    "anthropic_prefix": "claude-opus-4-6-20250605",
+    "bedrock_suffix": "anthropic.claude-opus-4-6-v1",
+    "anthropic_display": "claude-opus-4-6-20250605"
+  },
+  {
+    "anthropic_prefix": "claude-sonnet-4-6-20250514",
+    "bedrock_suffix": "anthropic.claude-sonnet-4-6",
+    "anthropic_display": "claude-sonnet-4-6-20250514"
+  },
+  {
+    "anthropic_prefix": "claude-sonnet-4-5-20250929",
+    "bedrock_suffix": "anthropic.claude-sonnet-4-5-20250929-v1:0",
+    "anthropic_display": "claude-sonnet-4-5-20250929"
+  },
+  {
+    "anthropic_prefix": "claude-sonnet-4-20250514",
+    "bedrock_suffix": "anthropic.claude-sonnet-4-20250514-v1:0",
+    "anthropic_display": "claude-sonnet-4-20250514"
+  },
+  {
+    "anthropic_prefix": "claude-haiku-4-5-20251001",
+    "bedrock_suffix": "anthropic.claude-haiku-4-5-20251001-v1:0",
+    "anthropic_display": "claude-haiku-4-5-20251001"
+  }
+]

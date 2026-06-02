@@ -1,0 +1,32 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT anthropic_prefix, bedrock_suffix, source\n           FROM model_mappings\n           WHERE anthropic_prefix = 'claude-opus-4-8'",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "anthropic_prefix",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 1,
+        "name": "bedrock_suffix",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 2,
+        "name": "source",
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "c11723760e05ef04a688b73addda80d7be73a6d2a142ba9e774ae1042fad9ab5"
+}
