@@ -58,6 +58,24 @@ impl ModelCache {
         guard.get(anthropic_model).map(|m| m.bedrock_suffix.clone())
     }
 
+    /// Forward lookup with a read-time date-suffix fallback.
+    /// 1. Exact match on `model`.
+    /// 2. On miss, if `model` carries a date suffix, retry once against the
+    ///    date-stripped form — but ONLY when the stripped form is
+    ///    minor-version-bearing (ends with two numeric dash-segments, e.g.
+    ///    `claude-opus-4-8`), never a bare major (`claude-opus-4`). This guard
+    ///    prevents recreating the greedy-prefix bug Slice 1 eliminated.
+    pub fn lookup_forward_with_fallback(&self, model: &str) -> Option<String> {
+        if let Some(hit) = self.lookup_forward(model) {
+            return Some(hit);
+        }
+        let stripped = strip_date_suffix(model);
+        if stripped != model && is_minor_version_bearing(stripped) {
+            return self.lookup_forward(stripped);
+        }
+        None
+    }
+
     /// Reverse lookup: bedrock model ID -> anthropic display name.
     /// First tries an exact-match fast path against known bedrock_suffix values,
     /// then falls back to the existing `contains` scan (for rows where the suffix
@@ -106,6 +124,23 @@ pub fn strip_date_suffix(model: &str) -> &str {
         }
     }
     model
+}
+
+/// True when `s` ends with two numeric dash-segments (`…-<major>-<minor>`),
+/// e.g. `claude-opus-4-8` -> true, `claude-opus-4` -> false.
+/// Used to gate the date-strip fallback so a dated bare-major input
+/// (`claude-opus-4-20250514`) never resolves to a `claude-opus-4` row.
+fn is_minor_version_bearing(s: &str) -> bool {
+    // Split on '-'; the last two segments must both be all-ASCII-digits.
+    let mut segs = s.rsplit('-');
+    let last = segs.next();
+    let second_last = segs.next();
+    matches!(
+        (last, second_last),
+        (Some(a), Some(b))
+            if !a.is_empty() && a.bytes().all(|c| c.is_ascii_digit())
+            && !b.is_empty() && b.bytes().all(|c| c.is_ascii_digit())
+    )
 }
 
 /// Discover a model by calling Bedrock ListInferenceProfiles and fuzzy-matching.
@@ -220,7 +255,7 @@ pub fn anthropic_to_bedrock(model: &str, prefix: &str, model_cache: Option<&Mode
 
     // Try dynamic cache first (non-blocking)
     if let Some(cache) = model_cache
-        && let Some(suffix) = cache.lookup_forward(model)
+        && let Some(suffix) = cache.lookup_forward_with_fallback(model)
     {
         return format!("{prefix}.{suffix}");
     }
@@ -685,6 +720,120 @@ mod tests {
         assert_eq!(
             cache.lookup_reverse("global.anthropic.claude-opus-4-8"),
             None
+        );
+    }
+
+    // --- Slice 2: Read-time date-suffix fallback tests ---
+    // These tests are within #[cfg(test)] mod tests (defined at line 289)
+
+    /// AC6: Cache contains row for `claude-opus-4-8` (no date).
+    /// Lookup of `claude-opus-4-8-20260601` (WITH date) should return the cached suffix
+    /// via the fallback (strips date from input, re-tries exact lookup).
+    #[tokio::test]
+    async fn test_lookup_with_fallback_strips_date_from_input() {
+        let cache = ModelCache::new();
+        cache
+            .insert(CachedMapping {
+                anthropic_prefix: "claude-opus-4-8".to_string(),
+                bedrock_suffix: "anthropic.claude-opus-4-8".to_string(),
+                anthropic_display: None,
+            })
+            .await;
+
+        // Dated input strips to "claude-opus-4-8" which matches the cache row
+        assert_eq!(
+            cache.lookup_forward_with_fallback("claude-opus-4-8-20260601"),
+            Some("anthropic.claude-opus-4-8".to_string()),
+            "AC6: Dated input should strip and match the no-date cache row"
+        );
+    }
+
+    /// AC7: Cache contains row for `claude-opus-4-8-20260601` (WITH date).
+    /// Lookup of `claude-opus-4-8` (no date) should return None.
+    /// The fallback only strips dates from the INPUT; it never adds them.
+    #[tokio::test]
+    async fn test_lookup_with_fallback_does_not_add_dates() {
+        let cache = ModelCache::new();
+        cache
+            .insert(CachedMapping {
+                anthropic_prefix: "claude-opus-4-8-20260601".to_string(),
+                bedrock_suffix: "anthropic.claude-opus-4-8".to_string(),
+                anthropic_display: Some("claude-opus-4-8-20260601".to_string()),
+            })
+            .await;
+
+        // No-date input has no date to strip; exact miss on "claude-opus-4-8" returns None
+        assert_eq!(
+            cache.lookup_forward_with_fallback("claude-opus-4-8"),
+            None,
+            "AC7: Fallback must NOT add dates; no-date input against dated cache row returns None"
+        );
+    }
+
+    /// AC8: The anti-greedy guarantee.
+    /// Cache contains ONLY a bare-major row `claude-opus-4`.
+    /// Lookup of `claude-opus-4-20250514` (dated bare-major) MUST return None.
+    ///
+    /// INTENT: The fallback refuses to route a dated bare-major input (like
+    /// `claude-opus-4-20250514`) to a bare-major cache row (`claude-opus-4`),
+    /// because that would recreate the exact greedy prefix bug.
+    ///
+    /// IMPLEMENTATION NOTE (builder): The spec's "ends with a digit" guard is
+    /// insufficient to distinguish `claude-opus-4` (bare major, ends with `4`)
+    /// from `claude-opus-4-8` (minor-version-bearing, ends with `8`). Both end
+    /// with digits. You must implement a stricter guard that:
+    /// - ALLOWS the fallback for `claude-opus-4-8-20260601` → `claude-opus-4-8` (AC6)
+    /// - REJECTS the fallback for `claude-opus-4-20250514` → `claude-opus-4` (AC8)
+    ///
+    /// Suggested approach: after stripping, check that the stripped form contains
+    /// a minor-version segment (e.g., trailing pattern `-\d{1,2}$` indicating a
+    /// version like `-8`, NOT just ending at a bare major like `-4` where the `4`
+    /// is the major version itself). Alternatively: only allow the fallback when
+    /// `stripped.ends_with(char::is_ascii_digit)` AND `stripped` differs from input
+    /// by exactly 9 chars (the `-YYYYMMDD` suffix) AND the char before the removed
+    /// suffix was also a digit (meaning the stripped form has a trailing version segment).
+    #[tokio::test]
+    async fn test_lookup_with_fallback_refuses_bare_major_greedy_match() {
+        let cache = ModelCache::new();
+        cache
+            .insert(CachedMapping {
+                anthropic_prefix: "claude-opus-4".to_string(),
+                bedrock_suffix: "anthropic.claude-opus-4-20250514-v1:0".to_string(),
+                anthropic_display: Some("claude-opus-4-20250514".to_string()),
+            })
+            .await;
+
+        // AC8: This MUST return None — the fallback must NOT route dated bare-major
+        // input to a bare-major cache row (that's the greedy bug we're preventing)
+        assert_eq!(
+            cache.lookup_forward_with_fallback("claude-opus-4-20250514"),
+            None,
+            "AC8: Fallback must NOT match 'claude-opus-4-20250514' against bare-major row 'claude-opus-4'"
+        );
+    }
+
+    /// AC9: Reassert AC1 under the new fallback method.
+    /// Cache contains ONLY `claude-opus-4` (bare major).
+    /// Lookup of `claude-opus-4-8` (minor-version) MUST return None.
+    ///
+    /// `claude-opus-4-8` has no date suffix, so the fallback never strips anything
+    /// and never attempts a second lookup. Exact miss → None.
+    #[tokio::test]
+    async fn test_lookup_with_fallback_no_greedy_prefix_match() {
+        let cache = ModelCache::new();
+        cache
+            .insert(CachedMapping {
+                anthropic_prefix: "claude-opus-4".to_string(),
+                bedrock_suffix: "anthropic.claude-opus-4-20250514-v1:0".to_string(),
+                anthropic_display: Some("claude-opus-4-20250514".to_string()),
+            })
+            .await;
+
+        // AC9: This MUST return None — no date to strip, exact miss on "claude-opus-4-8"
+        assert_eq!(
+            cache.lookup_forward_with_fallback("claude-opus-4-8"),
+            None,
+            "AC9: Fallback must NOT match 'claude-opus-4-8' (no date) against bare-major row 'claude-opus-4'"
         );
     }
 }

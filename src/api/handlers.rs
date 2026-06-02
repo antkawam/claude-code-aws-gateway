@@ -493,7 +493,9 @@ pub async fn messages(
         // Determine the Bedrock suffix for the requested model.
         // Prefer the model cache (exact suffix); fall back to prefix-based translation
         // and strip the region prefix so suffix matching works across regions.
-        let bedrock_suffix = if let Some(suffix) = state.model_cache.lookup_forward(&original_model)
+        let bedrock_suffix = if let Some(suffix) = state
+            .model_cache
+            .lookup_forward_with_fallback(&original_model)
         {
             suffix
         } else {
