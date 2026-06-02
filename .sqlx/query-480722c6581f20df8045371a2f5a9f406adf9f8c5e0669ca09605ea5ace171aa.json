@@ -1,0 +1,12 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO model_mappings (anthropic_prefix, bedrock_suffix, anthropic_display, source)\n           VALUES ('claude-opus-4-8', 'WRONG_SUFFIX', NULL, 'discovered')",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": []
+  },
+  "hash": "480722c6581f20df8045371a2f5a9f406adf9f8c5e0669ca09605ea5ace171aa"
+}
