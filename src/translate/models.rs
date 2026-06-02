@@ -143,6 +143,70 @@ fn is_minor_version_bearing(s: &str) -> bool {
     )
 }
 
+/// Select the best matching inference profile ID using three ordered passes:
+/// 1. Exact stem: profile_id ends with `.anthropic.{stripped}`.
+/// 2. Versioned stem: profile_id matches `\.anthropic\.{stripped}-v\d+(:\d+)?$`.
+/// 3. Fuzzy contains: first profile_id containing `stripped` (legacy behaviour).
+///
+/// First match within the earliest non-empty pass wins.
+fn select_profile_id<'a>(profile_ids: &'a [String], stripped: &str) -> Option<&'a str> {
+    // Pass 1: exact stem
+    let exact = format!(".anthropic.{stripped}");
+    for id in profile_ids {
+        if id.ends_with(&exact) {
+            return Some(id.as_str());
+        }
+    }
+    // Pass 2: versioned stem  (.anthropic.{stripped}-v<digits>(:<digits>)? at end)
+    // Build the regex from an ESCAPED stripped value (stripped contains '-' and could
+    // in theory contain regex metachars; escape defensively).
+    let pattern = format!(r"\.anthropic\.{}-v\d+(:\d+)?$", regex::escape(stripped));
+    if let Ok(re) = regex::Regex::new(&pattern) {
+        for id in profile_ids {
+            if re.is_match(id) {
+                return Some(id.as_str());
+            }
+        }
+    }
+    // Pass 3: fuzzy contains (legacy)
+    for id in profile_ids {
+        if id.contains(stripped) {
+            return Some(id.as_str());
+        }
+    }
+    None
+}
+
+/// Build discover_model's return tuple from the chosen profile id.
+/// KEY FIX: anthropic_prefix is the EXACT requested model id, NOT the stripped form.
+/// Returns (anthropic_prefix, bedrock_suffix, anthropic_display, profile_prefix).
+fn build_mapping_row(
+    anthropic_model: &str,
+    stripped: &str,
+    chosen_profile_id: &str,
+) -> (String, String, Option<String>, String) {
+    // profile_prefix = before first '.', bedrock_suffix = after first '.'
+    let (profile_prefix, bedrock_suffix) = match chosen_profile_id.find('.') {
+        Some(i) => (
+            chosen_profile_id[..i].to_string(),
+            chosen_profile_id[i + 1..].to_string(),
+        ),
+        None => (chosen_profile_id.to_string(), chosen_profile_id.to_string()),
+    };
+    let anthropic_prefix = anthropic_model.to_string();
+    let anthropic_display = if anthropic_model != stripped {
+        Some(anthropic_model.to_string())
+    } else {
+        None
+    };
+    (
+        anthropic_prefix,
+        bedrock_suffix,
+        anthropic_display,
+        profile_prefix,
+    )
+}
+
 /// Discover a model by calling Bedrock ListInferenceProfiles and fuzzy-matching.
 /// Returns (anthropic_prefix, bedrock_suffix, anthropic_display, profile_prefix) if found.
 pub async fn discover_model(
@@ -184,61 +248,42 @@ pub async fn discover_model(
 
     tracing::debug!(count = profiles.len(), "Listed inference profiles");
 
-    // Find a profile whose ID contains the stripped prefix
-    // e.g. stripped="claude-sonnet-5-0" matches "us.anthropic.claude-sonnet-5-0-v1"
-    for profile in &profiles {
-        let profile_id = profile.inference_profile_id();
-        if profile_id.contains(stripped) {
-            let profile_id = profile_id.to_string();
+    // Build profile_ids list for selection
+    let profile_ids: Vec<String> = profiles
+        .iter()
+        .map(|p| p.inference_profile_id().to_string())
+        .collect();
 
-            // Extract the profile prefix (region): everything before the first '.'
-            // e.g. "global.anthropic.claude-opus-4-7" -> "global"
-            let profile_prefix = profile_id
-                .find('.')
-                .map(|i| &profile_id[..i])
-                .unwrap_or(&profile_id)
-                .to_string();
-
-            // Extract the bedrock_suffix: everything after the first '.'
-            // e.g. "us.anthropic.claude-sonnet-5-0-v1" -> "anthropic.claude-sonnet-5-0-v1"
-            let bedrock_suffix = profile_id
-                .find('.')
-                .map(|i| &profile_id[i + 1..])
-                .unwrap_or(&profile_id)
-                .to_string();
-
-            // anthropic_prefix is the stripped model name (without date)
-            let anthropic_prefix = stripped.to_string();
-
-            // anthropic_display is the full model ID CC sent (with date)
-            let anthropic_display = if anthropic_model != stripped {
-                Some(anthropic_model.to_string())
-            } else {
-                None
-            };
-
-            tracing::info!(
-                anthropic_prefix = %anthropic_prefix,
-                bedrock_suffix = %bedrock_suffix,
-                profile_id = %profile_id,
-                "Discovered new model mapping"
+    // Three-pass selection: exact stem -> versioned stem -> fuzzy contains
+    let chosen = match select_profile_id(&profile_ids, stripped) {
+        Some(id) => id,
+        None => {
+            tracing::warn!(
+                model = %anthropic_model,
+                stripped = %stripped,
+                "No matching inference profile found"
             );
-
-            return Some((
-                anthropic_prefix,
-                bedrock_suffix,
-                anthropic_display,
-                profile_prefix,
-            ));
+            return None;
         }
-    }
+    };
 
-    tracing::warn!(
-        model = %anthropic_model,
-        stripped = %stripped,
-        "No matching inference profile found"
+    // Build the mapping row (anthropic_prefix = exact requested id, NOT stripped)
+    let (anthropic_prefix, bedrock_suffix, anthropic_display, profile_prefix) =
+        build_mapping_row(anthropic_model, stripped, chosen);
+
+    tracing::info!(
+        anthropic_prefix = %anthropic_prefix,
+        bedrock_suffix = %bedrock_suffix,
+        profile_id = %chosen,
+        "Discovered new model mapping"
     );
-    None
+
+    Some((
+        anthropic_prefix,
+        bedrock_suffix,
+        anthropic_display,
+        profile_prefix,
+    ))
 }
 
 /// Map Anthropic model IDs to Bedrock inference profile IDs.
@@ -834,6 +879,252 @@ mod tests {
             cache.lookup_forward_with_fallback("claude-opus-4-8"),
             None,
             "AC9: Fallback must NOT match 'claude-opus-4-8' (no date) against bare-major row 'claude-opus-4'"
+        );
+    }
+
+    // --- Slice 3: discover_model three-pass selection + exact-key write ---
+    // Tests within #[cfg(test)] for Slice 3 acceptance criteria.
+    //
+    // BUILDER CONTRACT: These tests require two new pure functions that you MUST extract from
+    // `discover_model` to make the logic testable without a live Bedrock client:
+    //
+    // 1. `select_profile_id<'a>(profile_ids: &'a [String], stripped: &str) -> Option<&'a str>`
+    //    Implements the 3-pass selection logic:
+    //    - Pass 1 (exact stem): profile_id ends with `.anthropic.{stripped}`. First match wins.
+    //    - Pass 2 (versioned stem): profile_id matches regex `\.anthropic\.{stripped}-v\d+(:\d+)?$`. First match wins.
+    //    - Pass 3 (fuzzy contains): existing behavior — first profile_id that contains `stripped`.
+    //    Returns the chosen profile_id (full string like "global.anthropic.claude-opus-4-8").
+    //
+    // 2. `build_mapping_row(anthropic_model: &str, stripped: &str, chosen_profile_id: &str) -> (String, String, Option<String>, String)`
+    //    Builds the return tuple (anthropic_prefix, bedrock_suffix, anthropic_display, profile_prefix).
+    //    Key change: `anthropic_prefix` MUST be `anthropic_model` (the exact requested ID), NOT `stripped`.
+    //    `anthropic_display` is Some(anthropic_model) when anthropic_model != stripped, else None.
+    //    `profile_prefix` extracts the region (everything before first '.').
+    //    `bedrock_suffix` extracts everything after first '.'.
+    //
+    // Your implementation: call `select_profile_id` to pick the winner, then `build_mapping_row` to construct the result.
+
+    /// AC10: Exact stem beats variant.
+    /// Profile list contains both "global.anthropic.claude-opus-4-8" and
+    /// "global.anthropic.claude-opus-4-8-thinking". Pass 1 (exact stem) MUST win,
+    /// returning the base profile, NOT the `-thinking` variant.
+    #[test]
+    fn test_select_profile_exact_stem_beats_variant() {
+        let profiles = vec![
+            "global.anthropic.claude-opus-4-8".to_string(),
+            "global.anthropic.claude-opus-4-8-thinking".to_string(),
+        ];
+        let stripped = "claude-opus-4-8";
+
+        let chosen = select_profile_id(&profiles, stripped);
+        assert_eq!(
+            chosen,
+            Some("global.anthropic.claude-opus-4-8"),
+            "AC10: Exact stem '.anthropic.claude-opus-4-8' must beat '-thinking' variant"
+        );
+    }
+
+    /// AC10 (order independence): Exact stem wins regardless of list order.
+    /// Reversed profile list — exact stem still wins via pass 1, not position.
+    #[test]
+    fn test_select_profile_exact_stem_order_independent() {
+        let profiles = vec![
+            "global.anthropic.claude-opus-4-8-thinking".to_string(),
+            "global.anthropic.claude-opus-4-8".to_string(),
+        ];
+        let stripped = "claude-opus-4-8";
+
+        let chosen = select_profile_id(&profiles, stripped);
+        assert_eq!(
+            chosen,
+            Some("global.anthropic.claude-opus-4-8"),
+            "AC10: Exact stem must win even when it appears AFTER the variant in the list"
+        );
+    }
+
+    /// AC11: Versioned stem match (pass 2).
+    /// Profile list contains "global.anthropic.claude-opus-4-6-v1".
+    /// No exact stem match exists (`global.anthropic.claude-opus-4-6` is absent),
+    /// so pass 2 (versioned-stem regex) fires and returns the `-v1` profile.
+    #[test]
+    fn test_select_profile_versioned_stem() {
+        let profiles = vec!["global.anthropic.claude-opus-4-6-v1".to_string()];
+        let stripped = "claude-opus-4-6";
+
+        let chosen = select_profile_id(&profiles, stripped);
+        assert_eq!(
+            chosen,
+            Some("global.anthropic.claude-opus-4-6-v1"),
+            "AC11: Versioned-stem match (pass 2) must succeed when exact stem is absent"
+        );
+    }
+
+    /// AC11 (versioned stem with sub-version): Test `-v1:0` form.
+    /// The versioned-stem regex allows optional `:\d+` after `-v\d+`.
+    #[test]
+    fn test_select_profile_versioned_stem_with_subversion() {
+        let profiles = vec!["us.anthropic.claude-sonnet-4-6-v1:0".to_string()];
+        let stripped = "claude-sonnet-4-6";
+
+        let chosen = select_profile_id(&profiles, stripped);
+        assert_eq!(
+            chosen,
+            Some("us.anthropic.claude-sonnet-4-6-v1:0"),
+            "AC11: Versioned-stem match must accept `-v1:0` form (with sub-version)"
+        );
+    }
+
+    /// AC11 (pass-order priority): Exact stem beats versioned stem when both exist.
+    /// Profiles list contains BOTH `global.anthropic.claude-opus-4-6` (exact stem)
+    /// and `global.anthropic.claude-opus-4-6-v2` (versioned stem). Pass 1 must win.
+    #[test]
+    fn test_select_profile_exact_stem_beats_versioned_stem() {
+        let profiles = vec![
+            "global.anthropic.claude-opus-4-6-v2".to_string(),
+            "global.anthropic.claude-opus-4-6".to_string(),
+        ];
+        let stripped = "claude-opus-4-6";
+
+        let chosen = select_profile_id(&profiles, stripped);
+        assert_eq!(
+            chosen,
+            Some("global.anthropic.claude-opus-4-6"),
+            "Exact stem (pass 1) must beat versioned stem (pass 2) when both exist"
+        );
+    }
+
+    /// Fuzzy contains fallback (pass 3): when exact and versioned stem both miss.
+    /// This is the existing behavior — first profile whose id contains `stripped`.
+    #[test]
+    fn test_select_profile_fuzzy_contains_fallback() {
+        let profiles = vec![
+            "global.foo.claude-opus-4-8-experimental".to_string(),
+            "us.anthropic.claude-opus-4-8-custom".to_string(),
+        ];
+        let stripped = "claude-opus-4-8";
+
+        // Neither profile ends with `.anthropic.claude-opus-4-8` (exact stem miss)
+        // Neither matches versioned-stem regex (pass 2 miss)
+        // Both contain `claude-opus-4-8` → pass 3 takes the FIRST one
+        let chosen = select_profile_id(&profiles, stripped);
+        assert_eq!(
+            chosen,
+            Some("global.foo.claude-opus-4-8-experimental"),
+            "Pass 3 (fuzzy contains) must return the first profile whose id contains stripped"
+        );
+    }
+
+    /// No match: all three passes miss.
+    #[test]
+    fn test_select_profile_no_match() {
+        let profiles = vec![
+            "global.anthropic.claude-sonnet-4-6".to_string(),
+            "us.anthropic.claude-haiku-4-5".to_string(),
+        ];
+        let stripped = "claude-opus-4-8";
+
+        let chosen = select_profile_id(&profiles, stripped);
+        assert_eq!(
+            chosen, None,
+            "select_profile_id must return None when no profile matches"
+        );
+    }
+
+    /// AC12: THE PRINCIPAL REGRESSION GUARD — persisted prefix is the exact id.
+    /// After `discover_model("claude-opus-4-6-20250605", ...)` resolves, the persisted/returned
+    /// `anthropic_prefix` MUST equal `"claude-opus-4-6-20250605"` (the exact request), NOT
+    /// `"claude-opus-4-6"` (the stripped form). This is the core bug fix.
+    ///
+    /// Test via the pure `build_mapping_row` function.
+    #[test]
+    fn test_build_mapping_row_persists_exact_id_with_date() {
+        let anthropic_model = "claude-opus-4-6-20250605";
+        let stripped = "claude-opus-4-6";
+        let chosen_profile_id = "global.anthropic.claude-opus-4-6-v1";
+
+        let (anthropic_prefix, bedrock_suffix, anthropic_display, profile_prefix) =
+            build_mapping_row(anthropic_model, stripped, chosen_profile_id);
+
+        // AC12: The prefix MUST be the exact requested model ID
+        assert_eq!(
+            anthropic_prefix, "claude-opus-4-6-20250605",
+            "AC12: anthropic_prefix must be the EXACT requested model ID (with date), not stripped form"
+        );
+
+        // Verify the other fields for completeness
+        assert_eq!(
+            bedrock_suffix, "anthropic.claude-opus-4-6-v1",
+            "bedrock_suffix must extract everything after the first '.'"
+        );
+        assert_eq!(
+            anthropic_display,
+            Some("claude-opus-4-6-20250605".to_string()),
+            "anthropic_display must be Some(exact_id) when exact_id != stripped"
+        );
+        assert_eq!(
+            profile_prefix, "global",
+            "profile_prefix must extract the region before the first '.'"
+        );
+    }
+
+    /// AC13: No-date input — persisted prefix equals the input (which equals stripped).
+    /// When the input has no date suffix (input == stripped), `anthropic_prefix` still
+    /// equals the input, and `anthropic_display` is None (since input == stripped).
+    #[test]
+    fn test_build_mapping_row_persists_exact_id_no_date() {
+        let anthropic_model = "claude-opus-4-7";
+        let stripped = "claude-opus-4-7"; // No date, so stripped == input
+        let chosen_profile_id = "us.anthropic.claude-opus-4-7";
+
+        let (anthropic_prefix, bedrock_suffix, anthropic_display, profile_prefix) =
+            build_mapping_row(anthropic_model, stripped, chosen_profile_id);
+
+        // AC13: anthropic_prefix still equals the exact input (which happens to equal stripped)
+        assert_eq!(
+            anthropic_prefix, "claude-opus-4-7",
+            "AC13: anthropic_prefix must be the exact requested model ID (no date case)"
+        );
+
+        // When input == stripped, anthropic_display is None
+        assert_eq!(
+            anthropic_display, None,
+            "AC13: anthropic_display must be None when input == stripped (no date)"
+        );
+
+        // Verify the other fields
+        assert_eq!(
+            bedrock_suffix, "anthropic.claude-opus-4-7",
+            "bedrock_suffix must extract everything after the first '.'"
+        );
+        assert_eq!(
+            profile_prefix, "us",
+            "profile_prefix must extract the region before the first '.'"
+        );
+    }
+
+    /// Edge case: profile_id with no dot (malformed, but defensively handled).
+    /// `profile_prefix` should be the whole string, `bedrock_suffix` should be the whole string.
+    #[test]
+    fn test_build_mapping_row_no_dot_in_profile_id() {
+        let anthropic_model = "claude-test";
+        let stripped = "claude-test";
+        let chosen_profile_id = "malformed-profile-id";
+
+        let (anthropic_prefix, bedrock_suffix, anthropic_display, profile_prefix) =
+            build_mapping_row(anthropic_model, stripped, chosen_profile_id);
+
+        assert_eq!(
+            anthropic_prefix, "claude-test",
+            "anthropic_prefix is always the exact input"
+        );
+        assert_eq!(
+            bedrock_suffix, "malformed-profile-id",
+            "bedrock_suffix fallback: entire string when no dot found"
+        );
+        assert_eq!(anthropic_display, None, "input == stripped → None");
+        assert_eq!(
+            profile_prefix, "malformed-profile-id",
+            "profile_prefix fallback: entire string when no dot found"
         );
     }
 }
