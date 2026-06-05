@@ -220,10 +220,8 @@ async fn spend_flush_with_poison_tool_errors_persists_sanitized() {
     // shape that produces Postgres SQLSTATE 22P05 (untranslatable character)
     // in production when written un-sanitized to JSONB columns.
     let poison_request_id = "req-poison-tool-errors-1";
-    let mut poison = helpers::make_spend_entry(
-        "claude-sonnet-4-20250514",
-        Some("poison-user@test.com"),
-    );
+    let mut poison =
+        helpers::make_spend_entry("claude-sonnet-4-20250514", Some("poison-user@test.com"));
     poison.request_id = poison_request_id.to_string();
     poison.tool_errors = Some(serde_json::json!({
         "err": "bad\u{0000}value",
@@ -254,14 +252,15 @@ async fn spend_flush_with_poison_tool_errors_persists_sanitized() {
     // Sanitization actually applied: tool_errors stored in the DB contains no
     // NUL byte. We fetch the raw JSONB back as serde_json::Value and serialize
     // it to text, then assert the absence of \0.
-    let stored: (Option<serde_json::Value>,) = sqlx::query_as(
-        "SELECT tool_errors FROM spend_log WHERE request_id = $1",
-    )
-    .bind(poison_request_id)
-    .fetch_one(&pool)
-    .await
-    .unwrap();
-    let stored_json = stored.0.expect("tool_errors must be Some after persistence");
+    let stored: (Option<serde_json::Value>,) =
+        sqlx::query_as("SELECT tool_errors FROM spend_log WHERE request_id = $1")
+            .bind(poison_request_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    let stored_json = stored
+        .0
+        .expect("tool_errors must be Some after persistence");
     let stored_text = serde_json::to_string(&stored_json).unwrap();
     assert!(
         !stored_text.contains('\0'),
@@ -372,7 +371,10 @@ struct PoisonInjectingSpendDb<'a> {
 #[async_trait::async_trait]
 impl<'a> SpendDb for PoisonInjectingSpendDb<'a> {
     async fn insert_batch(&self, entries: &[RequestLogEntry]) -> Result<(), sqlx::Error> {
-        if entries.iter().any(|e| e.request_id == self.poison_request_id) {
+        if entries
+            .iter()
+            .any(|e| e.request_id == self.poison_request_id)
+        {
             return Err(injected_data_error("22P05"));
         }
         self.inner.insert_batch(entries).await
@@ -394,20 +396,14 @@ async fn spend_flush_quarantines_data_error_via_direct_inject() {
     let tracker = SpendTracker::new(db_pool, Arc::new(metrics));
 
     // Three entries: req-clean-a, req-poison-injected, req-clean-b.
-    let mut e1 = helpers::make_spend_entry(
-        "claude-sonnet-4-20250514",
-        Some("inject-user@test.com"),
-    );
+    let mut e1 =
+        helpers::make_spend_entry("claude-sonnet-4-20250514", Some("inject-user@test.com"));
     e1.request_id = "req-clean-a".to_string();
-    let mut e2 = helpers::make_spend_entry(
-        "claude-sonnet-4-20250514",
-        Some("inject-user@test.com"),
-    );
+    let mut e2 =
+        helpers::make_spend_entry("claude-sonnet-4-20250514", Some("inject-user@test.com"));
     e2.request_id = "req-poison-injected".to_string();
-    let mut e3 = helpers::make_spend_entry(
-        "claude-sonnet-4-20250514",
-        Some("inject-user@test.com"),
-    );
+    let mut e3 =
+        helpers::make_spend_entry("claude-sonnet-4-20250514", Some("inject-user@test.com"));
     e3.request_id = "req-clean-b".to_string();
 
     tracker.record(e1).await;
@@ -430,7 +426,11 @@ async fn spend_flush_quarantines_data_error_via_direct_inject() {
         result.is_ok(),
         "flush_with_db must return Ok after a per-record fallback that drops one record; got {result:?}"
     );
-    assert_eq!(result.unwrap(), 2, "two clean records must have inserted individually");
+    assert_eq!(
+        result.unwrap(),
+        2,
+        "two clean records must have inserted individually"
+    );
 
     // The two clean records reached spend_log. The poisoned one did NOT.
     let rows: Vec<(String,)> =
@@ -523,10 +523,8 @@ async fn spend_flush_loop_survives_transient_then_recovers() {
     let tracker = SpendTracker::new(db_pool, Arc::new(metrics));
 
     for i in 0..3 {
-        let mut e = helpers::make_spend_entry(
-            "claude-sonnet-4-20250514",
-            Some("transient-user@test.com"),
-        );
+        let mut e =
+            helpers::make_spend_entry("claude-sonnet-4-20250514", Some("transient-user@test.com"));
         e.request_id = format!("req-transient-{i}");
         tracker.record(e).await;
     }
@@ -543,11 +541,10 @@ async fn spend_flush_loop_survives_transient_then_recovers() {
     );
 
     // No rows should have hit Postgres yet.
-    let row_count_after_transient: (i64,) =
-        sqlx::query_as("SELECT COUNT(*) FROM spend_log")
-            .fetch_one(&pool)
-            .await
-            .unwrap();
+    let row_count_after_transient: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM spend_log")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
     assert_eq!(
         row_count_after_transient.0, 0,
         "no rows must be persisted while DB is transiently unavailable"
@@ -563,11 +560,10 @@ async fn spend_flush_loop_survives_transient_then_recovers() {
         "all 3 re-buffered records must be flushed on recovery"
     );
 
-    let row_count_after_recovery: (i64,) =
-        sqlx::query_as("SELECT COUNT(*) FROM spend_log")
-            .fetch_one(&pool)
-            .await
-            .unwrap();
+    let row_count_after_recovery: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM spend_log")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
     assert_eq!(
         row_count_after_recovery.0, 3,
         "recovery flush must persist all re-buffered records"
