@@ -18,9 +18,15 @@ pub struct Metrics {
     pub error_count: Counter<u64>,
     pub auth_failure_count: Counter<u64>,
     pub spend_flush_errors: Counter<u64>,
+    pub spend_records_quarantined: Counter<u64>,
     pub bedrock_throttle_count: Counter<u64>,
     pub in_flight_requests: opentelemetry::metrics::UpDownCounter<i64>,
     prometheus_registry: Registry,
+    // Keep the provider alive for the lifetime of `Metrics`.
+    // The `Metrics::new` return tuple's `SdkMeterProvider` is a clone of this
+    // (provider holds an Arc internally), so dropping the external one
+    // does not detach the Prometheus exporter — Metrics stays functional.
+    _provider: SdkMeterProvider,
 }
 
 impl Metrics {
@@ -99,6 +105,12 @@ impl Metrics {
                 .u64_counter("ccag.spend_flush_errors.total")
                 .with_description("Total spend flush failures")
                 .build(),
+            spend_records_quarantined: meter
+                .u64_counter("ccag.spend_records_quarantined.total")
+                .with_description(
+                    "Spend log records dropped (quarantined) after individual insert failure with a data-rejection error",
+                )
+                .build(),
             bedrock_throttle_count: meter
                 .u64_counter("ccag.bedrock.throttles.total")
                 .with_description("Total Bedrock throttling events")
@@ -108,6 +120,7 @@ impl Metrics {
                 .with_description("Currently in-flight proxy requests")
                 .build(),
             prometheus_registry: registry,
+            _provider: provider.clone(),
         };
 
         Ok((metrics, provider))
@@ -190,6 +203,13 @@ impl Metrics {
     /// Record a spend flush error.
     pub fn record_spend_flush_error(&self) {
         self.spend_flush_errors.add(1, &[]);
+    }
+
+    /// Record `n` spend-log records quarantined (dropped) after individual
+    /// insert failures with data-rejection SQLSTATEs (e.g. 22P05, 22021).
+    /// `n` may be > 1 when a flush quarantines multiple records.
+    pub fn record_spend_records_quarantined(&self, n: u64) {
+        self.spend_records_quarantined.add(n, &[]);
     }
 
     /// Record a Bedrock throttling event.

@@ -900,10 +900,11 @@ dependencies = [
 
 [[package]]
 name = "ccag"
-version = "1.7.0"
+version = "1.7.1"
 dependencies = [
  "anyhow",
  "async-stream",
+ "async-trait",
  "aws-config",
  "aws-credential-types",
  "aws-sdk-bedrock",
@@ -960,7 +961,7 @@ dependencies = [
 
 [[package]]
 name = "ccag-cli"
-version = "1.7.0"
+version = "1.7.1"
 dependencies = [
  "anyhow",
  "clap",
