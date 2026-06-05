@@ -904,6 +904,7 @@ version = "1.7.0"
 dependencies = [
  "anyhow",
  "async-stream",
+ "async-trait",
  "aws-config",
  "aws-credential-types",
  "aws-sdk-bedrock",

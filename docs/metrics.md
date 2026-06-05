@@ -87,6 +87,7 @@ All metrics use the `ccag` prefix (dots in instrument names become underscores i
 | Instrument | Type | Labels | Description |
 |---|---|---|---|
 | `ccag.spend_flush_errors.total` | Counter | | Spend tracker flush failures |
+| `ccag.spend_records_quarantined.total` | Counter | | Spend records dropped after individual insert failed with a data-rejection error (e.g. SQLSTATE 22P05). Non-zero indicates real spend data was discarded; alarm on this. |
 
 ## Grafana Dashboard
 
