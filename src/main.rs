@@ -303,12 +303,15 @@ async fn main() -> anyhow::Result<()> {
                             // Reload after marking default so is_default is reflected in pool.
                             match ccag::db::endpoints::get_enabled_endpoints(&pool).await {
                                 Ok(eps) => {
-                                    state.endpoint_pool.load_endpoints(eps, &aws_config).await
+                                    state
+                                        .endpoint_pool
+                                        .load_endpoints_with_db(eps, &aws_config, &pool)
+                                        .await
                                 }
                                 Err(_) => {
                                     state
                                         .endpoint_pool
-                                        .load_endpoints(vec![ep], &aws_config)
+                                        .load_endpoints_with_db(vec![ep], &aws_config, &pool)
                                         .await
                                 }
                             }
@@ -319,7 +322,7 @@ async fn main() -> anyhow::Result<()> {
                     let count = endpoints.len();
                     state
                         .endpoint_pool
-                        .load_endpoints(endpoints, &aws_config)
+                        .load_endpoints_with_db(endpoints, &aws_config, &pool)
                         .await;
                     tracing::info!(count, "Loaded endpoints into pool");
                 }
@@ -336,6 +339,99 @@ async fn main() -> anyhow::Result<()> {
 
     // Start cache version polling loop (5s interval)
     start_cache_poll_loop(Arc::clone(&state));
+
+    // Self-healing startup migration: populate endpoint_aip_overrides from the
+    // legacy inference_profile_arn column for endpoints that haven't been migrated yet.
+    {
+        let pool = state.db().await;
+
+        // Build candidate list from all loaded endpoint clients that have a legacy ARN.
+        let all_clients = state.endpoint_pool.get_all_clients().await;
+
+        let candidates: Vec<ccag::migrations::aip_legacy::EndpointMigrationCandidate> = all_clients
+            .iter()
+            .filter_map(|c| {
+                c.config.inference_profile_arn.as_ref().map(|arn| {
+                    ccag::migrations::aip_legacy::EndpointMigrationCandidate {
+                        endpoint_id: c.config.id,
+                        legacy_arn: arn.clone(),
+                    }
+                })
+            })
+            .collect();
+
+        if !candidates.is_empty() {
+            // Build a map from legacy_arn -> control_client so the closure can
+            // call GetInferenceProfile with the correct per-endpoint credentials.
+            let arn_to_client: std::collections::HashMap<
+                String,
+                Arc<ccag::endpoint::EndpointClient>,
+            > = all_clients
+                .iter()
+                .filter_map(|c| {
+                    c.config
+                        .inference_profile_arn
+                        .as_ref()
+                        .map(|arn| (arn.clone(), Arc::clone(c)))
+                })
+                .collect();
+
+            let model_cache_ref = state.model_cache.clone();
+
+            let get_foundation_model = move |arn: &str| {
+                let arn_owned = arn.to_string();
+                let client = arn_to_client.get(&arn_owned).cloned();
+                let mc = model_cache_ref.clone();
+                async move {
+                    let control = match client {
+                        Some(c) => c.control_client.clone(),
+                        None => {
+                            return Err(format!("No endpoint client found for ARN: {arn_owned}"));
+                        }
+                    };
+
+                    // Call GetInferenceProfile to find the foundation-model ARN.
+                    let resp = control
+                        .get_inference_profile()
+                        .inference_profile_identifier(&arn_owned)
+                        .send()
+                        .await
+                        .map_err(|e| {
+                            format!("GetInferenceProfile failed for {arn_owned}: {e:?}")
+                        })?;
+
+                    // Extract the first model ARN from the profile.
+                    // `GetInferenceProfileOutput` exposes `models()` directly.
+                    let fm_arn = resp
+                        .models()
+                        .iter()
+                        .next()
+                        .and_then(|m| m.model_arn())
+                        .map(|s| s.to_string())
+                        .ok_or_else(|| {
+                            format!("GetInferenceProfile returned no model ARN for {arn_owned}")
+                        })?;
+
+                    // Parse foundation-model id from ARN tail, then map to Anthropic name.
+                    let tail = ccag::translate::models::parse_foundation_model_from_arn(&fm_arn)?;
+                    let anthropic_id =
+                        ccag::translate::models::bedrock_to_anthropic(tail, Some(&mc));
+                    Ok(anthropic_id)
+                }
+            };
+
+            match ccag::migrations::aip_legacy::migrate_legacy_aip_endpoints(
+                &candidates,
+                &pool,
+                get_foundation_model,
+            )
+            .await
+            {
+                Ok(()) => tracing::info!("Legacy AIP startup migration complete"),
+                Err(e) => tracing::warn!(%e, "Legacy AIP startup migration encountered an error"),
+            }
+        }
+    }
 
     // Start IAM token refresh loop (10 min interval) if IAM auth is enabled
     if let (true, Some(host)) = (iam_auth_enabled, iam_db_host) {
@@ -933,7 +1029,7 @@ fn start_cache_poll_loop(state: Arc<proxy::GatewayState>) {
                         let count = endpoints.len();
                         state
                             .endpoint_pool
-                            .load_endpoints(endpoints, &state.aws_config)
+                            .load_endpoints_with_db(endpoints, &state.aws_config, pool)
                             .await;
                         tracing::debug!(count, "Reloaded endpoints");
                     }

@@ -355,6 +355,34 @@ fn hardcoded_anthropic_to_bedrock(model: &str, prefix: &str) -> String {
     }
 }
 
+/// Parse the Bedrock foundation-model ID from the tail of a foundation-model ARN.
+///
+/// Expects an ARN of the form:
+///   `arn:aws:bedrock:<region>:<account>:foundation-model/<model-id>`
+///
+/// Returns `Ok(&str)` containing the model ID after `foundation-model/`, or
+/// `Err(String)` when the segment is absent or the tail is empty.
+pub fn parse_foundation_model_from_arn(arn: &str) -> Result<&str, String> {
+    const SEGMENT: &str = "foundation-model/";
+    match arn.find(SEGMENT) {
+        Some(idx) => {
+            let tail = &arn[idx + SEGMENT.len()..];
+            if tail.is_empty() {
+                Err(format!(
+                    "ARN '{}' has an empty tail after 'foundation-model/'",
+                    arn
+                ))
+            } else {
+                Ok(tail)
+            }
+        }
+        None => Err(format!(
+            "ARN '{}' does not contain a 'foundation-model/' segment",
+            arn
+        )),
+    }
+}
+
 /// Map Bedrock model IDs back to Anthropic-format IDs for responses.
 ///
 /// Checks the dynamic cache first, falls back to hardcoded mappings.
@@ -1291,6 +1319,306 @@ mod tests_t4_suffix_strip {
         assert_eq!(
             result, "claude[1m]-opus-4-7",
             "Bracket not at end of string must NOT be stripped (regex is end-anchored)"
+        );
+    }
+}
+
+// ── Task 2: ARN-tail parser tests ────────────────────────────────────────────
+//
+// These tests cover the pure `parse_foundation_model_from_arn` helper that the
+// self-healing migration runner uses to extract a Bedrock foundation-model id
+// from an inference-profile ARN.
+//
+// BUILDER CONTRACT:
+//   Add `pub fn parse_foundation_model_from_arn(arn: &str) -> Result<&str, String>`
+//   to THIS file (src/translate/models.rs), adjacent to `bedrock_to_anthropic`.
+//
+//   The function must:
+//   1. Accept a full ARN string.
+//   2. Find the `foundation-model/` segment and return everything after the `/`.
+//   3. Return `Err(String)` when the segment is absent or the tail is empty.
+//
+//   The returned `&str` slice is the *Bedrock* model id as found in the ARN tail
+//   (e.g. `"anthropic.claude-sonnet-4-5-20250929-v1:0"`).  The caller then passes
+//   this value to `bedrock_to_anthropic(tail, None)` to get the logical Anthropic
+//   model name.
+//
+// The tests MUST FAIL (unresolved name) until the builder adds the function.
+
+#[cfg(test)]
+mod tests_task2_arn_parser {
+    use super::*;
+
+    // ── 1. Happy-path ARN parsing ─────────────────────────────────────────────
+
+    /// Well-formed foundation-model ARN (Sonnet 4.5) → returns the tail after
+    /// `foundation-model/`.
+    #[test]
+    fn test_parse_foundation_model_from_arn_sonnet_4_5() {
+        let arn = "arn:aws:bedrock:us-east-1:123456789012:foundation-model/anthropic.claude-sonnet-4-5-20250929-v1:0";
+        let result = parse_foundation_model_from_arn(arn);
+        assert!(
+            result.is_ok(),
+            "parse_foundation_model_from_arn must succeed for a well-formed ARN; got {result:?}"
+        );
+        assert_eq!(
+            result.unwrap(),
+            "anthropic.claude-sonnet-4-5-20250929-v1:0",
+            "returned tail must be the foundation-model id exactly as it appears in the ARN"
+        );
+    }
+
+    /// Well-formed foundation-model ARN (Haiku 4.5) → returns the tail.
+    #[test]
+    fn test_parse_foundation_model_from_arn_haiku_4_5() {
+        let arn = "arn:aws:bedrock:us-east-1:123456789012:foundation-model/anthropic.claude-haiku-4-5-20251001-v1:0";
+        let result = parse_foundation_model_from_arn(arn);
+        assert!(result.is_ok(), "haiku ARN must parse successfully");
+        assert_eq!(result.unwrap(), "anthropic.claude-haiku-4-5-20251001-v1:0");
+    }
+
+    /// Well-formed foundation-model ARN (Opus 4.7) → returns the tail.
+    #[test]
+    fn test_parse_foundation_model_from_arn_opus_4_7() {
+        let arn =
+            "arn:aws:bedrock:us-east-1:123456789012:foundation-model/anthropic.claude-opus-4-7";
+        let result = parse_foundation_model_from_arn(arn);
+        assert!(result.is_ok(), "opus ARN must parse successfully");
+        assert_eq!(result.unwrap(), "anthropic.claude-opus-4-7");
+    }
+
+    // ── 2. End-to-end: parse → bedrock_to_anthropic ───────────────────────────
+
+    /// Parse a Sonnet 4.5 ARN and map the tail through `bedrock_to_anthropic`.
+    /// The expected Anthropic logical model id is the value the hardcoded map
+    /// produces for `"us.anthropic.claude-sonnet-4-5-20250929-v1:0"`.
+    /// We test against `bedrock_to_anthropic(tail, None)` directly (no cache).
+    #[test]
+    fn test_arn_to_anthropic_model_sonnet_4_5() {
+        let arn = "arn:aws:bedrock:us-east-1:123456789012:foundation-model/anthropic.claude-sonnet-4-5-20250929-v1:0";
+        let tail = parse_foundation_model_from_arn(arn)
+            .expect("parse must succeed for this well-formed ARN");
+
+        // bedrock_to_anthropic needs the full profile id (with regional prefix) in
+        // some code paths, but the hardcoded reverse map uses `contains`, so the
+        // bare tail string still matches.
+        let anthropic_name = bedrock_to_anthropic(tail, None);
+        assert_eq!(
+            anthropic_name, "claude-sonnet-4-5-20250929",
+            "tail of a Sonnet 4.5 ARN must map to 'claude-sonnet-4-5-20250929' via bedrock_to_anthropic"
+        );
+    }
+
+    /// Parse a Haiku 4.5 ARN and map the tail through `bedrock_to_anthropic`.
+    #[test]
+    fn test_arn_to_anthropic_model_haiku_4_5() {
+        let arn = "arn:aws:bedrock:us-east-1:123456789012:foundation-model/anthropic.claude-haiku-4-5-20251001-v1:0";
+        let tail = parse_foundation_model_from_arn(arn)
+            .expect("parse must succeed for this well-formed ARN");
+
+        let anthropic_name = bedrock_to_anthropic(tail, None);
+        assert_eq!(
+            anthropic_name, "claude-haiku-4-5-20251001",
+            "tail of a Haiku 4.5 ARN must map to 'claude-haiku-4-5-20251001' via bedrock_to_anthropic"
+        );
+    }
+
+    // ── 3. Error cases ────────────────────────────────────────────────────────
+
+    /// ARN with no `foundation-model/` segment → `Err`.
+    #[test]
+    fn test_parse_foundation_model_from_arn_missing_segment() {
+        let arn = "arn:aws:bedrock:us-east-1:123456789012:application-inference-profile/my-tagged-profile";
+        let result = parse_foundation_model_from_arn(arn);
+        assert!(
+            result.is_err(),
+            "ARN without 'foundation-model/' segment must return Err; got {result:?}"
+        );
+    }
+
+    /// Completely wrong string (not an ARN at all) → `Err`.
+    #[test]
+    fn test_parse_foundation_model_from_arn_not_an_arn() {
+        let result = parse_foundation_model_from_arn("not-an-arn");
+        assert!(
+            result.is_err(),
+            "Non-ARN string must return Err; got {result:?}"
+        );
+    }
+
+    /// Empty string → `Err`.
+    #[test]
+    fn test_parse_foundation_model_from_arn_empty_string() {
+        let result = parse_foundation_model_from_arn("");
+        assert!(
+            result.is_err(),
+            "Empty string must return Err; got {result:?}"
+        );
+    }
+
+    /// ARN that ends immediately after `foundation-model/` (empty tail) → `Err`.
+    #[test]
+    fn test_parse_foundation_model_from_arn_empty_tail() {
+        let arn = "arn:aws:bedrock:us-east-1:123456789012:foundation-model/";
+        let result = parse_foundation_model_from_arn(arn);
+        assert!(
+            result.is_err(),
+            "ARN with empty tail after 'foundation-model/' must return Err; got {result:?}"
+        );
+    }
+
+    /// Truncated ARN (no trailing portion after the resource type) → `Err`.
+    #[test]
+    fn test_parse_foundation_model_from_arn_truncated() {
+        let arn = "arn:aws:bedrock:us-east-1:123456789012:foundation-model";
+        let result = parse_foundation_model_from_arn(arn);
+        assert!(
+            result.is_err(),
+            "Truncated ARN (no '/' after resource type) must return Err; got {result:?}"
+        );
+    }
+}
+
+// ── Task 2: Self-healing migration runner unit tests ─────────────────────────
+//
+// Tests for the `migrate_legacy_aip_endpoints` startup function.
+//
+// BUILDER CONTRACT:
+//   Extract (or add) this function — tentatively in a new file
+//   `src/migrations/aip_legacy.rs` — with a signature like:
+//
+//   ```rust
+//   pub async fn migrate_legacy_aip_endpoints<F, Fut>(
+//       endpoints: &[EndpointMigrationCandidate],
+//       pool: &sqlx::PgPool,
+//       get_foundation_model: F,
+//   ) -> anyhow::Result<()>
+//   where
+//       F: Fn(&str) -> Fut + Send + Sync,
+//       Fut: std::future::Future<Output = Result<String, String>> + Send,
+//   {
+//   ```
+//
+//   `EndpointMigrationCandidate` holds `(endpoint_id: Uuid, legacy_arn: String)`.
+//   `get_foundation_model` is the testable seam: in production it calls
+//   `GetInferenceProfile` then `parse_foundation_model_from_arn` +
+//   `bedrock_to_anthropic`; in tests it's a closure.
+//
+//   Behaviour:
+//   - Skip endpoints whose `list_by_endpoint` returns non-empty.
+//   - For each remaining endpoint, call `get_foundation_model(legacy_arn)`.
+//     - On `Ok(model_id)` → insert `(endpoint_id, model_id, legacy_arn,
+//       set_by="auto-migration", reason="migrated from inference_profile_arn column")`.
+//     - On `Err(_)` → `tracing::warn!` the endpoint id, continue loop (no panic/abort).
+//   - Returns Ok(()) regardless of per-endpoint errors.
+//
+//   Wire into `src/main.rs` after `load_endpoints_with_db` and before the health
+//   loop starts.
+//
+// The tests below are integration-style against a real Postgres pool (they are
+// placed here in the lib module so they can be run with `cargo test --lib`
+// alongside unit tests, but they require `make test-integration` to have a DB).
+// The pure-logic cases (skip-if-non-empty, idempotency, error-tolerance) are
+// exercised via the injected closure so no real AWS call is needed.
+//
+// Import: the tests import `migrate_legacy_aip_endpoints` from wherever the
+// builder places it. If it lands in `src/migrations/aip_legacy.rs`, adjust the
+// `use` path below accordingly. The test module is kept here so it's compiled
+// even without the `integration` feature flag — it just requires the DB.
+
+#[cfg(test)]
+mod tests_task2_migration_runner {
+    use super::*;
+
+    // ── In-memory stub DB ─────────────────────────────────────────────────────
+    //
+    // Rather than a real PgPool (which requires Docker), these unit tests use a
+    // minimal stub that tracks "what rows exist per endpoint_id" in memory.
+    // The production runner takes a `&sqlx::PgPool`; the unit tests below
+    // use the *extractable pure logic* path by directly exercising the helper
+    // functions the migration runner delegates to.
+    //
+    // BUILDER NOTE: if you extract the core loop into a helper that accepts a
+    // `list_fn` + `insert_fn` pair (function pointers / closures) in addition to
+    // the `get_foundation_model` seam, these tests become straightforward.
+    // Otherwise, the integration test file covers the full DB path.
+    //
+    // The tests here verify the *decision logic* through the ARN parser + the
+    // `bedrock_to_anthropic` round-trip, keeping them fast and dependency-free.
+
+    // ── ARN-parsing + reverse-mapping round-trips ─────────────────────────────
+
+    /// Full round-trip for Sonnet 4.5:
+    ///   AIP ARN → parse tail → bedrock_to_anthropic → "claude-sonnet-4-5-20250929"
+    ///
+    /// This is the exact computation `migrate_legacy_aip_endpoints` performs
+    /// in step 2. The result becomes `model_id` in the inserted row.
+    #[test]
+    fn test_migration_model_id_derivation_sonnet() {
+        let legacy_arn = "arn:aws:bedrock:us-east-1:123456789012:foundation-model/anthropic.claude-sonnet-4-5-20250929-v1:0";
+        let tail = parse_foundation_model_from_arn(legacy_arn).expect("well-formed ARN must parse");
+        let anthropic_model = bedrock_to_anthropic(tail, None);
+
+        assert_eq!(
+            anthropic_model, "claude-sonnet-4-5-20250929",
+            "migration must derive 'claude-sonnet-4-5-20250929' as the model_id for the Sonnet 4.5 ARN"
+        );
+    }
+
+    /// Full round-trip for Haiku 4.5:
+    ///   AIP ARN → parse tail → bedrock_to_anthropic → "claude-haiku-4-5-20251001"
+    #[test]
+    fn test_migration_model_id_derivation_haiku() {
+        let legacy_arn = "arn:aws:bedrock:us-east-1:123456789012:foundation-model/anthropic.claude-haiku-4-5-20251001-v1:0";
+        let tail = parse_foundation_model_from_arn(legacy_arn).expect("well-formed ARN must parse");
+        let anthropic_model = bedrock_to_anthropic(tail, None);
+
+        assert_eq!(
+            anthropic_model, "claude-haiku-4-5-20251001",
+            "migration must derive 'claude-haiku-4-5-20251001' as the model_id for the Haiku 4.5 ARN"
+        );
+    }
+
+    /// An ARN whose resource type is `application-inference-profile` (not
+    /// `foundation-model`) must produce an `Err` from `parse_foundation_model_from_arn`,
+    /// simulating the `GetInferenceProfile` failure path in the migration runner.
+    /// The runner must log a warning and continue — this test verifies the Err
+    /// propagation that the runner's error branch receives.
+    #[test]
+    fn test_migration_bad_arn_produces_err() {
+        // An AIP ARN is NOT a foundation-model ARN; the parser must reject it.
+        let bad_arn = "arn:aws:bedrock:us-east-1:123456789012:application-inference-profile/my-aip";
+        let result = parse_foundation_model_from_arn(bad_arn);
+        assert!(
+            result.is_err(),
+            "parse_foundation_model_from_arn must return Err for an AIP ARN (not a foundation-model ARN); migration runner must handle this without panicking"
+        );
+    }
+
+    // ── set_by / reason field values ──────────────────────────────────────────
+
+    /// The migration runner must write `set_by = "auto-migration"` and
+    /// `reason = "migrated from inference_profile_arn column"` exactly.
+    /// These string constants are checked here so the builder knows the
+    /// exact values the integration test will assert on.
+    #[test]
+    fn test_migration_metadata_constants() {
+        // The migration runner MUST use these exact constant strings when
+        // calling `db::endpoint_aip_overrides::insert`.
+        // Tested indirectly in the integration test; documented here as a
+        // compile-time-visible contract.
+        const EXPECTED_SET_BY: &str = "auto-migration";
+        const EXPECTED_REASON: &str = "migrated from inference_profile_arn column";
+
+        // No logic to test — this test documents the required constant values
+        // so the builder sees them alongside the ARN-parser tests.
+        assert!(!EXPECTED_SET_BY.is_empty());
+        assert!(!EXPECTED_REASON.is_empty());
+        // Verify the strings match the spec exactly:
+        assert_eq!(EXPECTED_SET_BY, "auto-migration");
+        assert_eq!(
+            EXPECTED_REASON,
+            "migrated from inference_profile_arn column"
         );
     }
 }

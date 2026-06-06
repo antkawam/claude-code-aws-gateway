@@ -70,6 +70,10 @@ pub struct EndpointClient {
     /// `AdminOverride` entries ignore TTL and are never overwritten by automatic probing.
     /// Non-override entries expire after `CAPABILITY_TTL` (24 h).
     pub beta_capabilities: Arc<RwLock<HashMap<(String, String), CapabilityEntry>>>,
+    /// Per-model AIP override map: Anthropic logical model ID → AIP ARN.
+    /// Populated at endpoint load time from `endpoint_aip_overrides` DB rows.
+    /// Empty for endpoints that have not been configured with any AIP overrides.
+    pub aip_overrides: HashMap<String, String>,
 }
 
 impl EndpointClient {
@@ -202,6 +206,26 @@ impl EndpointClient {
         }
         pairs
     }
+
+    /// Returns the AIP ARN for `model_id` from the new `aip_overrides` map, or
+    /// `None` if no override exists for this model.
+    ///
+    /// This helper reads **only** the `aip_overrides` HashMap (populated from the
+    /// `endpoint_aip_overrides` table). It does NOT fall back to
+    /// `config.inference_profile_arn` (the legacy column). The legacy fallback is
+    /// the responsibility of the request dispatcher — this strict boundary makes
+    /// each code path testable in isolation.
+    pub fn aip_override_for(&self, model_id: &str) -> Option<&str> {
+        self.aip_overrides.get(model_id).map(|s| s.as_str())
+    }
+
+    /// Returns `true` iff the `aip_overrides` map has at least one entry.
+    ///
+    /// Like `aip_override_for`, this ignores `config.inference_profile_arn`.
+    /// An endpoint with only the legacy column set returns `false` here.
+    pub fn has_any_aip_overrides(&self) -> bool {
+        !self.aip_overrides.is_empty()
+    }
 }
 
 // ── Seed-probe helpers ────────────────────────────────────────────────────────
@@ -323,10 +347,40 @@ impl EndpointPool {
     /// endpoints that are already in the pool (matched by UUID), so that learned
     /// capability data survives routine config reloads triggered by cache_version bumps.
     /// Only genuinely new endpoints get a fresh empty cache.
+    ///
+    /// `aip_overrides` are NOT loaded (empty maps on every client). Use
+    /// [`load_endpoints_with_db`] when a DB pool is available to also populate
+    /// per-endpoint AIP override maps.
     pub async fn load_endpoints(
         &self,
         endpoints: Vec<Endpoint>,
         base_aws_config: &aws_config::SdkConfig,
+    ) {
+        self.load_endpoints_inner(endpoints, base_aws_config, None)
+            .await
+    }
+
+    /// Load/reload endpoint clients from database endpoint configs and populate
+    /// each client's `aip_overrides` map from the `endpoint_aip_overrides` table.
+    ///
+    /// Equivalent to [`load_endpoints`] but fetches per-endpoint AIP override rows
+    /// so that `EndpointClient::aip_override_for` and `has_any_aip_overrides` work
+    /// correctly at runtime.
+    pub async fn load_endpoints_with_db(
+        &self,
+        endpoints: Vec<Endpoint>,
+        base_aws_config: &aws_config::SdkConfig,
+        pool: &sqlx::PgPool,
+    ) {
+        self.load_endpoints_inner(endpoints, base_aws_config, Some(pool))
+            .await
+    }
+
+    async fn load_endpoints_inner(
+        &self,
+        endpoints: Vec<Endpoint>,
+        base_aws_config: &aws_config::SdkConfig,
+        pool: Option<&sqlx::PgPool>,
     ) {
         let mut new_clients = HashMap::new();
         let mut new_default: Option<Uuid> = None;
@@ -352,9 +406,28 @@ impl EndpointPool {
             if ep.is_default {
                 new_default = Some(ep.id);
             }
+
+            // Load AIP overrides from DB when a pool is available.
+            let aip_overrides: HashMap<String, String> = if let Some(p) = pool {
+                match crate::db::endpoint_aip_overrides::list_by_endpoint(p, ep.id).await {
+                    Ok(rows) => rows.into_iter().map(|r| (r.model_id, r.aip_arn)).collect(),
+                    Err(e) => {
+                        tracing::warn!(endpoint_id = %ep.id, %e, "Failed to load AIP overrides for endpoint — using empty map");
+                        HashMap::new()
+                    }
+                }
+            } else {
+                HashMap::new()
+            };
+
             let preserved_caches = preserved.get(&ep.id).cloned();
-            let client =
-                Self::create_client_with_caches(&ep, base_aws_config, preserved_caches).await;
+            let client = Self::create_client_with_caches(
+                &ep,
+                base_aws_config,
+                preserved_caches,
+                aip_overrides,
+            )
+            .await;
             if let Some(c) = client {
                 new_clients.insert(ep.id, Arc::new(c));
             }
@@ -372,6 +445,7 @@ impl EndpointPool {
         endpoint: &Endpoint,
         _base_config: &aws_config::SdkConfig,
         preserved_caches: Option<PreservedCaches>,
+        aip_overrides: HashMap<String, String>,
     ) -> Option<EndpointClient> {
         let region = aws_config::Region::new(endpoint.region.clone());
 
@@ -423,6 +497,7 @@ impl EndpointPool {
             last_health_check: AtomicI64::new(0),
             available_models,
             beta_capabilities,
+            aip_overrides,
         })
     }
 
@@ -675,6 +750,7 @@ mod tests {
             last_health_check: AtomicI64::new(0),
             available_models: Arc::new(RwLock::new(vec![])),
             beta_capabilities: Arc::new(RwLock::new(HashMap::new())),
+            aip_overrides: HashMap::new(),
         }
     }
 
@@ -1385,6 +1461,7 @@ mod tests_slice2 {
             last_health_check: AtomicI64::new(0),
             available_models: Arc::new(RwLock::new(vec![])),
             beta_capabilities: Arc::new(RwLock::new(HashMap::new())),
+            aip_overrides: HashMap::new(),
         }
     }
 
@@ -1691,6 +1768,7 @@ mod tests_slice3 {
             last_health_check: AtomicI64::new(0),
             available_models: Arc::new(RwLock::new(vec![])),
             beta_capabilities: Arc::new(RwLock::new(HashMap::new())),
+            aip_overrides: HashMap::new(),
         }
     }
 
@@ -2132,6 +2210,7 @@ mod tests_dynamic_model_slice1 {
             last_health_check: AtomicI64::new(0),
             available_models: Arc::new(tokio::sync::RwLock::new(models)),
             beta_capabilities: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
+            aip_overrides: HashMap::new(),
         }
     }
 
@@ -2316,6 +2395,7 @@ mod tests_model_filtering_slice3 {
             last_health_check: AtomicI64::new(0),
             available_models: Arc::new(RwLock::new(models)),
             beta_capabilities: Arc::new(RwLock::new(HashMap::new())),
+            aip_overrides: HashMap::new(),
         }
     }
 
@@ -2626,6 +2706,7 @@ mod tests_slice5 {
             last_health_check: AtomicI64::new(0),
             available_models: Arc::new(RwLock::new(vec![])),
             beta_capabilities: Arc::new(RwLock::new(HashMap::new())),
+            aip_overrides: HashMap::new(),
         }
     }
 
@@ -2802,6 +2883,7 @@ mod tests_1m_capability_cache {
             available_models: Arc::new(tokio::sync::RwLock::new(vec![])),
             // Builder must add this field:
             beta_capabilities: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
+            aip_overrides: HashMap::new(),
         }
     }
 
@@ -3167,6 +3249,7 @@ mod tests_seed_probe {
             last_health_check: std::sync::atomic::AtomicI64::new(0),
             available_models: Arc::new(tokio::sync::RwLock::new(vec![])),
             beta_capabilities: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
+            aip_overrides: HashMap::new(),
         }
     }
 
@@ -3417,6 +3500,279 @@ mod tests_seed_probe {
             result,
             Some(true),
             "ProbeOutcome::Inconclusive must not overwrite an existing Some(true) cache entry"
+        );
+    }
+}
+// ── AIP override helpers — Task 1 (Slice 1) tests ──
+//
+// These tests cover the two new methods that the builder will add to
+// `EndpointClient`:
+//
+//   - `aip_override_for(model_id: &str) -> Option<&str>`
+//     Returns the AIP ARN from the in-memory `aip_overrides` HashMap when a
+//     matching entry exists, `None` otherwise.
+//
+//   - `has_any_aip_overrides() -> bool`
+//     Returns `true` iff `aip_overrides` is non-empty.
+//
+// The `aip_overrides: HashMap<String, String>` field is populated at load time
+// by reading `endpoint_aip_overrides` rows from the DB — the builder wires that
+// in `load_endpoints` / `create_client`. Here we test the helper methods
+// directly by constructing an `EndpointClient` with a known map.
+//
+// None of these tests require a database connection.
+
+#[cfg(test)]
+mod tests_aip_override_helpers {
+    use super::*;
+    use std::collections::HashMap;
+
+    /// Build a minimal `EndpointClient` with the provided `aip_overrides` map
+    /// and an optional `inference_profile_arn` on the config (legacy column).
+    ///
+    /// The AWS SDK clients are constructed with dummy configs — they are never
+    /// invoked in these unit tests.
+    fn make_client_with_overrides(
+        aip_overrides: HashMap<String, String>,
+        legacy_inference_profile_arn: Option<String>,
+    ) -> EndpointClient {
+        use std::sync::atomic::AtomicBool;
+        use std::sync::atomic::AtomicI64;
+
+        let id = Uuid::new_v4();
+        let config = crate::db::schema::Endpoint {
+            id,
+            name: "test-ep".to_string(),
+            role_arn: None,
+            external_id: None,
+            inference_profile_arn: legacy_inference_profile_arn,
+            region: "us-east-1".to_string(),
+            routing_prefix: "us".to_string(),
+            priority: 0,
+            is_default: false,
+            enabled: true,
+            created_at: chrono::Utc::now(),
+        };
+
+        let runtime_client = aws_sdk_bedrockruntime::Client::from_conf(
+            aws_sdk_bedrockruntime::Config::builder()
+                .behavior_version(aws_sdk_bedrockruntime::config::BehaviorVersion::latest())
+                .region(aws_config::Region::new("us-east-1"))
+                .build(),
+        );
+        let control_client = aws_sdk_bedrock::Client::from_conf(
+            aws_sdk_bedrock::Config::builder()
+                .behavior_version(aws_sdk_bedrock::config::BehaviorVersion::latest())
+                .region(aws_config::Region::new("us-east-1"))
+                .build(),
+        );
+        let quota_client = aws_sdk_servicequotas::Client::from_conf(
+            aws_sdk_servicequotas::Config::builder()
+                .behavior_version(aws_sdk_servicequotas::config::BehaviorVersion::latest())
+                .region(aws_config::Region::new("us-east-1"))
+                .build(),
+        );
+
+        EndpointClient {
+            config,
+            runtime_client,
+            control_client,
+            quota_cache: crate::quota::QuotaCache::new(quota_client),
+            healthy: AtomicBool::new(true),
+            last_health_check: AtomicI64::new(0),
+            available_models: Arc::new(RwLock::new(vec![])),
+            beta_capabilities: Arc::new(RwLock::new(HashMap::new())),
+            aip_overrides,
+        }
+    }
+
+    // ── aip_override_for ──────────────────────────────────────────────────────
+
+    /// `aip_override_for` returns `Some(arn)` when an exact model_id entry
+    /// exists in the `aip_overrides` map.
+    #[test]
+    fn test_aip_override_for_returns_arn_when_present() {
+        let mut map = HashMap::new();
+        let expected_arn =
+            "arn:aws:bedrock:us-east-1:123456789012:application-inference-profile/sonnet-tagged";
+        map.insert("claude-sonnet-4-5".to_string(), expected_arn.to_string());
+
+        let client = make_client_with_overrides(map, None);
+
+        let result = client.aip_override_for("claude-sonnet-4-5");
+        assert_eq!(
+            result,
+            Some(expected_arn),
+            "aip_override_for must return Some(arn) for a model present in the map"
+        );
+    }
+
+    /// `aip_override_for` returns `None` when the requested model has no entry
+    /// in the `aip_overrides` map, even when other models are present.
+    #[test]
+    fn test_aip_override_for_returns_none_for_absent_model() {
+        let mut map = HashMap::new();
+        map.insert(
+            "claude-sonnet-4-5".to_string(),
+            "arn:aws:bedrock:us-east-1:123456789012:application-inference-profile/sonnet-tagged"
+                .to_string(),
+        );
+        map.insert(
+            "claude-opus-4-7".to_string(),
+            "arn:aws:bedrock:us-east-1:123456789012:application-inference-profile/opus-tagged"
+                .to_string(),
+        );
+
+        let client = make_client_with_overrides(map, None);
+
+        let result = client.aip_override_for("claude-haiku-4-5");
+        assert!(
+            result.is_none(),
+            "aip_override_for must return None for a model not in the override map"
+        );
+    }
+
+    /// `aip_override_for` returns `None` when the map is empty.
+    #[test]
+    fn test_aip_override_for_returns_none_when_map_empty() {
+        let client = make_client_with_overrides(HashMap::new(), None);
+
+        let result = client.aip_override_for("claude-sonnet-4-5");
+        assert!(
+            result.is_none(),
+            "aip_override_for must return None when aip_overrides map is empty"
+        );
+    }
+
+    /// Boundary test: when no row exists in the new table (`aip_overrides` is
+    /// empty) but `inference_profile_arn` is set on the legacy column,
+    /// `aip_override_for` STILL returns `None`.
+    ///
+    /// The helper reads only the new `aip_overrides` map. The legacy fallback
+    /// (force-substitution from `config.inference_profile_arn`) is the
+    /// responsibility of the request dispatcher (Task 4), not this helper.
+    /// This test codifies the boundary between the two code paths.
+    #[test]
+    fn test_aip_override_for_ignores_legacy_inference_profile_arn() {
+        let legacy_arn =
+            "arn:aws:bedrock:us-east-1:123456789012:application-inference-profile/legacy-sonnet";
+
+        // Empty new-table map, but legacy column is set
+        let client = make_client_with_overrides(HashMap::new(), Some(legacy_arn.to_string()));
+
+        // The helper must return None — it does NOT fall through to the legacy column.
+        // The dispatcher will check config.inference_profile_arn separately.
+        let result = client.aip_override_for("claude-sonnet-4-5");
+        assert!(
+            result.is_none(),
+            "aip_override_for must return None when aip_overrides is empty, even if \
+             config.inference_profile_arn is set (legacy fallback is the dispatcher's job)"
+        );
+    }
+
+    /// `aip_override_for` performs exact-key matching only. A partial model name
+    /// (e.g. `"claude-sonnet"`) must NOT match the full key `"claude-sonnet-4-5"`.
+    #[test]
+    fn test_aip_override_for_exact_key_match_only() {
+        let mut map = HashMap::new();
+        map.insert(
+            "claude-sonnet-4-5".to_string(),
+            "arn:aws:bedrock:us-east-1:123456789012:application-inference-profile/sonnet-tagged"
+                .to_string(),
+        );
+
+        let client = make_client_with_overrides(map, None);
+
+        // Partial key must not match
+        assert!(
+            client.aip_override_for("claude-sonnet").is_none(),
+            "aip_override_for must not match on a partial model name"
+        );
+        // Different version must not match
+        assert!(
+            client.aip_override_for("claude-sonnet-4-6").is_none(),
+            "aip_override_for must not match a different version of the same model family"
+        );
+    }
+
+    // ── has_any_aip_overrides ─────────────────────────────────────────────────
+
+    /// `has_any_aip_overrides` returns `true` when at least one entry exists.
+    #[test]
+    fn test_has_any_aip_overrides_true_when_non_empty() {
+        let mut map = HashMap::new();
+        map.insert(
+            "claude-sonnet-4-5".to_string(),
+            "arn:aws:bedrock:us-east-1:123456789012:application-inference-profile/sonnet"
+                .to_string(),
+        );
+
+        let client = make_client_with_overrides(map, None);
+        assert!(
+            client.has_any_aip_overrides(),
+            "has_any_aip_overrides must return true when the map has entries"
+        );
+    }
+
+    /// `has_any_aip_overrides` returns `false` when the map is empty.
+    #[test]
+    fn test_has_any_aip_overrides_false_when_empty() {
+        let client = make_client_with_overrides(HashMap::new(), None);
+        assert!(
+            !client.has_any_aip_overrides(),
+            "has_any_aip_overrides must return false when aip_overrides is empty"
+        );
+    }
+
+    /// `has_any_aip_overrides` returns `false` even when the legacy
+    /// `inference_profile_arn` is set, as long as the new map is empty.
+    ///
+    /// This mirrors the boundary test for `aip_override_for`: the legacy column
+    /// is invisible to the new helpers.
+    #[test]
+    fn test_has_any_aip_overrides_false_with_only_legacy_column() {
+        let legacy_arn =
+            "arn:aws:bedrock:us-east-1:123456789012:application-inference-profile/legacy";
+        let client = make_client_with_overrides(HashMap::new(), Some(legacy_arn.to_string()));
+
+        assert!(
+            !client.has_any_aip_overrides(),
+            "has_any_aip_overrides must return false when aip_overrides is empty, \
+             even if the legacy inference_profile_arn column is set"
+        );
+    }
+
+    /// Multiple entries: `has_any_aip_overrides` remains `true` after inserting
+    /// multiple models, and `aip_override_for` returns the correct ARN for each.
+    #[test]
+    fn test_multiple_overrides_all_accessible() {
+        let sonnet_arn =
+            "arn:aws:bedrock:us-east-1:123456789012:application-inference-profile/sonnet";
+        let opus_arn = "arn:aws:bedrock:us-east-1:123456789012:application-inference-profile/opus";
+
+        let mut map = HashMap::new();
+        map.insert("claude-sonnet-4-5".to_string(), sonnet_arn.to_string());
+        map.insert("claude-opus-4-7".to_string(), opus_arn.to_string());
+
+        let client = make_client_with_overrides(map, None);
+
+        assert!(
+            client.has_any_aip_overrides(),
+            "has_any_aip_overrides must be true for a map with 2 entries"
+        );
+        assert_eq!(
+            client.aip_override_for("claude-sonnet-4-5"),
+            Some(sonnet_arn),
+            "must return correct sonnet ARN"
+        );
+        assert_eq!(
+            client.aip_override_for("claude-opus-4-7"),
+            Some(opus_arn),
+            "must return correct opus ARN"
+        );
+        assert!(
+            client.aip_override_for("claude-haiku-4-5").is_none(),
+            "haiku has no override, must return None"
         );
     }
 }

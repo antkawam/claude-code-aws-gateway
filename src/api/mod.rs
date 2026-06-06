@@ -123,11 +123,9 @@ pub fn router(state: Arc<GatewayState>) -> Router {
         .route("/admin/endpoints", post(admin::create_endpoint))
         .route(
             "/admin/endpoints/{endpoint_id}",
-            put(admin::update_endpoint),
-        )
-        .route(
-            "/admin/endpoints/{endpoint_id}",
-            delete(admin::delete_endpoint),
+            get(admin::get_endpoint_by_id)
+                .put(admin::update_endpoint)
+                .delete(admin::delete_endpoint),
         )
         .route(
             "/admin/endpoints/{endpoint_id}/quotas",
@@ -136,6 +134,14 @@ pub fn router(state: Arc<GatewayState>) -> Router {
         .route(
             "/admin/endpoints/{endpoint_id}/models",
             get(admin::get_endpoint_models),
+        )
+        .route(
+            "/admin/endpoints/{endpoint_id}/aip-overrides",
+            get(admin::list_aip_overrides).post(admin::create_aip_override),
+        )
+        .route(
+            "/admin/endpoints/{endpoint_id}/aip-overrides/{model_id}",
+            delete(admin::delete_aip_override),
         )
         .route("/admin/bedrock/models", get(admin::get_all_models))
         .route(
