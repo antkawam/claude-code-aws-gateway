@@ -1,3 +1,4 @@
+pub mod betas;
 pub mod model_seed;
 pub mod models;
 pub mod request;

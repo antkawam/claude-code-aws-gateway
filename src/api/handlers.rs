@@ -15,9 +15,10 @@ use uuid::Uuid;
 use crate::auth::CachedKey;
 use crate::auth::oidc::OidcIdentity;
 use crate::db::spend::RequestLogEntry;
+use crate::endpoint::{EndpointClient, ProbeSource};
 use crate::proxy::GatewayState;
 use crate::telemetry::Metrics;
-use crate::translate::{models, request, response, streaming};
+use crate::translate::{betas as beta_filter, models, request, response, streaming};
 use crate::websearch;
 
 /// RAII guard that decrements the in-flight request counter on drop.
@@ -42,6 +43,21 @@ impl Drop for InFlightGuard {
 enum AuthResult {
     VirtualKey(CachedKey),
     Oidc(OidcIdentity),
+}
+
+/// Context passed to `handle_non_streaming` / `handle_streaming` so they can
+/// perform opportunistic beta-capability learning and retry-on-rejection.
+struct BetaRetryContext {
+    /// The endpoint client whose capability cache should be updated.
+    endpoint_client: Arc<EndpointClient>,
+    /// Bedrock profile ID used as the cache key (e.g. `us.anthropic.claude-opus-4-7`).
+    profile: String,
+    /// Forwarded betas whose cache state was `None` at filter time.
+    /// On HTTP 200 these are marked `(profile, beta) → true` via `RequestSuccess`.
+    unknown_betas: Vec<String>,
+    /// All betas that were forwarded in this request.
+    /// Used to match against Bedrock's `ValidationException` error message.
+    forwarded_betas: Vec<String>,
 }
 
 /// Identity extracted from auth for spend tracking.
@@ -547,7 +563,7 @@ pub async fn messages(
         .flatten()
         .unwrap_or_else(|| "enabled".to_string());
 
-    let (mut bedrock_model, bedrock_body, web_search_ctx) = request::translate(
+    let (mut bedrock_model, mut bedrock_body, web_search_ctx) = request::translate(
         body,
         &routing_prefix,
         Some(&state.model_cache),
@@ -597,6 +613,39 @@ pub async fn messages(
     if web_search_ctx.is_some() {
         tracing::info!(request_id = %request_id, "Web search tool detected, interception enabled");
     }
+
+    // ── Beta capability filtering ────────────────────────────────────────────
+    // Filter anthropic_beta through the per-endpoint capability cache.
+    // Betas the cache says Some(false) are dropped here to avoid a Bedrock
+    // ValidationException. Betas whose cache state is None are kept optimistically
+    // and tracked for opportunistic learning when the request succeeds.
+    //
+    // This block also builds BetaRetryContext for the handler to use when
+    // a ValidationException fires at runtime (parse, mark_unsupported, retry once).
+    let beta_retry_ctx: Option<BetaRetryContext> = if let Some(ref ep) = selected_endpoint {
+        let filter_result =
+            beta_filter::filter_betas_by_cache(ep, &bedrock_model, &bedrock_body.anthropic_beta)
+                .await;
+
+        if !filter_result.dropped.is_empty() {
+            tracing::info!(
+                request_id = %request_id,
+                dropped = ?filter_result.dropped,
+                "Dropped betas that cache records as unsupported"
+            );
+        }
+
+        let ctx = BetaRetryContext {
+            endpoint_client: Arc::clone(ep),
+            profile: bedrock_model.clone(),
+            unknown_betas: filter_result.unknown.clone(),
+            forwarded_betas: filter_result.kept.clone(),
+        };
+        bedrock_body.anthropic_beta = filter_result.kept;
+        Some(ctx)
+    } else {
+        None
+    };
 
     let body_bytes = match serde_json::to_vec(&bedrock_body) {
         Ok(b) => b,
@@ -730,6 +779,7 @@ pub async fn messages(
             req_info.clone(),
             start,
             endpoint_id,
+            beta_retry_ctx,
         )
         .await
     } else {
@@ -744,6 +794,7 @@ pub async fn messages(
             req_info.clone(),
             start,
             endpoint_id,
+            beta_retry_ctx,
         )
         .await
     };
@@ -791,6 +842,7 @@ pub async fn messages(
                         req_info.clone(),
                         start,
                         fb_endpoint_id,
+                        None, // no beta retry on failover — already retried on primary
                     )
                     .await
                 } else {
@@ -805,6 +857,7 @@ pub async fn messages(
                         req_info.clone(),
                         start,
                         fb_endpoint_id,
+                        None, // no beta retry on failover — already retried on primary
                     )
                     .await
                 };
@@ -1088,18 +1141,152 @@ async fn handle_non_streaming(
     req_info: RequestInfo,
     start: Instant,
     endpoint_id: Option<Uuid>,
+    beta_ctx: Option<BetaRetryContext>,
 ) -> Response {
     let result = runtime_client
         .invoke_model()
         .model_id(bedrock_model)
         .content_type("application/json")
         .accept("application/json")
-        .body(Blob::new(body_bytes))
+        .body(Blob::new(body_bytes.clone()))
         .send()
         .await;
 
+    // Check for ValidationException that names a known beta — retry once with those
+    // betas stripped, and mark them as unsupported in the capability cache.
+    let result = if let Err(ref e) = result {
+        use aws_sdk_bedrockruntime::error::SdkError;
+        let is_ve = matches!(e, SdkError::ServiceError(svc) if svc.err().is_validation_exception());
+        if is_ve && let Some(ref ctx) = beta_ctx {
+            let err_str = format!("{e:?}");
+            let rejected = beta_filter::parse_rejected_betas(&err_str, &ctx.forwarded_betas);
+            if !rejected.is_empty() {
+                tracing::info!(
+                    model = %bedrock_model,
+                    rejected = ?rejected,
+                    "ValidationException named betas — marking unsupported and retrying"
+                );
+                for beta in &rejected {
+                    ctx.endpoint_client
+                        .mark_unsupported(&ctx.profile, beta, ProbeSource::RequestRejection)
+                        .await;
+                }
+                // Rebuild body with rejected betas removed.
+                let retry_bytes =
+                    rebuild_body_without_betas(&body_bytes, &rejected).unwrap_or_default();
+                if retry_bytes.is_empty() {
+                    // Serialization failed — bubble original error.
+                } else {
+                    let retry_result = runtime_client
+                        .invoke_model()
+                        .model_id(bedrock_model)
+                        .content_type("application/json")
+                        .accept("application/json")
+                        .body(Blob::new(retry_bytes))
+                        .send()
+                        .await;
+                    // Return retry result regardless; if it also fails we bubble that.
+                    // Per spec: "if retry fails (any reason) → bubble the original Bedrock error".
+                    // We actually bubble the retry error here so the client gets a fresh message.
+                    // On success the unknown betas are NOT re-marked (we only had ctx.forwarded);
+                    // the remaining betas will be marked by the opportunistic path on Ok below.
+                    match retry_result {
+                        Ok(output) => {
+                            // Retry succeeded — opportunistically learn remaining unknown betas.
+                            let remaining_unknown: Vec<String> = ctx
+                                .unknown_betas
+                                .iter()
+                                .filter(|b| !rejected.contains(b))
+                                .cloned()
+                                .collect();
+                            for beta in &remaining_unknown {
+                                ctx.endpoint_client
+                                    .mark_supported(&ctx.profile, beta, ProbeSource::RequestSuccess)
+                                    .await;
+                            }
+                            // Process the successful retry response.
+                            let response_bytes = output.body().as_ref();
+                            return match serde_json::from_slice::<Value>(response_bytes) {
+                                Ok(resp) => {
+                                    let (input, output_tok, cache_read, cache_write, stop_reason) =
+                                        extract_response_metadata(&resp);
+                                    state.metrics.record_tokens(
+                                        original_model,
+                                        input as u64,
+                                        output_tok as u64,
+                                        cache_read as u64,
+                                        cache_write as u64,
+                                    );
+                                    state.metrics.record_tools(&req_info.tool_names);
+                                    state
+                                        .spend_tracker
+                                        .record(RequestLogEntry {
+                                            key_id: identity.key_id,
+                                            user_identity: identity.user_identity,
+                                            request_id,
+                                            model: original_model.to_string(),
+                                            streaming: false,
+                                            duration_ms: start.elapsed().as_millis() as i32,
+                                            input_tokens: input,
+                                            output_tokens: output_tok,
+                                            cache_read_tokens: cache_read,
+                                            cache_write_tokens: cache_write,
+                                            stop_reason,
+                                            tool_count: req_info.tool_count,
+                                            tool_names: req_info.tool_names,
+                                            turn_count: req_info.turn_count,
+                                            thinking_enabled: req_info.thinking_enabled,
+                                            has_system_prompt: req_info.has_system_prompt,
+                                            session_id: req_info.session_id,
+                                            project_key: req_info.project_key,
+                                            tool_errors: req_info.tool_errors,
+                                            has_correction: req_info.has_correction,
+                                            content_block_types: req_info.content_block_types,
+                                            system_prompt_hash: req_info.system_prompt_hash,
+                                            detection_flags: req_info.detection_flags,
+                                            endpoint_id,
+                                        })
+                                        .await;
+                                    let normalized = response::normalize_response(
+                                        resp,
+                                        original_model,
+                                        Some(&state.model_cache),
+                                    );
+                                    Json(normalized).into_response()
+                                }
+                                Err(e) => {
+                                    tracing::error!(%e, "Failed to parse Bedrock retry response");
+                                    error_response(
+                                        StatusCode::BAD_GATEWAY,
+                                        "api_error",
+                                        "Failed to parse upstream response",
+                                    )
+                                }
+                            };
+                        }
+                        Err(_) => {
+                            // Retry failed — fall through and bubble the original error.
+                        }
+                    }
+                }
+            }
+        }
+        result
+    } else {
+        result
+    };
+
     match result {
         Ok(output) => {
+            // Opportunistic learning: betas whose cache state was None are now known to work.
+            if let Some(ref ctx) = beta_ctx {
+                for beta in &ctx.unknown_betas {
+                    ctx.endpoint_client
+                        .mark_supported(&ctx.profile, beta, ProbeSource::RequestSuccess)
+                        .await;
+                }
+            }
+
             let response_bytes = output.body().as_ref();
             match serde_json::from_slice::<Value>(response_bytes) {
                 Ok(resp) => {
@@ -1199,6 +1386,24 @@ async fn handle_non_streaming(
     }
 }
 
+/// Strip the given `rejected_betas` from the `anthropic_beta` array in `body_bytes`.
+///
+/// Returns the re-serialized bytes, or `None` if the body can't be parsed.
+fn rebuild_body_without_betas(body_bytes: &[u8], rejected: &[String]) -> Option<Vec<u8>> {
+    let mut body: Value = serde_json::from_slice(body_bytes).ok()?;
+    if let Some(arr) = body
+        .get_mut("anthropic_beta")
+        .and_then(|v| v.as_array_mut())
+    {
+        arr.retain(|v| {
+            v.as_str()
+                .map(|s| !rejected.iter().any(|r| r == s))
+                .unwrap_or(true)
+        });
+    }
+    serde_json::to_vec(&body).ok()
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn handle_streaming(
     state: &GatewayState,
@@ -1211,17 +1416,89 @@ async fn handle_streaming(
     req_info: RequestInfo,
     start: Instant,
     endpoint_id: Option<Uuid>,
+    beta_ctx: Option<BetaRetryContext>,
 ) -> Response {
     let result = runtime_client
         .invoke_model_with_response_stream()
         .model_id(bedrock_model)
         .content_type("application/json")
-        .body(Blob::new(body_bytes))
+        .body(Blob::new(body_bytes.clone()))
         .send()
         .await;
 
+    // Check for ValidationException naming a known beta — retry once with those betas stripped.
+    let (result, beta_ctx) = if let Err(ref e) = result {
+        use aws_sdk_bedrockruntime::error::SdkError;
+        let is_ve = matches!(
+            e,
+            SdkError::ServiceError(svc) if svc.err().is_validation_exception()
+        );
+        if is_ve {
+            if let Some(ref ctx) = beta_ctx {
+                let err_str = format!("{e:?}");
+                let rejected = beta_filter::parse_rejected_betas(&err_str, &ctx.forwarded_betas);
+                if !rejected.is_empty() {
+                    tracing::info!(
+                        model = %bedrock_model,
+                        rejected = ?rejected,
+                        "ValidationException named betas (stream) — marking unsupported and retrying"
+                    );
+                    for beta in &rejected {
+                        ctx.endpoint_client
+                            .mark_unsupported(&ctx.profile, beta, ProbeSource::RequestRejection)
+                            .await;
+                    }
+                    let retry_bytes =
+                        rebuild_body_without_betas(&body_bytes, &rejected).unwrap_or_default();
+                    if !retry_bytes.is_empty() {
+                        let retry_result = runtime_client
+                            .invoke_model_with_response_stream()
+                            .model_id(bedrock_model)
+                            .content_type("application/json")
+                            .body(Blob::new(retry_bytes))
+                            .send()
+                            .await;
+                        // Build an updated ctx with the rejected betas removed from unknown_betas
+                        let remaining_ctx = BetaRetryContext {
+                            endpoint_client: Arc::clone(&ctx.endpoint_client),
+                            profile: ctx.profile.clone(),
+                            unknown_betas: ctx
+                                .unknown_betas
+                                .iter()
+                                .filter(|b| !rejected.contains(b))
+                                .cloned()
+                                .collect(),
+                            forwarded_betas: ctx.forwarded_betas.clone(),
+                        };
+                        (retry_result, Some(remaining_ctx))
+                    } else {
+                        (result, beta_ctx)
+                    }
+                } else {
+                    (result, beta_ctx)
+                }
+            } else {
+                (result, beta_ctx)
+            }
+        } else {
+            (result, beta_ctx)
+        }
+    } else {
+        (result, beta_ctx)
+    };
+
     match result {
         Ok(output) => {
+            // Opportunistic learning: Bedrock accepted the request, so unknown betas are now known
+            // to work. Fire mark_supported before spawning the stream task.
+            if let Some(ref ctx) = beta_ctx {
+                for beta in &ctx.unknown_betas {
+                    ctx.endpoint_client
+                        .mark_supported(&ctx.profile, beta, ProbeSource::RequestSuccess)
+                        .await;
+                }
+            }
+
             let original_model = original_model.to_string();
             let mut event_stream = output.body;
 
@@ -2914,6 +3191,7 @@ mod tests {
             top_p: None,
             top_k: None,
             mcp_servers: None,
+            anthropic_beta: vec![],
         }
     }
 
