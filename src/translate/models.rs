@@ -1221,8 +1221,7 @@ mod tests_t4_suffix_strip {
     /// Result equals the bare Bedrock ID with no suffix.
     #[test]
     fn strips_suffix_on_bedrock_style_id() {
-        let with_suffix =
-            anthropic_to_bedrock("us.anthropic.claude-opus-4-7[1m]", "us", None);
+        let with_suffix = anthropic_to_bedrock("us.anthropic.claude-opus-4-7[1m]", "us", None);
         assert_eq!(
             with_suffix, "us.anthropic.claude-opus-4-7",
             "strip must run before the dot-passthrough check so Bedrock-style IDs with suffix also work"
