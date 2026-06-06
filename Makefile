@@ -1,4 +1,4 @@
-.PHONY: test lint fmt test-integration test-e2e test-frontend test-load test-load-constrained coverage check build help dev dev-reset dev-seed dev-down
+.PHONY: test lint fmt check-docs test-integration test-e2e test-frontend test-load test-load-constrained coverage check build help dev dev-reset dev-seed dev-down
 
 help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-20s\033[0m %s\n", $$1, $$2}'
@@ -18,6 +18,9 @@ lint: ## Check formatting and run clippy
 
 fmt: ## Auto-format code
 	cargo fmt --all
+
+check-docs: ## Lint public docs for internal spec/task language leaks
+	scripts/check-docs.sh
 
 test-integration: ## Run integration tests (requires Docker)
 	@docker compose -f docker-compose.yml down 2>/dev/null || true
@@ -58,7 +61,7 @@ test-e2e: ## Run e2e HTTP tests (requires Docker + AWS credentials)
 			docker-compose -f docker-compose.test.yml down 2>/dev/null; \
 		exit $$status
 
-check: lint test test-integration ## Run all checks (what CI runs)
+check: lint check-docs test test-integration ## Run all checks (what CI runs)
 
 coverage: ## Generate code coverage report (requires cargo-tarpaulin)
 	cargo tarpaulin --workspace --lib --out html --output-dir coverage --skip-clean
