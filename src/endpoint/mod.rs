@@ -114,6 +114,16 @@ impl EndpointClient {
         );
     }
 
+    /// Remove the `(profile, beta)` entry from the capability cache entirely.
+    ///
+    /// After this call, `is_beta_supported(profile, beta)` returns `None`.
+    /// Used by the admin DELETE handler to clear an override and let the
+    /// health-loop re-probe on the next cycle.
+    pub async fn forget_capability(&self, profile: &str, beta: &str) {
+        let mut map = self.beta_capabilities.write().await;
+        map.remove(&(profile.to_string(), beta.to_string()));
+    }
+
     /// Record that `(profile, beta)` is NOT supported.
     pub async fn mark_unsupported(&self, profile: &str, beta: &str, source: ProbeSource) {
         let mut map = self.beta_capabilities.write().await;
