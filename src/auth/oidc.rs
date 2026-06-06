@@ -409,6 +409,44 @@ impl MultiIdpValidator {
     }
 }
 
+/// Resolve the OIDC scopes string to request during authorization.
+///
+/// Priority:
+/// 1. `idp.scopes` when `Some(s)` and `s` is non-empty — returned verbatim.
+/// 2. Otherwise infer from `idp.user_claim`:
+///    - "email", "preferred_username", "upn", "name", or "auto" → "openid email profile"
+///    - `None` → heuristic on issuer URL (Entra/Okta/Google → "openid email profile",
+///      anything else → "openid")
+///    - any other `Some(_)` → "openid"
+pub(crate) fn resolve_oidc_scopes(idp: &IdpConfig) -> String {
+    // Explicit scopes take priority if non-empty.
+    if let Some(s) = &idp.scopes
+        && !s.is_empty()
+    {
+        return s.clone();
+    }
+
+    // Infer from user_claim.
+    match idp.user_claim.as_deref() {
+        Some("email") | Some("preferred_username") | Some("upn") | Some("name") | Some("auto") => {
+            "openid email profile".to_string()
+        }
+        None => {
+            // Heuristic on issuer: well-known multi-claim IDPs benefit from email+profile.
+            let issuer = idp.issuer.to_lowercase();
+            if issuer.contains("microsoftonline")
+                || issuer.contains("okta")
+                || issuer.contains("accounts.google")
+            {
+                "openid email profile".to_string()
+            } else {
+                "openid".to_string()
+            }
+        }
+        Some(_) => "openid".to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -974,5 +1012,153 @@ mod tests {
         let found = validator.find_key(&keys, None);
         assert!(found.is_some());
         assert_eq!(found.unwrap().n.unwrap(), "n-sig");
+    }
+
+    // -----------------------------------------------------------------------
+    // Tests for resolve_oidc_scopes (issue #76)
+    //
+    // The function does not exist yet — these tests are intentionally failing
+    // at compile time until @Builder Agent implements it in src/auth/oidc.rs.
+    // -----------------------------------------------------------------------
+
+    fn make_idp(issuer: &str, user_claim: Option<&str>, scopes: Option<&str>) -> IdpConfig {
+        IdpConfig {
+            name: "test-idp".to_string(),
+            issuer: issuer.to_string(),
+            audience: None,
+            jwks_url: None,
+            auto_provision: true,
+            default_role: "member".to_string(),
+            allowed_domains: None,
+            user_claim: user_claim.map(String::from),
+            scopes: scopes.map(String::from),
+        }
+    }
+
+    // 1. Explicit scopes are returned verbatim, regardless of user_claim or issuer.
+    #[test]
+    fn resolve_scopes_explicit_wins_over_all() {
+        let idp = make_idp(
+            "https://midway-auth.amazon.com",
+            Some("email"),
+            Some("openid email profile groups"),
+        );
+        assert_eq!(
+            resolve_oidc_scopes(&idp),
+            "openid email profile groups",
+            "Explicit scopes must be returned unchanged"
+        );
+    }
+
+    // 2. Explicit but empty string is treated as unset, falls through to inference.
+    #[test]
+    fn resolve_scopes_empty_explicit_falls_through_to_inference() {
+        // Issuer is Entra → inference should give "openid email profile"
+        let idp = make_idp(
+            "https://login.microsoftonline.com/tenant-id/v2.0",
+            None,
+            Some(""),
+        );
+        assert_eq!(
+            resolve_oidc_scopes(&idp),
+            "openid email profile",
+            "Empty scopes string must be treated as None and fall through to inference"
+        );
+    }
+
+    // 3. user_claim = "email" with no explicit scopes → "openid email profile"
+    #[test]
+    fn resolve_scopes_user_claim_email_implies_profile() {
+        let idp = make_idp("https://neutral.example.com", Some("email"), None);
+        assert_eq!(
+            resolve_oidc_scopes(&idp),
+            "openid email profile",
+            "user_claim=email should infer email+profile scopes"
+        );
+    }
+
+    // 4. user_claim = "preferred_username" with no explicit scopes → "openid email profile"
+    #[test]
+    fn resolve_scopes_user_claim_preferred_username_implies_profile() {
+        let idp = make_idp(
+            "https://neutral.example.com",
+            Some("preferred_username"),
+            None,
+        );
+        assert_eq!(
+            resolve_oidc_scopes(&idp),
+            "openid email profile",
+            "user_claim=preferred_username should infer email+profile scopes"
+        );
+    }
+
+    // 5. user_claim = "upn" with no explicit scopes → "openid email profile"
+    #[test]
+    fn resolve_scopes_user_claim_upn_implies_profile() {
+        let idp = make_idp("https://neutral.example.com", Some("upn"), None);
+        assert_eq!(
+            resolve_oidc_scopes(&idp),
+            "openid email profile",
+            "user_claim=upn should infer email+profile scopes"
+        );
+    }
+
+    // 6. scopes=None, user_claim=None, Entra issuer → "openid email profile"
+    #[test]
+    fn resolve_scopes_no_claim_entra_issuer_infers_profile() {
+        let idp = make_idp(
+            "https://login.microsoftonline.com/tenant-id/v2.0",
+            None,
+            None,
+        );
+        assert_eq!(
+            resolve_oidc_scopes(&idp),
+            "openid email profile",
+            "Entra issuer without user_claim should infer email+profile scopes"
+        );
+    }
+
+    // 7. scopes=None, user_claim=None, Okta issuer → "openid email profile"
+    #[test]
+    fn resolve_scopes_no_claim_okta_issuer_infers_profile() {
+        let idp = make_idp("https://mycompany.okta.com/oauth2/default", None, None);
+        assert_eq!(
+            resolve_oidc_scopes(&idp),
+            "openid email profile",
+            "Okta issuer without user_claim should infer email+profile scopes"
+        );
+    }
+
+    // 8. scopes=None, user_claim=None, Google issuer → "openid email profile"
+    #[test]
+    fn resolve_scopes_no_claim_google_issuer_infers_profile() {
+        let idp = make_idp("https://accounts.google.com", None, None);
+        assert_eq!(
+            resolve_oidc_scopes(&idp),
+            "openid email profile",
+            "Google issuer without user_claim should infer email+profile scopes"
+        );
+    }
+
+    // 9. scopes=None, user_claim=None, neutral/Midway-style issuer → "openid" only
+    #[test]
+    fn resolve_scopes_no_claim_neutral_issuer_returns_openid_only() {
+        let idp = make_idp("https://midway-auth.amazon.com", None, None);
+        assert_eq!(
+            resolve_oidc_scopes(&idp),
+            "openid",
+            "Neutral issuer (Midway-style) without user_claim should only request 'openid'"
+        );
+    }
+
+    // 10. Issuer matching is case-insensitive.
+    #[test]
+    fn resolve_scopes_issuer_match_is_case_insensitive() {
+        let idp = make_idp("https://LOGIN.MICROSOFTONLINE.COM/TENANT/v2.0", None, None);
+        assert_eq!(
+            resolve_oidc_scopes(&idp),
+            "openid email profile",
+            "Issuer substring matching must be case-insensitive"
+        );
     }
 }

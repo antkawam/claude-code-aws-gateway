@@ -414,8 +414,10 @@ async fn build_provider_info(
         '?'
     };
 
+    let scopes = crate::auth::oidc::resolve_oidc_scopes(idp);
+    let encoded_scopes = scopes.replace(' ', "%20");
     let login_url = format!(
-        "{authorize_endpoint}{separator}response_type=id_token&client_id={audience}&redirect_uri={redirect_uri}&nonce={nonce}&scope=openid"
+        "{authorize_endpoint}{separator}response_type=id_token&client_id={audience}&redirect_uri={redirect_uri}&nonce={nonce}&scope={encoded_scopes}"
     );
 
     Some(serde_json::json!({
