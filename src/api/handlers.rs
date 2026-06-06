@@ -872,6 +872,7 @@ pub async fn messages(
             ws_ctx,
             endpoint_id,
             &websearch_mode,
+            beta_retry_ctx,
         )
         .await
     } else if is_streaming {
@@ -1800,6 +1801,7 @@ async fn handle_with_web_search(
     ws_ctx: &websearch::WebSearchContext,
     endpoint_id: Option<Uuid>,
     websearch_mode: &str,
+    beta_retry_ctx: Option<BetaRetryContext>,
 ) -> Response {
     // Resolve search provider: "global" mode uses admin-configured global provider,
     // otherwise fall back to per-user provider (which defaults to DuckDuckGo).
@@ -1858,9 +1860,102 @@ async fn handle_with_web_search(
             .model_id(bedrock_model)
             .content_type("application/json")
             .accept("application/json")
-            .body(Blob::new(body_bytes))
+            .body(Blob::new(body_bytes.clone()))
             .send()
             .await;
+
+        // On the first iteration, apply the beta retry pattern:
+        // if Bedrock rejects with a ValidationException naming a beta, strip
+        // that beta, mark it unsupported, and retry once.  On success, mark
+        // any unknown betas as supported.
+        let result = if loop_iteration == 1 {
+            if let Err(ref e) = result {
+                use aws_sdk_bedrockruntime::error::SdkError;
+                let is_ve = matches!(
+                    e,
+                    SdkError::ServiceError(svc) if svc.err().is_validation_exception()
+                );
+                if is_ve {
+                    if let Some(ref ctx) = beta_retry_ctx {
+                        let err_str = format!("{e:?}");
+                        let rejected =
+                            beta_filter::parse_rejected_betas(&err_str, &ctx.forwarded_betas);
+                        if !rejected.is_empty() {
+                            tracing::info!(
+                                model = %bedrock_model,
+                                rejected = ?rejected,
+                                "ValidationException named betas (web-search path) — marking unsupported and retrying"
+                            );
+                            for beta in &rejected {
+                                ctx.endpoint_client
+                                    .mark_unsupported(
+                                        &ctx.profile,
+                                        beta,
+                                        ProbeSource::RequestRejection,
+                                    )
+                                    .await;
+                            }
+                            // Strip the rejected betas from bedrock_body for this and
+                            // all subsequent iterations in the loop.
+                            bedrock_body
+                                .anthropic_beta
+                                .retain(|b| !rejected.iter().any(|r| r == b));
+                            let retry_bytes = rebuild_body_without_betas(&body_bytes, &rejected)
+                                .unwrap_or_default();
+                            if !retry_bytes.is_empty() {
+                                let retry_result = runtime_client
+                                    .invoke_model()
+                                    .model_id(bedrock_model)
+                                    .content_type("application/json")
+                                    .accept("application/json")
+                                    .body(Blob::new(retry_bytes))
+                                    .send()
+                                    .await;
+                                if retry_result.is_ok() {
+                                    // Opportunistic learning: remaining unknown betas work.
+                                    let remaining_unknown: Vec<String> = ctx
+                                        .unknown_betas
+                                        .iter()
+                                        .filter(|b| !rejected.contains(b))
+                                        .cloned()
+                                        .collect();
+                                    for beta in &remaining_unknown {
+                                        ctx.endpoint_client
+                                            .mark_supported(
+                                                &ctx.profile,
+                                                beta,
+                                                ProbeSource::RequestSuccess,
+                                            )
+                                            .await;
+                                    }
+                                }
+                                retry_result
+                            } else {
+                                result
+                            }
+                        } else {
+                            result
+                        }
+                    } else {
+                        result
+                    }
+                } else {
+                    result
+                }
+            } else {
+                // First iteration succeeded — opportunistic learning for unknown betas.
+                if let Some(ref ctx) = beta_retry_ctx {
+                    for beta in &ctx.unknown_betas {
+                        ctx.endpoint_client
+                            .mark_supported(&ctx.profile, beta, ProbeSource::RequestSuccess)
+                            .await;
+                    }
+                }
+                result
+            }
+        } else {
+            result
+        };
 
         let resp_value = match result {
             Ok(output) => match serde_json::from_slice::<Value>(output.body().as_ref()) {

@@ -10,6 +10,14 @@ use crate::db::schema::Endpoint;
 
 pub mod stats;
 
+/// Shared capability map type — maps `(profile_id, beta_name)` to `CapabilityEntry`.
+type BetaCapabilityMap = Arc<RwLock<HashMap<(String, String), CapabilityEntry>>>;
+
+/// Pair of preserved cache Arcs carried from an existing `EndpointClient` into
+/// a reloaded one so that learned capability data and model lists survive
+/// routine `cache_version`-triggered reloads.
+type PreservedCaches = (BetaCapabilityMap, Arc<RwLock<Vec<String>>>);
+
 /// TTL for non-`AdminOverride` capability cache entries.
 pub const CAPABILITY_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 
@@ -102,10 +110,22 @@ impl EndpointClient {
     }
 
     /// Record that `(profile, beta)` is supported.
+    ///
+    /// If the existing entry was written by `AdminOverride` and the incoming
+    /// `source` is anything other than `AdminOverride`, the call is a no-op.
+    /// Admin overrides stay until explicitly cleared via `forget_capability`.
     pub async fn mark_supported(&self, profile: &str, beta: &str, source: ProbeSource) {
         let mut map = self.beta_capabilities.write().await;
+        let key = (profile.to_string(), beta.to_string());
+        // Never overwrite an admin override from any other source.
+        if let Some(existing) = map.get(&key)
+            && existing.source == ProbeSource::AdminOverride
+            && source != ProbeSource::AdminOverride
+        {
+            return;
+        }
         map.insert(
-            (profile.to_string(), beta.to_string()),
+            key,
             CapabilityEntry {
                 supported: true,
                 learned_at: Instant::now(),
@@ -125,10 +145,22 @@ impl EndpointClient {
     }
 
     /// Record that `(profile, beta)` is NOT supported.
+    ///
+    /// If the existing entry was written by `AdminOverride` and the incoming
+    /// `source` is anything other than `AdminOverride`, the call is a no-op.
+    /// Admin overrides stay until explicitly cleared via `forget_capability`.
     pub async fn mark_unsupported(&self, profile: &str, beta: &str, source: ProbeSource) {
         let mut map = self.beta_capabilities.write().await;
+        let key = (profile.to_string(), beta.to_string());
+        // Never overwrite an admin override from any other source.
+        if let Some(existing) = map.get(&key)
+            && existing.source == ProbeSource::AdminOverride
+            && source != ProbeSource::AdminOverride
+        {
+            return;
+        }
         map.insert(
-            (profile.to_string(), beta.to_string()),
+            key,
             CapabilityEntry {
                 supported: false,
                 learned_at: Instant::now(),
@@ -286,6 +318,11 @@ impl EndpointPool {
     /// Load/reload endpoint clients from database endpoint configs.
     /// For endpoints with role_arn, uses STS AssumeRole (via AssumeRoleProvider).
     /// For endpoints without role_arn (NULL), uses the gateway's own credentials.
+    ///
+    /// Existing `beta_capabilities` and `available_models` Arcs are preserved for
+    /// endpoints that are already in the pool (matched by UUID), so that learned
+    /// capability data survives routine config reloads triggered by cache_version bumps.
+    /// Only genuinely new endpoints get a fresh empty cache.
     pub async fn load_endpoints(
         &self,
         endpoints: Vec<Endpoint>,
@@ -294,11 +331,30 @@ impl EndpointPool {
         let mut new_clients = HashMap::new();
         let mut new_default: Option<Uuid> = None;
 
+        // Snapshot the current pool so we can preserve cache Arcs for unchanged endpoints.
+        let preserved: HashMap<Uuid, PreservedCaches> = {
+            let old_clients = self.clients.read().await;
+            old_clients
+                .iter()
+                .map(|(id, c)| {
+                    (
+                        *id,
+                        (
+                            Arc::clone(&c.beta_capabilities),
+                            Arc::clone(&c.available_models),
+                        ),
+                    )
+                })
+                .collect()
+        };
+
         for ep in endpoints {
             if ep.is_default {
                 new_default = Some(ep.id);
             }
-            let client = Self::create_client(&ep, base_aws_config).await;
+            let preserved_caches = preserved.get(&ep.id).cloned();
+            let client =
+                Self::create_client_with_caches(&ep, base_aws_config, preserved_caches).await;
             if let Some(c) = client {
                 new_clients.insert(ep.id, Arc::new(c));
             }
@@ -312,9 +368,10 @@ impl EndpointPool {
         *default_id = new_default;
     }
 
-    async fn create_client(
+    async fn create_client_with_caches(
         endpoint: &Endpoint,
         _base_config: &aws_config::SdkConfig,
+        preserved_caches: Option<PreservedCaches>,
     ) -> Option<EndpointClient> {
         let region = aws_config::Region::new(endpoint.region.clone());
 
@@ -347,6 +404,16 @@ impl EndpointPool {
         let control_client = aws_sdk_bedrock::Client::new(&sdk_config);
         let quota_client = aws_sdk_servicequotas::Client::new(&sdk_config);
 
+        // Reuse existing cache Arcs when reloading a known endpoint, so that
+        // learned capability data and available-model lists survive config reloads.
+        let (beta_capabilities, available_models) = match preserved_caches {
+            Some((beta_cap, avail_models)) => (beta_cap, avail_models),
+            None => (
+                Arc::new(RwLock::new(HashMap::new())),
+                Arc::new(RwLock::new(vec![])),
+            ),
+        };
+
         Some(EndpointClient {
             config: endpoint.clone(),
             runtime_client,
@@ -354,8 +421,8 @@ impl EndpointPool {
             quota_cache: crate::quota::QuotaCache::new(quota_client),
             healthy: AtomicBool::new(false),
             last_health_check: AtomicI64::new(0),
-            available_models: Arc::new(RwLock::new(vec![])),
-            beta_capabilities: Arc::new(RwLock::new(HashMap::new())),
+            available_models,
+            beta_capabilities,
         })
     }
 

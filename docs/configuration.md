@@ -113,6 +113,8 @@ These variables are set in the **client's shell** (not the gateway process). The
 
 CCAG supports Claude Code's 1M-context model variants via the `[1m]` suffix convention (e.g., `claude-opus-4-7[1m]`).
 
+> **Multi-endpoint requirement.** `[1m]` variants only appear in `/v1/models` for endpoints configured in the admin portal (or via `ccag` CLI). The gateway's built-in default Bedrock client (used when no endpoint is configured) does not run capability probes, so single-endpoint deployments using only the default client will not see `[1m]` variants in CC's model picker. To enable 1M context discovery, add at least one named endpoint via `Admin → Endpoints` or `ccag endpoints add`.
+
 **How it works end-to-end:**
 
 1. **Advertising.** `/v1/models` emits a paired `<model-id>[1m]` entry (display name appended with `(1M context)`) for any Bedrock inference profile where the `context-1m-2025-08-07` beta has been confirmed supported. With `CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1` set, CC's model picker shows these variants.
@@ -123,7 +125,7 @@ CCAG supports Claude Code's 1M-context model variants via the `[1m]` suffix conv
 
 4. **Self-healing.** If Bedrock changes which betas it accepts on a model — a beta promoted to GA starts returning a 400, or a new model starts accepting a beta — the cache corrects itself on the next health-loop tick or the next rejected request. No gateway binary release is required.
 
-5. **Admin override.** Operators can force a `(endpoint, profile, beta) → supported` value via `ccag betas override` (see Tasks 7–8). Overrides persist across restarts and ignore the 24-hour TTL. Use as an escape hatch when the learned value is wrong (transient Bedrock error misclassified as unsupported, new beta before the parser recognizes the format, etc.).
+5. **Admin override.** Operators can force a `(endpoint, profile, beta) → supported` value via `ccag betas override <endpoint-id> <profile-id> <beta-name> true|false [--reason "..."]` — sets a permanent capability override that ignores TTL and survives restarts. Useful when the auto-discovery is wrong (Bedrock returns a misleading error string, transient outage misclassified as `unsupported`, or a new beta needs to be force-enabled before our parser knows about it).
 
 **Bootstrap window.** After a gateway restart, the capability cache is empty. The first health-loop tick completes within seconds and populates entries. During that window, no `[1m]` variants are advertised by `/v1/models`, and betas are forwarded optimistically on real requests (with rejection-retry protection).
 
