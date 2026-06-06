@@ -39,6 +39,12 @@ TOKEN_REFRESH_MARGIN=60
 # Don't retry browser flow within this window after a failure
 FAIL_COOLDOWN_SECS=30
 
+# Signal to Claude Code that it should use the gateway's /v1/models endpoint
+# rather than its hardcoded model list. Set here (before any early-return) so
+# every exit path — cached token, fresh login, lock-wait — exports the flag.
+export CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1
+echo "[ccag] gateway model discovery enabled (CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1)" >&2
+
 # Decode JWT payload and extract a field (no external deps)
 jwt_field() {
     local token="$1" field="$2"

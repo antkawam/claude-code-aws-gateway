@@ -101,6 +101,36 @@ When `DATABASE_HOST` is set, the gateway constructs the connection string from t
 |---|---|---|
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | _(none)_ | OTLP gRPC endpoint for exporting metrics (e.g., `http://otel-collector:4317`). When set, all metric instruments are exported via gRPC every 60 seconds alongside the Prometheus scrape endpoint. See `docs/metrics.md` for the full metric list. |
 
+## Client-Side Environment Variables
+
+These variables are set in the **client's shell** (not the gateway process). The standard CCAG setup flow exports them automatically via `proxy_login.sh` (the `apiKeyHelper` script installed by the Connect page). You do not normally need to set them manually.
+
+| Variable | Value | Description |
+|---|---|---|
+| `CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY` | `1` | Instructs Claude Code to query the gateway's `/v1/models` endpoint for the model picker, instead of using CC's hardcoded model list. Set automatically by `proxy_login.sh` on every invocation (before any early-return path, so it is always exported regardless of whether a cached token is reused or a fresh browser login occurs). Required for `[1m]` suffix variants to appear in `/model`. |
+
+### 1M context window
+
+CCAG supports Claude Code's 1M-context model variants via the `[1m]` suffix convention (e.g., `claude-opus-4-7[1m]`).
+
+**How it works end-to-end:**
+
+1. **Advertising.** `/v1/models` emits a paired `<model-id>[1m]` entry (display name appended with `(1M context)`) for any Bedrock inference profile where the `context-1m-2025-08-07` beta has been confirmed supported. With `CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1` set, CC's model picker shows these variants.
+
+2. **Auto-discovery.** The gateway health loop probes each `(profile, beta)` pair with a synthetic 1-token `InvokeModel` call every 24 hours. A 200 response marks the pair as supported; a `ValidationException` whose message names the beta marks it unsupported. Throttle/5xx responses are ignored and retried on the next tick. No operator configuration is required.
+
+3. **Opportunistic learning.** When a real user request succeeds with a beta that had no cache entry, the gateway records it as supported. When Bedrock rejects a request naming specific betas, those betas are recorded as unsupported, the rejected betas are stripped, and the request is retried once automatically. This means a single `(profile, beta)` pair absorbs at most one round-trip penalty per 24-hour window.
+
+4. **Self-healing.** If Bedrock changes which betas it accepts on a model — a beta promoted to GA starts returning a 400, or a new model starts accepting a beta — the cache corrects itself on the next health-loop tick or the next rejected request. No gateway binary release is required.
+
+5. **Admin override.** Operators can force a `(endpoint, profile, beta) → supported` value via `ccag betas override` (see Tasks 7–8). Overrides persist across restarts and ignore the 24-hour TTL. Use as an escape hatch when the learned value is wrong (transient Bedrock error misclassified as unsupported, new beta before the parser recognizes the format, etc.).
+
+**Bootstrap window.** After a gateway restart, the capability cache is empty. The first health-loop tick completes within seconds and populates entries. During that window, no `[1m]` variants are advertised by `/v1/models`, and betas are forwarded optimistically on real requests (with rejection-retry protection).
+
+**No operator maintenance.** Self-deployers do not need a new CCAG binary release when Anthropic ships a new beta header that Bedrock accepts, or when AWS launches a new 1M-capable Claude model. The health-loop probe and rejection-learning paths handle both cases automatically.
+
+
+
 ### Pricing
 
 | Variable | Default | Description |

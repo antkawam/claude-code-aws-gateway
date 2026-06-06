@@ -66,7 +66,7 @@ docs/
 - **Presents as Anthropic Direct API**: Set `ANTHROPIC_BASE_URL` (NOT `CLAUDE_CODE_USE_BEDROCK`)
 - **Model ID mapping**: Auto-detected from AWS SDK region. See `config/mod.rs`
 - **Model availability**: `/v1/models` returns dynamically discovered models from Bedrock `ListInferenceProfiles` (filtered by routing prefix). Health loop caches per-endpoint availability every 60s. Requests are blocked with a clear error if the model isn't available on the user's team endpoints. See `endpoint/mod.rs`, `api/handlers.rs`
-- **Beta flag allowlist**: Only forward betas Bedrock accepts. See `translate/models.rs`
+- **Beta flags**: forwarded if cache shows (profile, beta) supported. Cache is populated by health-loop probes (24h TTL), opportunistic learning on successful requests, and rejection-parsing on Bedrock ValidationException (with a single-retry-without-rejected-beta). No hardcoded allowlist. Admin override via `ccag betas override`. See spec `1m-context-support`.
 - **Auth**: Virtual keys (DB cache) + OIDC JWT (multi-IDP) + gateway session tokens + SCIM 2.0 provisioning
 - **Web search**: Intercepts `web_search` tool, executes via DuckDuckGo. See `websearch/mod.rs`
 - **Cache invalidation**: Polling `cache_version` table every 5s
@@ -103,7 +103,7 @@ Full list: see `docs/configuration.md`
 - `cache_control` is sanitized before forwarding to Bedrock (only `type` and `ttl` fields are kept; unknown fields like `scope` are stripped)
 - `amazon-bedrock-invocationMetrics` must be stripped from SSE events
 - Inference profiles are mandatory for newer Claude models (4.5+)
-- Beta flags: ALLOWLIST approach (only forward betas Bedrock accepts)
+- Beta flags: forwarded if cache shows (profile, beta) supported. Cache is populated by health-loop probes (24h TTL), opportunistic learning on successful requests, and rejection-parsing on Bedrock ValidationException (with a single-retry-without-rejected-beta). No hardcoded allowlist. Admin override via `ccag betas override`. See spec `1m-context-support`.
 - Bedrock SDK `Display` impl is terse. Use `Debug` format for error messages.
 - `ListInferenceProfiles` returns ALL region profiles (us., eu., global.) regardless of calling region — filter by routing prefix before caching
 
