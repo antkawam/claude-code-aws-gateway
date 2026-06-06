@@ -39,7 +39,10 @@ pub async fn list_all(pool: &PgPool) -> Result<Vec<BetaOverride>, sqlx::Error> {
 }
 
 /// List all beta overrides for a specific endpoint.
-pub async fn list_for_endpoint(pool: &PgPool, endpoint_id: Uuid) -> Result<Vec<BetaOverride>, sqlx::Error> {
+pub async fn list_for_endpoint(
+    pool: &PgPool,
+    endpoint_id: Uuid,
+) -> Result<Vec<BetaOverride>, sqlx::Error> {
     sqlx::query_as::<_, BetaOverride>(
         "SELECT endpoint_id, profile_id, beta_name, supported, set_at, set_by, reason \
          FROM beta_overrides \

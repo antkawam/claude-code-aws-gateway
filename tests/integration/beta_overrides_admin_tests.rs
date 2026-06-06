@@ -137,7 +137,10 @@ async fn create_fixture_endpoint(pool: &sqlx::PgPool, name: &str) -> Uuid {
 // we call `load_endpoints` on it after the endpoint is in the DB.
 // ---------------------------------------------------------------------------
 
-async fn build_app_with_endpoint(pool: &sqlx::PgPool, ep_name: &str) -> (axum::Router, String, Uuid, Arc<ccag::proxy::GatewayState>) {
+async fn build_app_with_endpoint(
+    pool: &sqlx::PgPool,
+    ep_name: &str,
+) -> (axum::Router, String, Uuid, Arc<ccag::proxy::GatewayState>) {
     use std::sync::atomic::AtomicI64;
 
     let ep_id = create_fixture_endpoint(pool, ep_name).await;
@@ -279,7 +282,9 @@ async fn list_returns_all_overrides_admin_only() {
         .await
         .unwrap();
     let json: serde_json::Value = serde_json::from_slice(&resp_body).unwrap();
-    let overrides = json["overrides"].as_array().expect("response must have 'overrides' array");
+    let overrides = json["overrides"]
+        .as_array()
+        .expect("response must have 'overrides' array");
     assert_eq!(overrides.len(), 1, "should return 1 override");
     assert_eq!(overrides[0]["profile_id"], "us.anthropic.claude-opus-4-7");
     assert_eq!(overrides[0]["beta_name"], "context-1m-2025-08-07");
@@ -431,7 +436,11 @@ async fn upsert_with_supported_false_caches_in_memory_as_false() {
         .await
         .unwrap();
 
-    assert_eq!(resp.status(), StatusCode::OK, "upsert supported=false should return 200");
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "upsert supported=false should return 200"
+    );
 
     // DB must have supported=false
     let db_rows = db::beta_overrides::list_for_endpoint(&pool, ep_id)
@@ -462,8 +471,7 @@ async fn upsert_with_supported_false_caches_in_memory_as_false() {
 #[tokio::test]
 async fn upsert_admin_override_wins_over_existing_seedprobe() {
     let pool = helpers::setup_test_db().await;
-    let (app, admin_token, ep_id, state) =
-        build_app_with_endpoint(&pool, "ep-override-wins").await;
+    let (app, admin_token, ep_id, state) = build_app_with_endpoint(&pool, "ep-override-wins").await;
 
     let profile = "us.anthropic.claude-opus-4-7";
     let beta = "context-1m-2025-08-07";
@@ -474,7 +482,9 @@ async fn upsert_admin_override_wins_over_existing_seedprobe() {
         .get_client(ep_id)
         .await
         .expect("endpoint must be in pool");
-    client.mark_supported(profile, beta, ProbeSource::SeedProbe).await;
+    client
+        .mark_supported(profile, beta, ProbeSource::SeedProbe)
+        .await;
 
     // Verify the seed-probe entry is there
     assert_eq!(
@@ -535,8 +545,7 @@ async fn upsert_admin_override_wins_over_existing_seedprobe() {
 #[tokio::test]
 async fn delete_removes_db_row_and_in_memory_cache() {
     let pool = helpers::setup_test_db().await;
-    let (app, admin_token, ep_id, state) =
-        build_app_with_endpoint(&pool, "ep-delete-cache").await;
+    let (app, admin_token, ep_id, state) = build_app_with_endpoint(&pool, "ep-delete-cache").await;
 
     let profile = "us.anthropic.claude-opus-4-7";
     let beta = "context-1m-2025-08-07";
@@ -563,10 +572,16 @@ async fn delete_removes_db_row_and_in_memory_cache() {
         )
         .await
         .unwrap();
-    assert_eq!(resp.status(), StatusCode::OK, "upsert before delete should succeed");
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "upsert before delete should succeed"
+    );
 
     // Verify it's in DB and cache
-    let rows = db::beta_overrides::list_for_endpoint(&pool, ep_id).await.unwrap();
+    let rows = db::beta_overrides::list_for_endpoint(&pool, ep_id)
+        .await
+        .unwrap();
     assert_eq!(rows.len(), 1, "sanity: DB row exists before delete");
 
     let client = state
@@ -583,10 +598,7 @@ async fn delete_removes_db_row_and_in_memory_cache() {
     // Now: DELETE via admin API
     // URL encoding: profile_id and beta_name are path segments; they may contain dots
     // (which are valid in URL paths) but the router must handle them as-is.
-    let delete_uri = format!(
-        "/admin/beta-overrides/{}/{}/{}",
-        ep_id, profile, beta
-    );
+    let delete_uri = format!("/admin/beta-overrides/{}/{}/{}", ep_id, profile, beta);
 
     let resp = app
         .clone()
@@ -608,14 +620,15 @@ async fn delete_removes_db_row_and_in_memory_cache() {
     );
 
     // DB row must be gone
-    let rows_after = db::beta_overrides::list_for_endpoint(&pool, ep_id).await.unwrap();
+    let rows_after = db::beta_overrides::list_for_endpoint(&pool, ep_id)
+        .await
+        .unwrap();
     assert_eq!(rows_after.len(), 0, "DB row must be deleted");
 
     // In-memory cache must return None (forget_capability removes the entry)
     let cached_after = client.is_beta_supported(profile, beta).await;
     assert_eq!(
-        cached_after,
-        None,
+        cached_after, None,
         "is_beta_supported must return None after the override is deleted"
     );
 }
@@ -662,8 +675,8 @@ async fn delete_404_for_nonexistent() {
     let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
         .await
         .unwrap();
-    let json: serde_json::Value = serde_json::from_slice(&body)
-        .expect("DELETE 404 response must be valid JSON");
+    let json: serde_json::Value =
+        serde_json::from_slice(&body).expect("DELETE 404 response must be valid JSON");
     assert!(
         json["error"].is_object(),
         "DELETE 404 response must have 'error' object, got: {json}"
@@ -725,8 +738,8 @@ async fn upsert_validates_endpoint_exists() {
     let body_bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
         .await
         .unwrap();
-    let json: serde_json::Value = serde_json::from_slice(&body_bytes)
-        .expect("404 response body must be valid JSON");
+    let json: serde_json::Value =
+        serde_json::from_slice(&body_bytes).expect("404 response body must be valid JSON");
     assert!(
         json["error"].is_object(),
         "404 response must contain 'error' object, got: {json}"
@@ -768,16 +781,15 @@ async fn forget_capability_removes_entry_from_cache() {
     let endpoints = vec![ep.clone()];
     pool.load_endpoints(endpoints, &aws_config).await;
 
-    let client = pool
-        .get_client(ep.id)
-        .await
-        .expect("client must be loaded");
+    let client = pool.get_client(ep.id).await.expect("client must be loaded");
 
     let profile = "us.anthropic.claude-opus-4-7";
     let beta = "context-1m-2025-08-07";
 
     // Pre-populate cache
-    client.mark_supported(profile, beta, ProbeSource::AdminOverride).await;
+    client
+        .mark_supported(profile, beta, ProbeSource::AdminOverride)
+        .await;
     assert_eq!(
         client.is_beta_supported(profile, beta).await,
         Some(true),

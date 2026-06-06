@@ -31,7 +31,12 @@ async fn create_fixture_endpoint(pool: &sqlx::PgPool, name: &str) -> Uuid {
 // Helper: build a BetaOverride value for a given endpoint
 // ---------------------------------------------------------------------------
 
-fn make_override(endpoint_id: Uuid, profile_id: &str, beta_name: &str, supported: bool) -> BetaOverride {
+fn make_override(
+    endpoint_id: Uuid,
+    profile_id: &str,
+    beta_name: &str,
+    supported: bool,
+) -> BetaOverride {
     BetaOverride {
         endpoint_id,
         profile_id: profile_id.to_string(),
@@ -128,7 +133,12 @@ async fn upsert_inserts_new_row() {
     let pool = helpers::setup_test_db().await;
     let ep_id = create_fixture_endpoint(&pool, "ep-upsert-new").await;
 
-    let ovr = make_override(ep_id, "us.anthropic.claude-opus-4-7", "context-1m-2025-08-07", true);
+    let ovr = make_override(
+        ep_id,
+        "us.anthropic.claude-opus-4-7",
+        "context-1m-2025-08-07",
+        true,
+    );
     db::beta_overrides::upsert(&pool, &ovr)
         .await
         .expect("upsert should succeed");
@@ -156,7 +166,12 @@ async fn upsert_overwrites_existing() {
     let ep_id = create_fixture_endpoint(&pool, "ep-upsert-overwrite").await;
 
     // First upsert: supported = true
-    let ovr1 = make_override(ep_id, "us.anthropic.claude-opus-4-7", "context-1m-2025-08-07", true);
+    let ovr1 = make_override(
+        ep_id,
+        "us.anthropic.claude-opus-4-7",
+        "context-1m-2025-08-07",
+        true,
+    );
     db::beta_overrides::upsert(&pool, &ovr1)
         .await
         .expect("first upsert should succeed");
@@ -166,7 +181,12 @@ async fn upsert_overwrites_existing() {
         supported: false,
         set_by: "admin-2".to_string(),
         reason: None,
-        ..make_override(ep_id, "us.anthropic.claude-opus-4-7", "context-1m-2025-08-07", false)
+        ..make_override(
+            ep_id,
+            "us.anthropic.claude-opus-4-7",
+            "context-1m-2025-08-07",
+            false,
+        )
     };
     db::beta_overrides::upsert(&pool, &ovr2)
         .await
@@ -176,10 +196,23 @@ async fn upsert_overwrites_existing() {
         .await
         .expect("list_for_endpoint should succeed");
 
-    assert_eq!(rows.len(), 1, "upsert should produce exactly one row, not two");
-    assert!(!rows[0].supported, "second upsert (supported=false) must win");
-    assert_eq!(rows[0].set_by, "admin-2", "set_by should be from the second upsert");
-    assert!(rows[0].reason.is_none(), "reason should be None from second upsert");
+    assert_eq!(
+        rows.len(),
+        1,
+        "upsert should produce exactly one row, not two"
+    );
+    assert!(
+        !rows[0].supported,
+        "second upsert (supported=false) must win"
+    );
+    assert_eq!(
+        rows[0].set_by, "admin-2",
+        "set_by should be from the second upsert"
+    );
+    assert!(
+        rows[0].reason.is_none(),
+        "reason should be None from second upsert"
+    );
 }
 
 // ===========================================================================
@@ -194,14 +227,24 @@ async fn list_all_aggregates_across_endpoints() {
 
     db::beta_overrides::upsert(
         &pool,
-        &make_override(ep1, "us.anthropic.claude-opus-4-7", "context-1m-2025-08-07", true),
+        &make_override(
+            ep1,
+            "us.anthropic.claude-opus-4-7",
+            "context-1m-2025-08-07",
+            true,
+        ),
     )
     .await
     .expect("upsert ep1 override");
 
     db::beta_overrides::upsert(
         &pool,
-        &make_override(ep2, "eu.anthropic.claude-sonnet-4-7", "interleaved-thinking-2025-05-14", false),
+        &make_override(
+            ep2,
+            "eu.anthropic.claude-sonnet-4-7",
+            "interleaved-thinking-2025-05-14",
+            false,
+        ),
     )
     .await
     .expect("upsert ep2 override");
@@ -210,7 +253,11 @@ async fn list_all_aggregates_across_endpoints() {
         .await
         .expect("list_all should succeed");
 
-    assert_eq!(all.len(), 2, "list_all should return overrides for both endpoints");
+    assert_eq!(
+        all.len(),
+        2,
+        "list_all should return overrides for both endpoints"
+    );
 
     let ep1_row = all.iter().find(|r| r.endpoint_id == ep1);
     let ep2_row = all.iter().find(|r| r.endpoint_id == ep2);
@@ -258,7 +305,11 @@ async fn delete_removes_specific_row_only() {
         .await
         .expect("list_for_endpoint should succeed");
 
-    assert_eq!(remaining.len(), 2, "two overrides should remain after deleting one");
+    assert_eq!(
+        remaining.len(),
+        2,
+        "two overrides should remain after deleting one"
+    );
     let remaining_profiles: Vec<&str> = remaining.iter().map(|r| r.profile_id.as_str()).collect();
     assert!(
         remaining_profiles.contains(&"us.anthropic.claude-opus-4-7"),
@@ -311,7 +362,12 @@ async fn cascade_on_endpoint_delete() {
     // Insert an override for the endpoint
     db::beta_overrides::upsert(
         &pool,
-        &make_override(ep_id, "us.anthropic.claude-opus-4-7", "context-1m-2025-08-07", true),
+        &make_override(
+            ep_id,
+            "us.anthropic.claude-opus-4-7",
+            "context-1m-2025-08-07",
+            true,
+        ),
     )
     .await
     .expect("upsert should succeed before endpoint deletion");
@@ -320,7 +376,11 @@ async fn cascade_on_endpoint_delete() {
     let before = db::beta_overrides::list_for_endpoint(&pool, ep_id)
         .await
         .expect("list before delete");
-    assert_eq!(before.len(), 1, "sanity: override exists before endpoint deletion");
+    assert_eq!(
+        before.len(),
+        1,
+        "sanity: override exists before endpoint deletion"
+    );
 
     // Delete the endpoint — should cascade to beta_overrides
     db::endpoints::delete_endpoint(&pool, ep_id)
@@ -352,7 +412,12 @@ async fn set_at_defaults_to_now() {
     // The `upsert` implementation may use DEFAULT now() for set_at when the
     // caller's set_at is close to the current time. We simply pass Utc::now()
     // and verify the stored value is within ±5 seconds of now.
-    let ovr = make_override(ep_id, "us.anthropic.claude-opus-4-7", "context-1m-2025-08-07", true);
+    let ovr = make_override(
+        ep_id,
+        "us.anthropic.claude-opus-4-7",
+        "context-1m-2025-08-07",
+        true,
+    );
     db::beta_overrides::upsert(&pool, &ovr)
         .await
         .expect("upsert should succeed");

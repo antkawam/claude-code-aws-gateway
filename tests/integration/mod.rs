@@ -1,6 +1,7 @@
 pub mod admin_tests;
 pub mod beta_overrides_admin_tests;
 pub mod beta_overrides_db_tests;
+pub mod beta_overrides_replay_tests;
 pub mod budget_tests;
 pub mod db_tests;
 pub mod endpoint_tests;

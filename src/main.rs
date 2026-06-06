@@ -326,6 +326,12 @@ async fn main() -> anyhow::Result<()> {
             }
             Err(e) => tracing::warn!(%e, "Failed to load endpoints"),
         }
+
+        // Replay admin beta overrides into in-memory cache before serving traffic.
+        match ccag::apply_overrides_to_pool(&pool, &state.endpoint_pool).await {
+            Ok(count) => tracing::info!(count, "Boot: replayed beta overrides"),
+            Err(e) => tracing::warn!(%e, "Boot: failed to replay beta overrides"),
+        }
     }
 
     // Start cache version polling loop (5s interval)
@@ -932,6 +938,15 @@ fn start_cache_poll_loop(state: Arc<proxy::GatewayState>) {
                         tracing::debug!(count, "Reloaded endpoints");
                     }
                     Err(e) => tracing::warn!(%e, "Failed to reload endpoints"),
+                }
+
+                // Re-replay admin beta overrides so changes made via API on one
+                // replica propagate to all gateway replicas within the 5s poll window.
+                match ccag::apply_overrides_to_pool(pool, &state.endpoint_pool).await {
+                    Ok(n) => {
+                        tracing::debug!(n, "Re-replayed beta overrides after cache version bump")
+                    }
+                    Err(e) => tracing::warn!(%e, "Failed to re-replay beta overrides"),
                 }
 
                 // Reload settings

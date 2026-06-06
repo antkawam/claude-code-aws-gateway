@@ -4121,11 +4121,19 @@ pub async fn upsert_beta_override(
     if let Some(client) = state.endpoint_pool.get_client(req.endpoint_id).await {
         if ovr.supported {
             client
-                .mark_supported(&ovr.profile_id, &ovr.beta_name, crate::endpoint::ProbeSource::AdminOverride)
+                .mark_supported(
+                    &ovr.profile_id,
+                    &ovr.beta_name,
+                    crate::endpoint::ProbeSource::AdminOverride,
+                )
                 .await;
         } else {
             client
-                .mark_unsupported(&ovr.profile_id, &ovr.beta_name, crate::endpoint::ProbeSource::AdminOverride)
+                .mark_unsupported(
+                    &ovr.profile_id,
+                    &ovr.beta_name,
+                    crate::endpoint::ProbeSource::AdminOverride,
+                )
                 .await;
         }
     } else {
@@ -4134,6 +4142,9 @@ pub async fn upsert_beta_override(
             "upsert_beta_override: endpoint exists in DB but not in EndpointPool — in-memory cache not updated"
         );
     }
+
+    // Bump cache_version so other gateway replicas pick up the change within 5s.
+    let _ = db::settings::bump_cache_version(pool).await;
 
     Json(json!({
         "endpoint_id": ovr.endpoint_id,
@@ -4174,6 +4185,8 @@ pub async fn delete_beta_override(
             if let Some(client) = state.endpoint_pool.get_client(endpoint_id).await {
                 client.forget_capability(&profile_id, &beta_name).await;
             }
+            // Bump cache_version so other gateway replicas evict the override within 5s.
+            let _ = db::settings::bump_cache_version(pool).await;
             Json(json!({ "deleted": true })).into_response()
         }
         Err(e) => admin_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
