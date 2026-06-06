@@ -124,6 +124,12 @@ https://your-domain.com/portal          # CDK deployment
 
 For OIDC/SSO authentication (browser-based login, no static API keys), see [Authentication](authentication.md).
 
+### Recommended client environment
+
+The standard CCAG setup flow (via the Connect page or `proxy_login.sh`) automatically exports `CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1` into Claude Code's environment. With this flag set, CC's `/model` picker queries the gateway's `/v1/models` endpoint rather than using CC's hardcoded model list — which is what allows CCAG to surface the correct available models for your team's endpoints, including `[1m]` (1M context) variants for models where Bedrock has confirmed that capability. If you are configuring CC manually, set this variable before launching Claude Code.
+
+
+
 ## Verifying It Works
 
 ```bash

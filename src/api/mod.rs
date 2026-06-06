@@ -150,6 +150,13 @@ pub fn router(state: Arc<GatewayState>) -> Router {
             "/admin/endpoints/{endpoint_id}/default",
             put(admin::set_default_endpoint),
         )
+        // Admin API — Beta capability overrides
+        .route("/admin/beta-overrides", get(admin::list_beta_overrides))
+        .route("/admin/beta-overrides", post(admin::upsert_beta_override))
+        .route(
+            "/admin/beta-overrides/{endpoint_id}/{profile_id}/{beta_name}",
+            delete(admin::delete_beta_override),
+        )
         // Admin API — Bedrock
         .route("/admin/bedrock/validate", post(admin::validate_bedrock))
         .route("/admin/bedrock/quotas", get(admin::get_bedrock_quotas))

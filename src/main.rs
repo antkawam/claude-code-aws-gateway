@@ -326,6 +326,12 @@ async fn main() -> anyhow::Result<()> {
             }
             Err(e) => tracing::warn!(%e, "Failed to load endpoints"),
         }
+
+        // Replay admin beta overrides into in-memory cache before serving traffic.
+        match ccag::apply_overrides_to_pool(&pool, &state.endpoint_pool).await {
+            Ok(count) => tracing::info!(count, "Boot: replayed beta overrides"),
+            Err(e) => tracing::warn!(%e, "Boot: failed to replay beta overrides"),
+        }
     }
 
     // Start cache version polling loop (5s interval)
@@ -377,6 +383,10 @@ async fn main() -> anyhow::Result<()> {
                         .write()
                         .await;
                     *models = profile_ids;
+                    // TODO(1m-context): probe gateway default client too — currently relies on
+                    // per-endpoint clients. Default client has no EndpointClient, so it cannot
+                    // hold beta_capabilities state. Defer until we extract the cache to a shared
+                    // trait or add default_beta_capabilities to EndpointPool.
                 }
 
                 if ok != was_healthy {
@@ -415,8 +425,85 @@ async fn main() -> anyhow::Result<()> {
                                     .map(|p| p.inference_profile_id().to_string())
                                     .filter(|id| id.starts_with(&prefix_dot))
                                     .collect();
+                                // Snapshot profiles for seed probing before releasing the lock.
+                                let profiles_snapshot = profile_ids.clone();
                                 let mut models = client.available_models.write().await;
                                 *models = profile_ids;
+                                drop(models);
+
+                                // ── 1M context seed probe step ──────────────────────────
+                                // For each (profile, beta) pair that is absent or expired,
+                                // fire a synthetic 1-token InvokeModel to learn whether
+                                // the beta is supported on this endpoint.
+                                // Probes are sequenced sequentially (no join_all) — the
+                                // total load is bounded by |profiles| × |SUFFIX_BETA_MAP|.
+                                let pairs = client.expired_seed_pairs(&profiles_snapshot).await;
+                                for (profile, beta) in &pairs {
+                                    // Build Bedrock request body directly — NOT via translate().
+                                    let probe_body = format!(
+                                        r#"{{"anthropic_version":"bedrock-2023-05-31","anthropic_beta":["{beta}"],"max_tokens":1,"messages":[{{"role":"user","content":"hi"}}]}}"#
+                                    );
+                                    let probe_result = client
+                                        .runtime_client
+                                        .invoke_model()
+                                        .model_id(profile)
+                                        .content_type("application/json")
+                                        .accept("application/json")
+                                        .body(aws_sdk_bedrockruntime::primitives::Blob::new(
+                                            probe_body.into_bytes(),
+                                        ))
+                                        .send()
+                                        .await;
+
+                                    let (success, is_validation_exception, error_message) =
+                                        match probe_result {
+                                            Ok(_) => (true, false, String::new()),
+                                            Err(ref sdk_err) => {
+                                                use aws_sdk_bedrockruntime::error::SdkError;
+                                                let err_str = format!("{sdk_err:?}");
+                                                let is_ve = matches!(
+                                                    sdk_err,
+                                                    SdkError::ServiceError(svc)
+                                                    if svc.err().is_validation_exception()
+                                                );
+                                                (false, is_ve, err_str)
+                                            }
+                                        };
+
+                                    let outcome = ccag::endpoint::classify_probe_outcome(
+                                        success,
+                                        is_validation_exception,
+                                        &error_message,
+                                        beta,
+                                    );
+
+                                    if !success
+                                        && matches!(
+                                            outcome,
+                                            ccag::endpoint::ProbeOutcome::Inconclusive
+                                        )
+                                    {
+                                        tracing::warn!(
+                                            profile = %profile,
+                                            beta = %beta,
+                                            err = %error_message,
+                                            "1m_probe failed to invoke (inconclusive)"
+                                        );
+                                    }
+
+                                    tracing::info!(
+                                        profile = %profile,
+                                        beta = %beta,
+                                        outcome = ?outcome,
+                                        "1m_probe outcome"
+                                    );
+
+                                    ccag::endpoint::apply_probe_outcome(
+                                        client, profile, beta, outcome,
+                                    )
+                                    .await;
+                                }
+
                                 true
                             }
                             Err(_) => false,
@@ -851,6 +938,15 @@ fn start_cache_poll_loop(state: Arc<proxy::GatewayState>) {
                         tracing::debug!(count, "Reloaded endpoints");
                     }
                     Err(e) => tracing::warn!(%e, "Failed to reload endpoints"),
+                }
+
+                // Re-replay admin beta overrides so changes made via API on one
+                // replica propagate to all gateway replicas within the 5s poll window.
+                match ccag::apply_overrides_to_pool(pool, &state.endpoint_pool).await {
+                    Ok(n) => {
+                        tracing::debug!(n, "Re-replayed beta overrides after cache version bump")
+                    }
+                    Err(e) => tracing::warn!(%e, "Failed to re-replay beta overrides"),
                 }
 
                 // Reload settings

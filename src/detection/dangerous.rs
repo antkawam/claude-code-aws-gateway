@@ -206,6 +206,7 @@ mod tests {
             top_p: None,
             top_k: None,
             mcp_servers: None,
+            anthropic_beta: vec![],
         }
     }
 

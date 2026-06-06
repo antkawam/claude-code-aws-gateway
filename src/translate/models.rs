@@ -292,7 +292,25 @@ pub async fn discover_model(
 /// profile IDs using the configured region prefix.
 ///
 /// Checks the dynamic cache first, falls back to hardcoded mappings.
+///
+/// **Suffix stripping (Slice 4):** if the model ID ends with `[\w+]` (e.g. `[1m]`,
+/// `[2m]`, `[batch]`, `[v2_0]`), that suffix is stripped before all other logic.
+/// The suffix is discarded — no beta is auto-injected here. Capability for any
+/// specific suffix is determined at the `/v1/models` advertising layer via
+/// `SUFFIX_BETA_MAP` (defined in `src/endpoint/mod.rs`).
 pub fn anthropic_to_bedrock(model: &str, prefix: &str, model_cache: Option<&ModelCache>) -> String {
+    // Strip trailing [\w+] suffix (e.g. [1m], [2m], [batch], [v2_0]) before any
+    // other logic. Compiled once via OnceLock.
+    static SUFFIX_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let re = SUFFIX_RE.get_or_init(|| regex::Regex::new(r"\[\w+\]$").unwrap());
+    let model_owned;
+    let model: &str = if re.is_match(model) {
+        model_owned = re.replace(model, "").into_owned();
+        &model_owned
+    } else {
+        model
+    };
+
     // If it already looks like a Bedrock ID (contains a dot prefix), pass through
     if model.contains('.') {
         return model.to_string();
@@ -1125,6 +1143,154 @@ mod tests {
         assert_eq!(
             profile_prefix, "malformed-profile-id",
             "profile_prefix fallback: entire string when no dot found"
+        );
+    }
+}
+
+/// Task 4 — Generic `[\w+]` suffix stripping in `anthropic_to_bedrock`.
+///
+/// The function must strip a trailing `[\w+]` (regex `\[\w+\]$`) from the
+/// model ID before all other logic (dot-passthrough check, cache lookup,
+/// hardcoded match, discovery fallback).
+///
+/// The suffix is silently discarded — it is not used to inject betas.
+/// That remains the responsibility of the client (CC sends the beta header;
+/// the gateway forwards it via the Slice 3 mechanism).
+#[cfg(test)]
+mod tests_t4_suffix_strip {
+    use super::*;
+
+    /// T4-1: `[1m]` suffix is stripped; result equals the bare Bedrock ID.
+    /// `claude-opus-4-7[1m]` → same as `claude-opus-4-7` (hardcoded mapping).
+    #[test]
+    fn strips_1m_suffix_from_anthropic_id() {
+        let with_suffix = anthropic_to_bedrock("claude-opus-4-7[1m]", "us", None);
+        let bare = anthropic_to_bedrock("claude-opus-4-7", "us", None);
+        assert_eq!(
+            with_suffix, bare,
+            "anthropic_to_bedrock must strip [1m] and produce the same result as the bare ID"
+        );
+        assert_eq!(
+            with_suffix, "us.anthropic.claude-opus-4-7",
+            "stripped [1m] from claude-opus-4-7 should map to us.anthropic.claude-opus-4-7"
+        );
+    }
+
+    /// T4-2: `[2m]` suffix is stripped generically — no validation at this layer.
+    /// The regex strips any `[\w+]` regardless of whether the suffix is in SUFFIX_BETA_MAP.
+    #[test]
+    fn strips_2m_suffix_generically() {
+        let with_suffix = anthropic_to_bedrock("claude-opus-4-7[2m]", "us", None);
+        let bare = anthropic_to_bedrock("claude-opus-4-7", "us", None);
+        assert_eq!(
+            with_suffix, bare,
+            "anthropic_to_bedrock must strip [2m] generically (no validation against SUFFIX_BETA_MAP)"
+        );
+        assert_eq!(with_suffix, "us.anthropic.claude-opus-4-7");
+    }
+
+    /// T4-3: Alphabetic suffix `[batch]` is stripped.
+    #[test]
+    fn strips_alphanumeric_suffix() {
+        let with_suffix = anthropic_to_bedrock("claude-opus-4-7[batch]", "us", None);
+        let bare = anthropic_to_bedrock("claude-opus-4-7", "us", None);
+        assert_eq!(
+            with_suffix, bare,
+            "anthropic_to_bedrock must strip [batch] suffix"
+        );
+    }
+
+    /// T4-4: Underscore suffix `[v2_0]` is stripped.
+    /// `\w+` matches `[a-zA-Z0-9_]+`, so underscores are valid inside the brackets.
+    #[test]
+    fn strips_underscore_suffix() {
+        let with_suffix = anthropic_to_bedrock("claude-opus-4-7[v2_0]", "us", None);
+        let bare = anthropic_to_bedrock("claude-opus-4-7", "us", None);
+        assert_eq!(
+            with_suffix, bare,
+            "anthropic_to_bedrock must strip [v2_0] suffix (underscore is valid \\w)"
+        );
+    }
+
+    /// T4-5: Suffix on an already-Bedrock-style ID (`us.anthropic.claude-opus-4-7[1m]`).
+    ///
+    /// The dot-passthrough check runs AFTER the strip, so:
+    ///   1. Strip `[1m]` → `us.anthropic.claude-opus-4-7`
+    ///   2. Contains dot → passthrough → `us.anthropic.claude-opus-4-7`
+    ///
+    /// Result equals the bare Bedrock ID with no suffix.
+    #[test]
+    fn strips_suffix_on_bedrock_style_id() {
+        let with_suffix = anthropic_to_bedrock("us.anthropic.claude-opus-4-7[1m]", "us", None);
+        assert_eq!(
+            with_suffix, "us.anthropic.claude-opus-4-7",
+            "strip must run before the dot-passthrough check so Bedrock-style IDs with suffix also work"
+        );
+    }
+
+    /// T4-6: No suffix on an unknown/future model ID — behavior unchanged.
+    /// `claude-future-9-9` has no hardcoded mapping and no cache, so it passes
+    /// through the `other =>` arm and is returned dotless (for discovery).
+    #[test]
+    fn no_suffix_unchanged_unknown_model() {
+        let result = anthropic_to_bedrock("claude-future-9-9", "us", None);
+        assert_eq!(
+            result, "claude-future-9-9",
+            "Unknown model without suffix must still pass through dotless (discovery path)"
+        );
+    }
+
+    /// T4-7: No suffix on a known model — existing hardcoded mapping is unaffected.
+    #[test]
+    fn no_suffix_unchanged_known_model() {
+        let result = anthropic_to_bedrock("claude-sonnet-4-6-20250514", "us", None);
+        assert_eq!(
+            result, "us.anthropic.claude-sonnet-4-6",
+            "Existing hardcoded mapping must be unaffected after adding strip logic"
+        );
+    }
+
+    /// T4-8: Empty brackets `[]` must NOT be stripped.
+    /// The regex `\[\w+\]$` requires at least one word character inside brackets.
+    /// `claude-opus-4-7[]` has no known hardcoded mapping, so it passes through
+    /// the `other =>` arm and is returned verbatim (dotless pass-through).
+    ///
+    /// This is defensive: we don't want accidental stripping of model IDs that
+    /// happen to end with `[]`.
+    #[test]
+    fn empty_brackets_not_stripped() {
+        let result = anthropic_to_bedrock("claude-opus-4-7[]", "us", None);
+        // `[]` does NOT match `\[\w+\]$` — the empty bracket falls to `other =>` arm
+        // and is returned verbatim (dotless). This is intentional: `[]` is not a
+        // valid suffix per the spec; `\w+` requires ≥1 word char.
+        assert_eq!(
+            result, "claude-opus-4-7[]",
+            "Empty brackets [] must NOT be stripped (\\w+ requires ≥1 char)"
+        );
+    }
+
+    /// T4-9: Unbalanced brackets (missing close) must NOT be stripped.
+    /// `claude-opus-4-7[1m` has no closing `]`, so the regex does not match.
+    /// Falls through to `other =>` arm and is returned verbatim.
+    #[test]
+    fn unbalanced_brackets_not_stripped() {
+        let result = anthropic_to_bedrock("claude-opus-4-7[1m", "us", None);
+        assert_eq!(
+            result, "claude-opus-4-7[1m",
+            "Missing close bracket must NOT be stripped"
+        );
+    }
+
+    /// T4-10: Bracket not at end-of-string must NOT be stripped.
+    /// `claude[1m]-opus-4-7` — the `[1m]` is mid-string, not at the end.
+    /// The regex is anchored with `$`, so this must not match.
+    /// Falls through to `other =>` arm and is returned verbatim.
+    #[test]
+    fn bracket_not_at_end_not_stripped() {
+        let result = anthropic_to_bedrock("claude[1m]-opus-4-7", "us", None);
+        assert_eq!(
+            result, "claude[1m]-opus-4-7",
+            "Bracket not at end of string must NOT be stripped (regex is end-anchored)"
         );
     }
 }

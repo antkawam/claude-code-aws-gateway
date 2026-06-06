@@ -15,9 +15,10 @@ use uuid::Uuid;
 use crate::auth::CachedKey;
 use crate::auth::oidc::OidcIdentity;
 use crate::db::spend::RequestLogEntry;
+use crate::endpoint::{EndpointClient, ProbeSource, SUFFIX_BETA_MAP};
 use crate::proxy::GatewayState;
 use crate::telemetry::Metrics;
-use crate::translate::{models, request, response, streaming};
+use crate::translate::{betas as beta_filter, models, request, response, streaming};
 use crate::websearch;
 
 /// RAII guard that decrements the in-flight request counter on drop.
@@ -42,6 +43,21 @@ impl Drop for InFlightGuard {
 enum AuthResult {
     VirtualKey(CachedKey),
     Oidc(OidcIdentity),
+}
+
+/// Context passed to `handle_non_streaming` / `handle_streaming` so they can
+/// perform opportunistic beta-capability learning and retry-on-rejection.
+struct BetaRetryContext {
+    /// The endpoint client whose capability cache should be updated.
+    endpoint_client: Arc<EndpointClient>,
+    /// Bedrock profile ID used as the cache key (e.g. `us.anthropic.claude-opus-4-7`).
+    profile: String,
+    /// Forwarded betas whose cache state was `None` at filter time.
+    /// On HTTP 200 these are marked `(profile, beta) → true` via `RequestSuccess`.
+    unknown_betas: Vec<String>,
+    /// All betas that were forwarded in this request.
+    /// Used to match against Bedrock's `ValidationException` error message.
+    forwarded_betas: Vec<String>,
 }
 
 /// Identity extracted from auth for spend tracking.
@@ -110,26 +126,91 @@ fn model_display_name(anthropic_id: &str) -> String {
     }
 }
 
-/// Build the JSON model list response from a slice of Anthropic model IDs.
-fn build_models_response(anthropic_ids: &[String]) -> serde_json::Value {
-    let data: Vec<serde_json::Value> = anthropic_ids
-        .iter()
-        .map(|id| {
-            let display = model_display_name(id);
-            json!({
-                "id": id,
-                "display_name": display,
-                "type": "model",
-                "created_at": "2025-01-01T00:00:00Z",
-            })
-        })
-        .collect();
+/// Build the `/v1/models` JSON response, including suffix variants for models
+/// whose Bedrock profiles have a supported beta capability in the cache.
+///
+/// Parameters:
+/// - `pairs`: (anthropic_id, bedrock_profile_id) pairs, one per available profile.
+///   May contain duplicate anthropic_ids (e.g. same model on multiple profile prefixes);
+///   deduplication is applied to bare entries and to variant entries independently.
+/// - `capability_lookup`: pre-snapshotted closure. Callers `.await` the cache snapshot
+///   in async land, then pass an owned closure to this sync helper.
+///   - Some(true)  → beta supported on that profile → emit variant
+///   - Some(false) → not supported → no variant
+///   - None        → cache absent or TTL expired → no variant (bootstrap safety)
+/// - `suffix_map`: (suffix, beta_name, display_suffix) tuples. Production caller passes
+///   `crate::endpoint::SUFFIX_BETA_MAP`. Tests pass synthetic slices.
+///
+/// Output sort order: all bare entries first (alphabetic by id), then all suffix
+/// variants (alphabetic by id). first_id and last_id reflect the resulting data.
+pub(crate) fn build_models_response_with_variants(
+    pairs: &[(String, String)],
+    capability_lookup: impl Fn(&str, &str) -> Option<bool>,
+    suffix_map: &[(&str, &str, &str)],
+) -> serde_json::Value {
+    let mut bare_set: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut variant_set: std::collections::HashSet<String> = std::collections::HashSet::new();
+    // Map from variant id → display_name, populated during collection
+    let mut variant_display: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
+
+    for (anthropic_id, bedrock_profile_id) in pairs {
+        // Always include the bare entry
+        bare_set.insert(anthropic_id.clone());
+
+        // Check each suffix mapping
+        for &(suffix, beta_name, display_suffix) in suffix_map {
+            if capability_lookup(bedrock_profile_id, beta_name) == Some(true) {
+                let variant_id = format!("{anthropic_id}{suffix}");
+                if !variant_set.contains(&variant_id) {
+                    let bare_display = model_display_name(anthropic_id);
+                    let variant_display_name = format!("{bare_display} ({display_suffix})");
+                    variant_display.insert(variant_id.clone(), variant_display_name);
+                    variant_set.insert(variant_id);
+                }
+            }
+        }
+    }
+
+    // Sort bare entries alphabetically
+    let mut bare_ids: Vec<String> = bare_set.into_iter().collect();
+    bare_ids.sort();
+
+    // Sort variant entries alphabetically
+    let mut variant_ids: Vec<String> = variant_set.into_iter().collect();
+    variant_ids.sort();
+
+    // Build data: bare entries first, then variant entries
+    let mut data: Vec<serde_json::Value> = Vec::new();
+
+    for id in &bare_ids {
+        let display = model_display_name(id);
+        data.push(json!({
+            "id": id,
+            "display_name": display,
+            "type": "model",
+            "created_at": "2025-01-01T00:00:00Z",
+        }));
+    }
+
+    for id in &variant_ids {
+        let display = variant_display
+            .get(id)
+            .cloned()
+            .unwrap_or_else(|| model_display_name(id));
+        data.push(json!({
+            "id": id,
+            "display_name": display,
+            "type": "model",
+            "created_at": "2025-01-01T00:00:00Z",
+        }));
+    }
 
     json!({
         "data": data,
         "has_more": false,
-        "first_id": data.first().map(|m| m["id"].as_str().unwrap_or("")),
-        "last_id": data.last().map(|m| m["id"].as_str().unwrap_or("")),
+        "first_id": data.first().and_then(|m| m["id"].as_str()),
+        "last_id": data.last().and_then(|m| m["id"].as_str()),
     })
 }
 
@@ -168,20 +249,62 @@ pub async fn list_models(State(state): State<Arc<GatewayState>>) -> Response {
             .into_response();
     }
 
-    // Map each Bedrock profile ID to Anthropic format, then deduplicate
-    let mut seen = std::collections::HashSet::new();
-    let mut anthropic_ids: Vec<String> = bedrock_ids
+    // Build (anthropic_id, bedrock_profile_id) pairs, deduplicating by bedrock_id
+    // to avoid feeding the same bedrock profile twice (from default_available_models
+    // and per-client available_models which can overlap).
+    let mut seen_bedrock: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let pairs: Vec<(String, String)> = bedrock_ids
         .iter()
+        .filter(|bedrock_id| seen_bedrock.insert((*bedrock_id).clone()))
         .map(|bedrock_id| {
-            crate::translate::models::bedrock_to_anthropic(bedrock_id, Some(&state.model_cache))
+            let anthropic_id = crate::translate::models::bedrock_to_anthropic(
+                bedrock_id,
+                Some(&state.model_cache),
+            );
+            (anthropic_id, bedrock_id.clone())
         })
-        .filter(|id| seen.insert(id.clone()))
         .collect();
 
-    // Stable sort for deterministic output
-    anthropic_ids.sort();
+    // Snapshot beta capability data from all endpoint clients.
+    // Merge across endpoints: a (profile, beta) is "supported" if ANY endpoint says so.
+    let mut supported: std::collections::HashSet<(String, String)> =
+        std::collections::HashSet::new();
+    let mut seen_cap: std::collections::HashSet<(String, String)> =
+        std::collections::HashSet::new();
 
-    let response = build_models_response(&anthropic_ids);
+    for client in &clients {
+        // For each beta in the suffix map, check all profiles this endpoint advertises.
+        let profile_ids = client.available_models.read().await.clone();
+        for profile in &profile_ids {
+            for &(_suffix, beta, _display) in SUFFIX_BETA_MAP {
+                let key = (profile.clone(), beta.to_string());
+                match client.is_beta_supported(profile, beta).await {
+                    Some(true) => {
+                        supported.insert(key.clone());
+                        seen_cap.insert(key);
+                    }
+                    Some(false) => {
+                        seen_cap.insert(key);
+                    }
+                    None => {}
+                }
+            }
+        }
+    }
+
+    // Build sync capability closure capturing the snapshots.
+    let capability_lookup = move |profile: &str, beta: &str| -> Option<bool> {
+        let key = (profile.to_string(), beta.to_string());
+        if supported.contains(&key) {
+            Some(true)
+        } else if seen_cap.contains(&key) {
+            Some(false)
+        } else {
+            None
+        }
+    };
+
+    let response = build_models_response_with_variants(&pairs, capability_lookup, SUFFIX_BETA_MAP);
 
     (StatusCode::OK, Json(response)).into_response()
 }
@@ -547,7 +670,7 @@ pub async fn messages(
         .flatten()
         .unwrap_or_else(|| "enabled".to_string());
 
-    let (mut bedrock_model, bedrock_body, web_search_ctx) = request::translate(
+    let (mut bedrock_model, mut bedrock_body, web_search_ctx) = request::translate(
         body,
         &routing_prefix,
         Some(&state.model_cache),
@@ -597,6 +720,39 @@ pub async fn messages(
     if web_search_ctx.is_some() {
         tracing::info!(request_id = %request_id, "Web search tool detected, interception enabled");
     }
+
+    // ── Beta capability filtering ────────────────────────────────────────────
+    // Filter anthropic_beta through the per-endpoint capability cache.
+    // Betas the cache says Some(false) are dropped here to avoid a Bedrock
+    // ValidationException. Betas whose cache state is None are kept optimistically
+    // and tracked for opportunistic learning when the request succeeds.
+    //
+    // This block also builds BetaRetryContext for the handler to use when
+    // a ValidationException fires at runtime (parse, mark_unsupported, retry once).
+    let beta_retry_ctx: Option<BetaRetryContext> = if let Some(ref ep) = selected_endpoint {
+        let filter_result =
+            beta_filter::filter_betas_by_cache(ep, &bedrock_model, &bedrock_body.anthropic_beta)
+                .await;
+
+        if !filter_result.dropped.is_empty() {
+            tracing::info!(
+                request_id = %request_id,
+                dropped = ?filter_result.dropped,
+                "Dropped betas that cache records as unsupported"
+            );
+        }
+
+        let ctx = BetaRetryContext {
+            endpoint_client: Arc::clone(ep),
+            profile: bedrock_model.clone(),
+            unknown_betas: filter_result.unknown.clone(),
+            forwarded_betas: filter_result.kept.clone(),
+        };
+        bedrock_body.anthropic_beta = filter_result.kept;
+        Some(ctx)
+    } else {
+        None
+    };
 
     let body_bytes = match serde_json::to_vec(&bedrock_body) {
         Ok(b) => b,
@@ -716,6 +872,7 @@ pub async fn messages(
             ws_ctx,
             endpoint_id,
             &websearch_mode,
+            beta_retry_ctx,
         )
         .await
     } else if is_streaming {
@@ -730,6 +887,7 @@ pub async fn messages(
             req_info.clone(),
             start,
             endpoint_id,
+            beta_retry_ctx,
         )
         .await
     } else {
@@ -744,6 +902,7 @@ pub async fn messages(
             req_info.clone(),
             start,
             endpoint_id,
+            beta_retry_ctx,
         )
         .await
     };
@@ -791,6 +950,7 @@ pub async fn messages(
                         req_info.clone(),
                         start,
                         fb_endpoint_id,
+                        None, // no beta retry on failover — already retried on primary
                     )
                     .await
                 } else {
@@ -805,6 +965,7 @@ pub async fn messages(
                         req_info.clone(),
                         start,
                         fb_endpoint_id,
+                        None, // no beta retry on failover — already retried on primary
                     )
                     .await
                 };
@@ -1088,18 +1249,152 @@ async fn handle_non_streaming(
     req_info: RequestInfo,
     start: Instant,
     endpoint_id: Option<Uuid>,
+    beta_ctx: Option<BetaRetryContext>,
 ) -> Response {
     let result = runtime_client
         .invoke_model()
         .model_id(bedrock_model)
         .content_type("application/json")
         .accept("application/json")
-        .body(Blob::new(body_bytes))
+        .body(Blob::new(body_bytes.clone()))
         .send()
         .await;
 
+    // Check for ValidationException that names a known beta — retry once with those
+    // betas stripped, and mark them as unsupported in the capability cache.
+    let result = if let Err(ref e) = result {
+        use aws_sdk_bedrockruntime::error::SdkError;
+        let is_ve = matches!(e, SdkError::ServiceError(svc) if svc.err().is_validation_exception());
+        if is_ve && let Some(ref ctx) = beta_ctx {
+            let err_str = format!("{e:?}");
+            let rejected = beta_filter::parse_rejected_betas(&err_str, &ctx.forwarded_betas);
+            if !rejected.is_empty() {
+                tracing::info!(
+                    model = %bedrock_model,
+                    rejected = ?rejected,
+                    "ValidationException named betas — marking unsupported and retrying"
+                );
+                for beta in &rejected {
+                    ctx.endpoint_client
+                        .mark_unsupported(&ctx.profile, beta, ProbeSource::RequestRejection)
+                        .await;
+                }
+                // Rebuild body with rejected betas removed.
+                let retry_bytes =
+                    rebuild_body_without_betas(&body_bytes, &rejected).unwrap_or_default();
+                if retry_bytes.is_empty() {
+                    // Serialization failed — bubble original error.
+                } else {
+                    let retry_result = runtime_client
+                        .invoke_model()
+                        .model_id(bedrock_model)
+                        .content_type("application/json")
+                        .accept("application/json")
+                        .body(Blob::new(retry_bytes))
+                        .send()
+                        .await;
+                    // Return retry result regardless; if it also fails we bubble that.
+                    // Per spec: "if retry fails (any reason) → bubble the original Bedrock error".
+                    // We actually bubble the retry error here so the client gets a fresh message.
+                    // On success the unknown betas are NOT re-marked (we only had ctx.forwarded);
+                    // the remaining betas will be marked by the opportunistic path on Ok below.
+                    match retry_result {
+                        Ok(output) => {
+                            // Retry succeeded — opportunistically learn remaining unknown betas.
+                            let remaining_unknown: Vec<String> = ctx
+                                .unknown_betas
+                                .iter()
+                                .filter(|b| !rejected.contains(b))
+                                .cloned()
+                                .collect();
+                            for beta in &remaining_unknown {
+                                ctx.endpoint_client
+                                    .mark_supported(&ctx.profile, beta, ProbeSource::RequestSuccess)
+                                    .await;
+                            }
+                            // Process the successful retry response.
+                            let response_bytes = output.body().as_ref();
+                            return match serde_json::from_slice::<Value>(response_bytes) {
+                                Ok(resp) => {
+                                    let (input, output_tok, cache_read, cache_write, stop_reason) =
+                                        extract_response_metadata(&resp);
+                                    state.metrics.record_tokens(
+                                        original_model,
+                                        input as u64,
+                                        output_tok as u64,
+                                        cache_read as u64,
+                                        cache_write as u64,
+                                    );
+                                    state.metrics.record_tools(&req_info.tool_names);
+                                    state
+                                        .spend_tracker
+                                        .record(RequestLogEntry {
+                                            key_id: identity.key_id,
+                                            user_identity: identity.user_identity,
+                                            request_id,
+                                            model: original_model.to_string(),
+                                            streaming: false,
+                                            duration_ms: start.elapsed().as_millis() as i32,
+                                            input_tokens: input,
+                                            output_tokens: output_tok,
+                                            cache_read_tokens: cache_read,
+                                            cache_write_tokens: cache_write,
+                                            stop_reason,
+                                            tool_count: req_info.tool_count,
+                                            tool_names: req_info.tool_names,
+                                            turn_count: req_info.turn_count,
+                                            thinking_enabled: req_info.thinking_enabled,
+                                            has_system_prompt: req_info.has_system_prompt,
+                                            session_id: req_info.session_id,
+                                            project_key: req_info.project_key,
+                                            tool_errors: req_info.tool_errors,
+                                            has_correction: req_info.has_correction,
+                                            content_block_types: req_info.content_block_types,
+                                            system_prompt_hash: req_info.system_prompt_hash,
+                                            detection_flags: req_info.detection_flags,
+                                            endpoint_id,
+                                        })
+                                        .await;
+                                    let normalized = response::normalize_response(
+                                        resp,
+                                        original_model,
+                                        Some(&state.model_cache),
+                                    );
+                                    Json(normalized).into_response()
+                                }
+                                Err(e) => {
+                                    tracing::error!(%e, "Failed to parse Bedrock retry response");
+                                    error_response(
+                                        StatusCode::BAD_GATEWAY,
+                                        "api_error",
+                                        "Failed to parse upstream response",
+                                    )
+                                }
+                            };
+                        }
+                        Err(_) => {
+                            // Retry failed — fall through and bubble the original error.
+                        }
+                    }
+                }
+            }
+        }
+        result
+    } else {
+        result
+    };
+
     match result {
         Ok(output) => {
+            // Opportunistic learning: betas whose cache state was None are now known to work.
+            if let Some(ref ctx) = beta_ctx {
+                for beta in &ctx.unknown_betas {
+                    ctx.endpoint_client
+                        .mark_supported(&ctx.profile, beta, ProbeSource::RequestSuccess)
+                        .await;
+                }
+            }
+
             let response_bytes = output.body().as_ref();
             match serde_json::from_slice::<Value>(response_bytes) {
                 Ok(resp) => {
@@ -1199,6 +1494,24 @@ async fn handle_non_streaming(
     }
 }
 
+/// Strip the given `rejected_betas` from the `anthropic_beta` array in `body_bytes`.
+///
+/// Returns the re-serialized bytes, or `None` if the body can't be parsed.
+fn rebuild_body_without_betas(body_bytes: &[u8], rejected: &[String]) -> Option<Vec<u8>> {
+    let mut body: Value = serde_json::from_slice(body_bytes).ok()?;
+    if let Some(arr) = body
+        .get_mut("anthropic_beta")
+        .and_then(|v| v.as_array_mut())
+    {
+        arr.retain(|v| {
+            v.as_str()
+                .map(|s| !rejected.iter().any(|r| r == s))
+                .unwrap_or(true)
+        });
+    }
+    serde_json::to_vec(&body).ok()
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn handle_streaming(
     state: &GatewayState,
@@ -1211,17 +1524,89 @@ async fn handle_streaming(
     req_info: RequestInfo,
     start: Instant,
     endpoint_id: Option<Uuid>,
+    beta_ctx: Option<BetaRetryContext>,
 ) -> Response {
     let result = runtime_client
         .invoke_model_with_response_stream()
         .model_id(bedrock_model)
         .content_type("application/json")
-        .body(Blob::new(body_bytes))
+        .body(Blob::new(body_bytes.clone()))
         .send()
         .await;
 
+    // Check for ValidationException naming a known beta — retry once with those betas stripped.
+    let (result, beta_ctx) = if let Err(ref e) = result {
+        use aws_sdk_bedrockruntime::error::SdkError;
+        let is_ve = matches!(
+            e,
+            SdkError::ServiceError(svc) if svc.err().is_validation_exception()
+        );
+        if is_ve {
+            if let Some(ref ctx) = beta_ctx {
+                let err_str = format!("{e:?}");
+                let rejected = beta_filter::parse_rejected_betas(&err_str, &ctx.forwarded_betas);
+                if !rejected.is_empty() {
+                    tracing::info!(
+                        model = %bedrock_model,
+                        rejected = ?rejected,
+                        "ValidationException named betas (stream) — marking unsupported and retrying"
+                    );
+                    for beta in &rejected {
+                        ctx.endpoint_client
+                            .mark_unsupported(&ctx.profile, beta, ProbeSource::RequestRejection)
+                            .await;
+                    }
+                    let retry_bytes =
+                        rebuild_body_without_betas(&body_bytes, &rejected).unwrap_or_default();
+                    if !retry_bytes.is_empty() {
+                        let retry_result = runtime_client
+                            .invoke_model_with_response_stream()
+                            .model_id(bedrock_model)
+                            .content_type("application/json")
+                            .body(Blob::new(retry_bytes))
+                            .send()
+                            .await;
+                        // Build an updated ctx with the rejected betas removed from unknown_betas
+                        let remaining_ctx = BetaRetryContext {
+                            endpoint_client: Arc::clone(&ctx.endpoint_client),
+                            profile: ctx.profile.clone(),
+                            unknown_betas: ctx
+                                .unknown_betas
+                                .iter()
+                                .filter(|b| !rejected.contains(b))
+                                .cloned()
+                                .collect(),
+                            forwarded_betas: ctx.forwarded_betas.clone(),
+                        };
+                        (retry_result, Some(remaining_ctx))
+                    } else {
+                        (result, beta_ctx)
+                    }
+                } else {
+                    (result, beta_ctx)
+                }
+            } else {
+                (result, beta_ctx)
+            }
+        } else {
+            (result, beta_ctx)
+        }
+    } else {
+        (result, beta_ctx)
+    };
+
     match result {
         Ok(output) => {
+            // Opportunistic learning: Bedrock accepted the request, so unknown betas are now known
+            // to work. Fire mark_supported before spawning the stream task.
+            if let Some(ref ctx) = beta_ctx {
+                for beta in &ctx.unknown_betas {
+                    ctx.endpoint_client
+                        .mark_supported(&ctx.profile, beta, ProbeSource::RequestSuccess)
+                        .await;
+                }
+            }
+
             let original_model = original_model.to_string();
             let mut event_stream = output.body;
 
@@ -1416,6 +1801,7 @@ async fn handle_with_web_search(
     ws_ctx: &websearch::WebSearchContext,
     endpoint_id: Option<Uuid>,
     websearch_mode: &str,
+    beta_retry_ctx: Option<BetaRetryContext>,
 ) -> Response {
     // Resolve search provider: "global" mode uses admin-configured global provider,
     // otherwise fall back to per-user provider (which defaults to DuckDuckGo).
@@ -1474,9 +1860,102 @@ async fn handle_with_web_search(
             .model_id(bedrock_model)
             .content_type("application/json")
             .accept("application/json")
-            .body(Blob::new(body_bytes))
+            .body(Blob::new(body_bytes.clone()))
             .send()
             .await;
+
+        // On the first iteration, apply the beta retry pattern:
+        // if Bedrock rejects with a ValidationException naming a beta, strip
+        // that beta, mark it unsupported, and retry once.  On success, mark
+        // any unknown betas as supported.
+        let result = if loop_iteration == 1 {
+            if let Err(ref e) = result {
+                use aws_sdk_bedrockruntime::error::SdkError;
+                let is_ve = matches!(
+                    e,
+                    SdkError::ServiceError(svc) if svc.err().is_validation_exception()
+                );
+                if is_ve {
+                    if let Some(ref ctx) = beta_retry_ctx {
+                        let err_str = format!("{e:?}");
+                        let rejected =
+                            beta_filter::parse_rejected_betas(&err_str, &ctx.forwarded_betas);
+                        if !rejected.is_empty() {
+                            tracing::info!(
+                                model = %bedrock_model,
+                                rejected = ?rejected,
+                                "ValidationException named betas (web-search path) — marking unsupported and retrying"
+                            );
+                            for beta in &rejected {
+                                ctx.endpoint_client
+                                    .mark_unsupported(
+                                        &ctx.profile,
+                                        beta,
+                                        ProbeSource::RequestRejection,
+                                    )
+                                    .await;
+                            }
+                            // Strip the rejected betas from bedrock_body for this and
+                            // all subsequent iterations in the loop.
+                            bedrock_body
+                                .anthropic_beta
+                                .retain(|b| !rejected.iter().any(|r| r == b));
+                            let retry_bytes = rebuild_body_without_betas(&body_bytes, &rejected)
+                                .unwrap_or_default();
+                            if !retry_bytes.is_empty() {
+                                let retry_result = runtime_client
+                                    .invoke_model()
+                                    .model_id(bedrock_model)
+                                    .content_type("application/json")
+                                    .accept("application/json")
+                                    .body(Blob::new(retry_bytes))
+                                    .send()
+                                    .await;
+                                if retry_result.is_ok() {
+                                    // Opportunistic learning: remaining unknown betas work.
+                                    let remaining_unknown: Vec<String> = ctx
+                                        .unknown_betas
+                                        .iter()
+                                        .filter(|b| !rejected.contains(b))
+                                        .cloned()
+                                        .collect();
+                                    for beta in &remaining_unknown {
+                                        ctx.endpoint_client
+                                            .mark_supported(
+                                                &ctx.profile,
+                                                beta,
+                                                ProbeSource::RequestSuccess,
+                                            )
+                                            .await;
+                                    }
+                                }
+                                retry_result
+                            } else {
+                                result
+                            }
+                        } else {
+                            result
+                        }
+                    } else {
+                        result
+                    }
+                } else {
+                    result
+                }
+            } else {
+                // First iteration succeeded — opportunistic learning for unknown betas.
+                if let Some(ref ctx) = beta_retry_ctx {
+                    for beta in &ctx.unknown_betas {
+                        ctx.endpoint_client
+                            .mark_supported(&ctx.profile, beta, ProbeSource::RequestSuccess)
+                            .await;
+                    }
+                }
+                result
+            }
+        } else {
+            result
+        };
 
         let resp_value = match result {
             Ok(output) => match serde_json::from_slice::<Value>(output.body().as_ref()) {
@@ -2914,6 +3393,7 @@ mod tests {
             top_p: None,
             top_k: None,
             mcp_servers: None,
+            anthropic_beta: vec![],
         }
     }
 
@@ -3442,6 +3922,580 @@ mod tests_slice4_no_hardcoded {
         assert!(
             json["last_id"].is_string(),
             "last_id must be a non-null string when data is non-empty"
+        );
+    }
+}
+
+// ── Slice 5: `/v1/models` advertises suffix variants from cache ─────────────────────────────
+//
+// These tests exercise a pure helper function that the Builder must extract:
+//
+//   `pub(crate) fn build_models_response_with_variants(
+//       pairs: &[(String, String)],           // (anthropic_id, bedrock_profile_id)
+//       capability_lookup: impl Fn(&str, &str) -> Option<bool>,  // (profile, beta) -> Option<bool>
+//       suffix_map: &[(&str, &str, &str)],    // (suffix, beta_name, display_suffix)
+//   ) -> serde_json::Value`
+//
+// Design rationale:
+//   - `capability_lookup` is SYNC (not async). The production caller pre-snapshots
+//     the async RwLock in `list_models` and hands a closure over the snapshot to
+//     this pure function. Tests can then pass a simple closure over a HashMap
+//     without any async machinery.
+//   - `suffix_map` is an explicit parameter (not a direct read of the `SUFFIX_BETA_MAP`
+//     const) so Test 8 can inject a synthetic 2-entry slice without modifying
+//     production constants.
+//   - `pairs` uses the `(anthropic_id, bedrock_profile_id)` shape because the
+//     production caller already iterates bedrock_ids → anthropic mapping and needs
+//     to keep both sides for the capability lookup.
+//
+// All tests are `#[test]` (not `#[tokio::test]`) because the helper is sync.
+// Tests are tagged `offline` in their doc comments to signal they require no DB/AWS.
+#[cfg(test)]
+mod tests_t5_suffix_variants {
+    use super::*;
+    use serde_json::Value;
+    use std::collections::HashMap;
+
+    // ── helper to call the function under test ────────────────────────────────────
+
+    /// Thin wrapper so tests don't need to repeat the turbofish / type annotation
+    /// for the closure.
+    fn run(
+        pairs: &[(&str, &str)],
+        capability_lookup: impl Fn(&str, &str) -> Option<bool>,
+        suffix_map: &[(&str, &str, &str)],
+    ) -> Value {
+        let owned: Vec<(String, String)> = pairs
+            .iter()
+            .map(|(a, b)| (a.to_string(), b.to_string()))
+            .collect();
+        build_models_response_with_variants(&owned, capability_lookup, suffix_map)
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────────
+    // Test 1 [offline]: variant emitted when capability cache says Some(true)
+    // ─────────────────────────────────────────────────────────────────────────────
+    //
+    // Input:  one model pair; cache returns `Some(true)` for its beta.
+    // Expect: response contains BOTH the bare entry and the `[1m]` suffixed variant.
+    //         The variant's display name is "<existing> (1M context)".
+    #[test]
+    fn variants_emitted_for_supported_betas() {
+        let pairs = &[("claude-opus-4-7", "us.anthropic.claude-opus-4-7")];
+        let suffix_map: &[(&str, &str, &str)] = &[("[1m]", "context-1m-2025-08-07", "1M context")];
+
+        let json = run(
+            pairs,
+            |profile, beta| {
+                if profile == "us.anthropic.claude-opus-4-7" && beta == "context-1m-2025-08-07" {
+                    Some(true)
+                } else {
+                    None
+                }
+            },
+            suffix_map,
+        );
+
+        let data = json["data"]
+            .as_array()
+            .expect("response must have 'data' array");
+        let ids: Vec<&str> = data.iter().map(|m| m["id"].as_str().unwrap()).collect();
+
+        assert!(
+            ids.contains(&"claude-opus-4-7"),
+            "bare entry must be present; got ids: {ids:?}"
+        );
+        assert!(
+            ids.contains(&"claude-opus-4-7[1m]"),
+            "[1m] variant must be emitted when cache returns Some(true); got ids: {ids:?}"
+        );
+
+        // Verify the display name of the variant.
+        let variant = data
+            .iter()
+            .find(|m| m["id"].as_str() == Some("claude-opus-4-7[1m]"))
+            .expect("[1m] variant entry must exist in data");
+
+        let display = variant["display_name"]
+            .as_str()
+            .expect("display_name must be a string");
+        assert!(
+            display.contains("1M context"),
+            "variant display_name must contain '1M context'; got: '{display}'"
+        );
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────────
+    // Test 2 [offline]: no variant when cache says Some(false)
+    // ─────────────────────────────────────────────────────────────────────────────
+    //
+    // Input:  one model pair; cache returns `Some(false)` for its beta.
+    // Expect: only the bare entry — no `[1m]` variant.
+    #[test]
+    fn no_variants_when_unsupported() {
+        let pairs = &[("claude-opus-4-7", "us.anthropic.claude-opus-4-7")];
+        let suffix_map: &[(&str, &str, &str)] = &[("[1m]", "context-1m-2025-08-07", "1M context")];
+
+        let json = run(pairs, |_profile, _beta| Some(false), suffix_map);
+
+        let data = json["data"]
+            .as_array()
+            .expect("response must have 'data' array");
+        let ids: Vec<&str> = data.iter().map(|m| m["id"].as_str().unwrap()).collect();
+
+        assert!(
+            ids.contains(&"claude-opus-4-7"),
+            "bare entry must always be present; got ids: {ids:?}"
+        );
+        assert!(
+            !ids.contains(&"claude-opus-4-7[1m]"),
+            "[1m] variant must NOT be emitted when cache returns Some(false); got ids: {ids:?}"
+        );
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────────
+    // Test 3 [offline]: no variant when cache is absent (None)
+    // ─────────────────────────────────────────────────────────────────────────────
+    //
+    // Bootstrap window safety: when the cache has no entry for a (profile, beta)
+    // pair, the helper must NOT emit a suffix variant. False positives are worse
+    // than false negatives here — advertising a model variant that doesn't work
+    // would break the user's workflow silently.
+    //
+    // Input:  one model pair; cache returns `None` for everything.
+    // Expect: only the bare entry.
+    #[test]
+    fn no_variants_when_cache_absent() {
+        let pairs = &[("claude-opus-4-7", "us.anthropic.claude-opus-4-7")];
+        let suffix_map: &[(&str, &str, &str)] = &[("[1m]", "context-1m-2025-08-07", "1M context")];
+
+        let json = run(
+            pairs,
+            |_profile, _beta| None, // cache empty — bootstrap window
+            suffix_map,
+        );
+
+        let data = json["data"]
+            .as_array()
+            .expect("response must have 'data' array");
+        let ids: Vec<&str> = data.iter().map(|m| m["id"].as_str().unwrap()).collect();
+
+        assert_eq!(
+            ids.len(),
+            1,
+            "only the bare entry must appear when cache is absent (bootstrap window); got ids: {ids:?}"
+        );
+        assert!(
+            ids.contains(&"claude-opus-4-7"),
+            "bare entry must be present; got ids: {ids:?}"
+        );
+        assert!(
+            !ids.contains(&"claude-opus-4-7[1m]"),
+            "[1m] variant must NOT be emitted when cache returns None; got ids: {ids:?}"
+        );
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────────
+    // Test 4 [offline]: variants emitted per-model independently
+    // ─────────────────────────────────────────────────────────────────────────────
+    //
+    // Input:  two models — opus (1M-capable) and haiku (not capable).
+    // Expect: 3 entries total: opus bare, opus[1m], haiku bare (no haiku[1m]).
+    #[test]
+    fn variants_for_subset_of_models() {
+        let pairs = &[
+            ("claude-opus-4-7", "us.anthropic.claude-opus-4-7"),
+            (
+                "claude-haiku-4-5-20251001",
+                "us.anthropic.claude-haiku-4-5-20251001-v1:0",
+            ),
+        ];
+        let suffix_map: &[(&str, &str, &str)] = &[("[1m]", "context-1m-2025-08-07", "1M context")];
+
+        // Build a lookup map: opus → true, haiku → false
+        let mut cap_map: HashMap<(&str, &str), Option<bool>> = HashMap::new();
+        cap_map.insert(
+            ("us.anthropic.claude-opus-4-7", "context-1m-2025-08-07"),
+            Some(true),
+        );
+        cap_map.insert(
+            (
+                "us.anthropic.claude-haiku-4-5-20251001-v1:0",
+                "context-1m-2025-08-07",
+            ),
+            Some(false),
+        );
+
+        let json = run(
+            pairs,
+            |profile, beta| cap_map.get(&(profile, beta)).copied().unwrap_or(None),
+            suffix_map,
+        );
+
+        let data = json["data"]
+            .as_array()
+            .expect("response must have 'data' array");
+        let ids: Vec<&str> = data.iter().map(|m| m["id"].as_str().unwrap()).collect();
+
+        assert_eq!(
+            ids.len(),
+            3,
+            "expected 3 entries: opus bare + opus[1m] + haiku bare; got ids: {ids:?}"
+        );
+        assert!(
+            ids.contains(&"claude-opus-4-7"),
+            "opus bare must be present"
+        );
+        assert!(
+            ids.contains(&"claude-opus-4-7[1m]"),
+            "opus [1m] variant must be present"
+        );
+        assert!(
+            ids.contains(&"claude-haiku-4-5-20251001"),
+            "haiku bare must be present"
+        );
+        assert!(
+            !ids.contains(&"claude-haiku-4-5-20251001[1m]"),
+            "haiku [1m] variant must NOT be present (cache says false)"
+        );
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────────
+    // Test 5 [offline]: bare entries appear before any suffix variants
+    // ─────────────────────────────────────────────────────────────────────────────
+    //
+    // Sort contract: all bare entries must appear before any `[...]` suffix
+    // variant, and within each group entries must be alphabetically ordered.
+    //
+    // Input:  two 1M-capable models.
+    // Expect: sorted as [claude-haiku-4-5-..., claude-opus-4-7, claude-haiku-4-5-...[1m], claude-opus-4-7[1m]]
+    #[test]
+    fn bare_entries_first_then_variants() {
+        let pairs = &[
+            ("claude-opus-4-7", "us.anthropic.claude-opus-4-7"),
+            (
+                "claude-haiku-4-5-20251001",
+                "us.anthropic.claude-haiku-4-5-20251001-v1:0",
+            ),
+        ];
+        let suffix_map: &[(&str, &str, &str)] = &[("[1m]", "context-1m-2025-08-07", "1M context")];
+
+        let json = run(
+            pairs,
+            |_profile, _beta| Some(true), // all models are 1M-capable
+            suffix_map,
+        );
+
+        let data = json["data"]
+            .as_array()
+            .expect("response must have 'data' array");
+        let ids: Vec<&str> = data.iter().map(|m| m["id"].as_str().unwrap()).collect();
+
+        // All bare entries must appear before any variant entry
+        let first_variant_pos = ids.iter().position(|id| id.contains('['));
+        let last_bare_pos = ids.iter().rposition(|id| !id.contains('['));
+
+        assert!(
+            first_variant_pos.is_some(),
+            "at least one variant must be present in output; got ids: {ids:?}"
+        );
+        assert!(
+            last_bare_pos.is_some(),
+            "at least one bare entry must be present in output; got ids: {ids:?}"
+        );
+
+        assert!(
+            last_bare_pos.unwrap() < first_variant_pos.unwrap(),
+            "all bare entries must precede all suffix variant entries in the sorted output; \
+             got ordering: {ids:?}"
+        );
+
+        // Alphabetic within bare group
+        let bare_ids: Vec<&str> = ids.iter().copied().filter(|id| !id.contains('[')).collect();
+        let mut sorted_bare = bare_ids.clone();
+        sorted_bare.sort_unstable();
+        assert_eq!(
+            bare_ids, sorted_bare,
+            "bare entries must be alphabetically sorted within their group; got: {bare_ids:?}"
+        );
+
+        // Alphabetic within variant group
+        let variant_ids: Vec<&str> = ids.iter().copied().filter(|id| id.contains('[')).collect();
+        let mut sorted_variants = variant_ids.clone();
+        sorted_variants.sort_unstable();
+        assert_eq!(
+            variant_ids, sorted_variants,
+            "suffix variant entries must be alphabetically sorted within their group; got: {variant_ids:?}"
+        );
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────────
+    // Test 6 [offline]: variant display name uses display_suffix from suffix_map
+    // ─────────────────────────────────────────────────────────────────────────────
+    //
+    // The display name of a variant entry must be "<existing display> (display_suffix)"
+    // where `display_suffix` comes from the third tuple element of the `suffix_map`
+    // parameter — it is NOT hardcoded as "1M context" in the helper body.
+    //
+    // This test uses a synthetic suffix_map entry with a distinct display label to
+    // prove the label flows from the map, not from a hardcoded string.
+    #[test]
+    fn display_name_includes_capability_suffix() {
+        let pairs = &[("claude-opus-4-7", "us.anthropic.claude-opus-4-7")];
+
+        // Use a recognisably different display suffix to confirm it comes from the map.
+        let suffix_map: &[(&str, &str, &str)] = &[("[1m]", "context-1m-2025-08-07", "1M context")];
+
+        let json = run(pairs, |_profile, _beta| Some(true), suffix_map);
+
+        let data = json["data"]
+            .as_array()
+            .expect("response must have 'data' array");
+        let variant = data
+            .iter()
+            .find(|m| m["id"].as_str() == Some("claude-opus-4-7[1m]"))
+            .expect("[1m] variant entry must be present");
+
+        let display = variant["display_name"]
+            .as_str()
+            .expect("display_name must be a string");
+
+        // Bare display name for claude-opus-4-7 (from model_display_name)
+        let bare_display = model_display_name("claude-opus-4-7");
+
+        let expected = format!("{} (1M context)", bare_display);
+        assert_eq!(
+            display, expected,
+            "variant display_name must be '<base display> (display_suffix)'; got: '{display}'"
+        );
+
+        // Now confirm the label flows from suffix_map by using a different map entry.
+        let custom_suffix_map: &[(&str, &str, &str)] =
+            &[("[1m]", "context-1m-2025-08-07", "Extended Context")];
+
+        let json2 = run(pairs, |_profile, _beta| Some(true), custom_suffix_map);
+
+        let data2 = json2["data"].as_array().unwrap();
+        let variant2 = data2
+            .iter()
+            .find(|m| m["id"].as_str() == Some("claude-opus-4-7[1m]"))
+            .expect("[1m] variant must be present with custom suffix map");
+
+        let display2 = variant2["display_name"].as_str().unwrap();
+        let expected2 = format!("{} (Extended Context)", bare_display);
+        assert_eq!(
+            display2, expected2,
+            "variant display_name must use the display_suffix from the suffix_map parameter, \
+             not a hardcoded string; got: '{display2}'"
+        );
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────────
+    // Test 7 [offline]: same Anthropic ID from multiple profiles → no duplicates
+    // ─────────────────────────────────────────────────────────────────────────────
+    //
+    // Mirrors the existing `seen.insert(id.clone())` dedup logic.
+    // Input: the same Anthropic model backed by two different Bedrock profile IDs
+    //        (e.g. us. and global. prefixes). Both profiles say Some(true).
+    // Expect: exactly ONE bare entry and ONE [1m] variant — deduplicated by Anthropic ID.
+    #[test]
+    fn data_has_no_duplicates_when_same_anthropic_id_from_multiple_profiles() {
+        let pairs = &[
+            ("claude-opus-4-7", "us.anthropic.claude-opus-4-7"),
+            ("claude-opus-4-7", "global.anthropic.claude-opus-4-7"),
+        ];
+        let suffix_map: &[(&str, &str, &str)] = &[("[1m]", "context-1m-2025-08-07", "1M context")];
+
+        let json = run(
+            pairs,
+            |_profile, _beta| Some(true), // both profiles say supported
+            suffix_map,
+        );
+
+        let data = json["data"]
+            .as_array()
+            .expect("response must have 'data' array");
+        let ids: Vec<&str> = data.iter().map(|m| m["id"].as_str().unwrap()).collect();
+
+        let bare_count = ids.iter().filter(|&&id| id == "claude-opus-4-7").count();
+        let variant_count = ids
+            .iter()
+            .filter(|&&id| id == "claude-opus-4-7[1m]")
+            .count();
+
+        assert_eq!(
+            bare_count, 1,
+            "claude-opus-4-7 bare entry must appear exactly once even when backed by multiple profiles; \
+             got {bare_count} copies; ids: {ids:?}"
+        );
+        assert_eq!(
+            variant_count, 1,
+            "claude-opus-4-7[1m] variant must appear exactly once even when multiple profiles support it; \
+             got {variant_count} copies; ids: {ids:?}"
+        );
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────────
+    // Test 8 [offline]: multiple suffix_map entries emit independent variants
+    // ─────────────────────────────────────────────────────────────────────────────
+    //
+    // Confirms that `suffix_map` is the single source of truth for which variants
+    // to advertise. By injecting a two-entry synthetic slice we verify both
+    // suffix entries are independently processed.
+    //
+    // NOTE: This test is only possible because the helper accepts `suffix_map` as
+    // an explicit parameter rather than reading `crate::endpoint::SUFFIX_BETA_MAP`
+    // directly. If the Builder implements the helper to read the const directly,
+    // this test cannot be written without modifying the const — which would be
+    // a design problem. The parameter approach is the correct design.
+    #[test]
+    fn multiple_suffix_map_entries_emit_independent_variants() {
+        let pairs = &[("claude-opus-4-7", "us.anthropic.claude-opus-4-7")];
+
+        // Synthetic 2-entry suffix map — NOT production constants.
+        let synthetic_suffix_map: &[(&str, &str, &str)] = &[
+            ("[1m]", "context-1m-2025-08-07", "1M context"),
+            ("[2m]", "context-2m-2025-99-99", "2M context"), // hypothetical future beta
+        ];
+
+        // Both betas supported
+        let json = run(pairs, |_profile, _beta| Some(true), synthetic_suffix_map);
+
+        let data = json["data"]
+            .as_array()
+            .expect("response must have 'data' array");
+        let ids: Vec<&str> = data.iter().map(|m| m["id"].as_str().unwrap()).collect();
+
+        assert!(
+            ids.contains(&"claude-opus-4-7"),
+            "bare entry must be present"
+        );
+        assert!(
+            ids.contains(&"claude-opus-4-7[1m]"),
+            "[1m] variant must be emitted for first suffix map entry; got ids: {ids:?}"
+        );
+        assert!(
+            ids.contains(&"claude-opus-4-7[2m]"),
+            "[2m] variant must be emitted for second suffix map entry; got ids: {ids:?}"
+        );
+
+        // Only first beta supported → only [1m] variant, not [2m]
+        let json2 = run(
+            pairs,
+            |_profile, beta| {
+                if beta == "context-1m-2025-08-07" {
+                    Some(true)
+                } else {
+                    Some(false)
+                }
+            },
+            synthetic_suffix_map,
+        );
+
+        let data2 = json2["data"].as_array().unwrap();
+        let ids2: Vec<&str> = data2.iter().map(|m| m["id"].as_str().unwrap()).collect();
+        assert!(
+            ids2.contains(&"claude-opus-4-7[1m]"),
+            "[1m] must appear when its beta is true"
+        );
+        assert!(
+            !ids2.contains(&"claude-opus-4-7[2m]"),
+            "[2m] must NOT appear when its beta is false; got ids: {ids2:?}"
+        );
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────────
+    // Test 9 [offline]: first_id and last_id reflect emitted data after sort
+    // ─────────────────────────────────────────────────────────────────────────────
+    //
+    // The response envelope fields `first_id` and `last_id` must equal
+    // `data[0].id` and `data[data.len()-1].id` after variant emission and sort.
+    #[test]
+    fn first_id_and_last_id_reflect_emitted_data() {
+        let pairs = &[
+            ("claude-opus-4-7", "us.anthropic.claude-opus-4-7"),
+            (
+                "claude-haiku-4-5-20251001",
+                "us.anthropic.claude-haiku-4-5-20251001-v1:0",
+            ),
+        ];
+        let suffix_map: &[(&str, &str, &str)] = &[("[1m]", "context-1m-2025-08-07", "1M context")];
+
+        // Opus is 1M-capable; haiku is not.
+        let json = run(
+            pairs,
+            |profile, beta| {
+                if profile == "us.anthropic.claude-opus-4-7" && beta == "context-1m-2025-08-07" {
+                    Some(true)
+                } else {
+                    Some(false)
+                }
+            },
+            suffix_map,
+        );
+
+        let data = json["data"]
+            .as_array()
+            .expect("response must have 'data' array");
+        assert!(
+            !data.is_empty(),
+            "data must be non-empty for this test to be meaningful"
+        );
+
+        let first_id_in_data = data.first().unwrap()["id"].as_str().unwrap();
+        let last_id_in_data = data.last().unwrap()["id"].as_str().unwrap();
+
+        assert_eq!(
+            json["first_id"].as_str(),
+            Some(first_id_in_data),
+            "first_id in envelope must equal the id of the first entry in data array; \
+             envelope says '{:?}', data[0].id is '{first_id_in_data}'",
+            json["first_id"]
+        );
+        assert_eq!(
+            json["last_id"].as_str(),
+            Some(last_id_in_data),
+            "last_id in envelope must equal the id of the last entry in data array; \
+             envelope says '{:?}', data[last].id is '{last_id_in_data}'",
+            json["last_id"]
+        );
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────────
+    // Test 10 [offline]: empty input returns empty response
+    // ─────────────────────────────────────────────────────────────────────────────
+    //
+    // When `pairs` is empty (bootstrap window or no endpoints configured),
+    // the helper must return the same empty-list envelope as before.
+    // This verifies that the variant-emission logic does not break the empty case.
+    #[test]
+    fn empty_input_returns_empty_response() {
+        let pairs: &[(&str, &str)] = &[];
+        let suffix_map: &[(&str, &str, &str)] = &[("[1m]", "context-1m-2025-08-07", "1M context")];
+
+        let json = run(pairs, |_profile, _beta| Some(true), suffix_map);
+
+        let data = json["data"]
+            .as_array()
+            .expect("response must have 'data' array");
+        assert!(
+            data.is_empty(),
+            "empty input must produce empty 'data' array; got: {data:?}"
+        );
+
+        assert_eq!(
+            json["has_more"], false,
+            "has_more must be false for empty response"
+        );
+        assert!(
+            json["first_id"].is_null(),
+            "first_id must be null for empty response; got: {:?}",
+            json["first_id"]
+        );
+        assert!(
+            json["last_id"].is_null(),
+            "last_id must be null for empty response; got: {:?}",
+            json["last_id"]
         );
     }
 }

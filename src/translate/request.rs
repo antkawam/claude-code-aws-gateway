@@ -35,6 +35,13 @@ pub struct AnthropicRequest {
     #[serde(default)]
     #[allow(dead_code)]
     pub mcp_servers: Option<Vec<Value>>,
+    /// Beta flags from the client. CC sends them under the JSON key `"betas"`; the
+    /// `anthropic-beta` HTTP header is merged in at the handler layer before calling
+    /// `translate()`. Two aliases accepted: `"betas"` (CC wire format) and
+    /// `"anthropic_beta"` (internal/legacy). Filtered through the capability cache
+    /// at the handler boundary, not here — `translate()` is a pure passthrough.
+    #[serde(default, alias = "betas", alias = "anthropic_beta")]
+    pub anthropic_beta: Vec<String>,
 }
 
 /// Request body for Bedrock InvokeModel.
@@ -113,7 +120,10 @@ pub fn translate(
 ) -> (String, BedrockRequest, Option<websearch::WebSearchContext>) {
     let bedrock_model = models::anthropic_to_bedrock(&req.model, model_prefix, model_cache);
 
-    let betas: Vec<String> = Vec::new();
+    // Pure passthrough: betas are forwarded as-is from the client.
+    // Cache-based filtering happens at the handler boundary (src/api/handlers.rs),
+    // not here. translate() must not strip or inject betas.
+    let betas = req.anthropic_beta.clone();
 
     // Extract web_search server tool (if present) and replace with regular tool definition.
     // The mode controls behavior: "disabled" strips tools, "enabled"/"global" processes them.
@@ -174,6 +184,7 @@ mod tests {
             top_p: None,
             top_k: None,
             mcp_servers: None,
+            anthropic_beta: vec![],
         }
     }
 

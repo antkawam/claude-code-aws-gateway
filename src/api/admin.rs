@@ -4031,3 +4031,164 @@ pub async fn refresh_pricing(
         });
     Json(report).into_response()
 }
+
+// --- Beta overrides ---
+
+/// GET /admin/beta-overrides — list all admin-managed capability overrides.
+pub async fn list_beta_overrides(
+    State(state): State<Arc<GatewayState>>,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(resp) = check_admin_auth(&headers, &state).await {
+        return resp;
+    }
+    let pool = state.db().await;
+    let pool = &pool;
+
+    match db::beta_overrides::list_all(pool).await {
+        Ok(overrides) => {
+            let items: Vec<serde_json::Value> = overrides
+                .iter()
+                .map(|o| {
+                    json!({
+                        "endpoint_id": o.endpoint_id,
+                        "profile_id": o.profile_id,
+                        "beta_name": o.beta_name,
+                        "supported": o.supported,
+                        "set_at": o.set_at,
+                        "set_by": o.set_by,
+                        "reason": o.reason,
+                    })
+                })
+                .collect();
+            Json(json!({ "overrides": items })).into_response()
+        }
+        Err(e) => admin_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    }
+}
+
+#[derive(Deserialize)]
+pub struct UpsertBetaOverrideRequest {
+    pub endpoint_id: Uuid,
+    pub profile_id: String,
+    pub beta_name: String,
+    pub supported: bool,
+    pub reason: Option<String>,
+}
+
+/// POST /admin/beta-overrides — upsert a (endpoint, profile, beta) override.
+pub async fn upsert_beta_override(
+    State(state): State<Arc<GatewayState>>,
+    headers: HeaderMap,
+    Json(req): Json<UpsertBetaOverrideRequest>,
+) -> Response {
+    let set_by = match check_admin_auth_identity(&headers, &state).await {
+        Ok(identity) => identity,
+        Err(resp) => return resp,
+    };
+
+    let pool = state.db().await;
+    let pool = &pool;
+
+    // Pre-validate that the endpoint exists — convert the FK violation into a clean 404.
+    match db::endpoints::get_endpoint(pool, req.endpoint_id).await {
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            return error_response(
+                StatusCode::NOT_FOUND,
+                &format!("Endpoint '{}' not found", req.endpoint_id),
+            );
+        }
+        Err(e) => return admin_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    }
+
+    let ovr = db::beta_overrides::BetaOverride {
+        endpoint_id: req.endpoint_id,
+        profile_id: req.profile_id.clone(),
+        beta_name: req.beta_name.clone(),
+        supported: req.supported,
+        set_at: chrono::Utc::now(),
+        set_by,
+        reason: req.reason.clone(),
+    };
+
+    if let Err(e) = db::beta_overrides::upsert(pool, &ovr).await {
+        return admin_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string());
+    }
+
+    // Synchronously update the in-memory cache so the new value is visible immediately,
+    // without waiting for the 5s cache_version poll.
+    if let Some(client) = state.endpoint_pool.get_client(req.endpoint_id).await {
+        if ovr.supported {
+            client
+                .mark_supported(
+                    &ovr.profile_id,
+                    &ovr.beta_name,
+                    crate::endpoint::ProbeSource::AdminOverride,
+                )
+                .await;
+        } else {
+            client
+                .mark_unsupported(
+                    &ovr.profile_id,
+                    &ovr.beta_name,
+                    crate::endpoint::ProbeSource::AdminOverride,
+                )
+                .await;
+        }
+    } else {
+        tracing::warn!(
+            endpoint_id = %req.endpoint_id,
+            "upsert_beta_override: endpoint exists in DB but not in EndpointPool — in-memory cache not updated"
+        );
+    }
+
+    // Bump cache_version so other gateway replicas pick up the change within 5s.
+    let _ = db::settings::bump_cache_version(pool).await;
+
+    Json(json!({
+        "endpoint_id": ovr.endpoint_id,
+        "profile_id": ovr.profile_id,
+        "beta_name": ovr.beta_name,
+        "supported": ovr.supported,
+        "set_at": ovr.set_at,
+        "set_by": ovr.set_by,
+        "reason": ovr.reason,
+    }))
+    .into_response()
+}
+
+/// DELETE /admin/beta-overrides/{endpoint_id}/{profile_id}/{beta_name}
+///
+/// Returns 200 on success, 404 if the override does not exist.
+pub async fn delete_beta_override(
+    State(state): State<Arc<GatewayState>>,
+    headers: HeaderMap,
+    Path((endpoint_id, profile_id, beta_name)): Path<(Uuid, String, String)>,
+) -> Response {
+    if let Err(resp) = check_admin_auth(&headers, &state).await {
+        return resp;
+    }
+
+    let pool = state.db().await;
+    let pool = &pool;
+
+    match db::beta_overrides::delete(pool, endpoint_id, &profile_id, &beta_name).await {
+        Ok(0) => error_response(
+            StatusCode::NOT_FOUND,
+            &format!(
+                "No override found for endpoint={endpoint_id} profile={profile_id} beta={beta_name}"
+            ),
+        ),
+        Ok(_) => {
+            // Synchronously evict from in-memory cache.
+            if let Some(client) = state.endpoint_pool.get_client(endpoint_id).await {
+                client.forget_capability(&profile_id, &beta_name).await;
+            }
+            // Bump cache_version so other gateway replicas evict the override within 5s.
+            let _ = db::settings::bump_cache_version(pool).await;
+            Json(json!({ "deleted": true })).into_response()
+        }
+        Err(e) => admin_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    }
+}

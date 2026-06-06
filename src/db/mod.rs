@@ -1,3 +1,4 @@
+pub mod beta_overrides;
 pub mod budget;
 pub mod endpoints;
 pub mod idp;

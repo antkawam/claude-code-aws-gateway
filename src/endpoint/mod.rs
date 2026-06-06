@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use tokio::sync::RwLock;
 use uuid::Uuid;
@@ -9,6 +9,47 @@ use uuid::Uuid;
 use crate::db::schema::Endpoint;
 
 pub mod stats;
+
+/// Shared capability map type — maps `(profile_id, beta_name)` to `CapabilityEntry`.
+type BetaCapabilityMap = Arc<RwLock<HashMap<(String, String), CapabilityEntry>>>;
+
+/// Pair of preserved cache Arcs carried from an existing `EndpointClient` into
+/// a reloaded one so that learned capability data and model lists survive
+/// routine `cache_version`-triggered reloads.
+type PreservedCaches = (BetaCapabilityMap, Arc<RwLock<Vec<String>>>);
+
+/// TTL for non-`AdminOverride` capability cache entries.
+pub const CAPABILITY_TTL: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// Map from model-ID suffix to `(suffix, beta_name, display_label)`.
+///
+/// Used by:
+/// - Health-loop seed probing (iterates beta_name across every available profile).
+/// - `/v1/models` advertising (emits a suffixed variant for every `Some(true)` cache entry).
+pub const SUFFIX_BETA_MAP: &[(&str, &str, &str)] =
+    &[("[1m]", "context-1m-2025-08-07", "1M context")];
+
+/// Who set a capability cache entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProbeSource {
+    /// Written by the health-loop seed probe.
+    SeedProbe,
+    /// Written opportunistically when a real request succeeds with this beta.
+    RequestSuccess,
+    /// Written when Bedrock returns a ValidationException naming the beta.
+    RequestRejection,
+    /// Written by an operator via admin API / CLI. Ignores TTL and is never
+    /// overwritten by automatic probing.
+    AdminOverride,
+}
+
+/// One entry in the per-`(profile, beta)` capability cache.
+#[derive(Debug, Clone)]
+pub struct CapabilityEntry {
+    pub supported: bool,
+    pub learned_at: Instant,
+    pub source: ProbeSource,
+}
 
 /// A Bedrock client for a specific endpoint (account/region).
 pub struct EndpointClient {
@@ -21,6 +62,14 @@ pub struct EndpointClient {
     /// Bedrock inference profile IDs available on this endpoint (e.g. `us.anthropic.claude-opus-4-7`).
     /// Populated by the health check loop; empty until the first successful tick.
     pub available_models: Arc<RwLock<Vec<String>>>,
+    /// Per-`(profile_id, beta_name)` capability cache.
+    ///
+    /// Key:   `(profile_id, beta_name)` — e.g. `("us.anthropic.claude-opus-4-7", "context-1m-2025-08-07")`.
+    /// Value: `CapabilityEntry` — most recent probe outcome with TTL and source.
+    ///
+    /// `AdminOverride` entries ignore TTL and are never overwritten by automatic probing.
+    /// Non-override entries expire after `CAPABILITY_TTL` (24 h).
+    pub beta_capabilities: Arc<RwLock<HashMap<(String, String), CapabilityEntry>>>,
 }
 
 impl EndpointClient {
@@ -33,6 +82,199 @@ impl EndpointClient {
     pub async fn supports_model(&self, bedrock_model_id: &str) -> bool {
         let models = self.available_models.read().await;
         models.iter().any(|m| m.ends_with(bedrock_model_id))
+    }
+
+    /// Query the beta capability cache for `(profile, beta)`.
+    ///
+    /// Returns:
+    /// - `Some(true)` — entry exists, supported, and either `AdminOverride` or not yet expired.
+    /// - `Some(false)` — entry exists, not supported, and either `AdminOverride` or not yet expired.
+    /// - `None` — entry absent, or non-`AdminOverride` entry whose TTL has elapsed.
+    pub async fn is_beta_supported(&self, profile: &str, beta: &str) -> Option<bool> {
+        let map = self.beta_capabilities.read().await;
+        let key = (profile.to_string(), beta.to_string());
+        match map.get(&key) {
+            None => None,
+            Some(entry) => {
+                if entry.source == ProbeSource::AdminOverride {
+                    // Admin overrides never expire.
+                    Some(entry.supported)
+                } else if entry.learned_at + CAPABILITY_TTL <= Instant::now() {
+                    // Expired non-override entry — treat as absent.
+                    None
+                } else {
+                    Some(entry.supported)
+                }
+            }
+        }
+    }
+
+    /// Record that `(profile, beta)` is supported.
+    ///
+    /// If the existing entry was written by `AdminOverride` and the incoming
+    /// `source` is anything other than `AdminOverride`, the call is a no-op.
+    /// Admin overrides stay until explicitly cleared via `forget_capability`.
+    pub async fn mark_supported(&self, profile: &str, beta: &str, source: ProbeSource) {
+        let mut map = self.beta_capabilities.write().await;
+        let key = (profile.to_string(), beta.to_string());
+        // Never overwrite an admin override from any other source.
+        if let Some(existing) = map.get(&key)
+            && existing.source == ProbeSource::AdminOverride
+            && source != ProbeSource::AdminOverride
+        {
+            return;
+        }
+        map.insert(
+            key,
+            CapabilityEntry {
+                supported: true,
+                learned_at: Instant::now(),
+                source,
+            },
+        );
+    }
+
+    /// Remove the `(profile, beta)` entry from the capability cache entirely.
+    ///
+    /// After this call, `is_beta_supported(profile, beta)` returns `None`.
+    /// Used by the admin DELETE handler to clear an override and let the
+    /// health-loop re-probe on the next cycle.
+    pub async fn forget_capability(&self, profile: &str, beta: &str) {
+        let mut map = self.beta_capabilities.write().await;
+        map.remove(&(profile.to_string(), beta.to_string()));
+    }
+
+    /// Record that `(profile, beta)` is NOT supported.
+    ///
+    /// If the existing entry was written by `AdminOverride` and the incoming
+    /// `source` is anything other than `AdminOverride`, the call is a no-op.
+    /// Admin overrides stay until explicitly cleared via `forget_capability`.
+    pub async fn mark_unsupported(&self, profile: &str, beta: &str, source: ProbeSource) {
+        let mut map = self.beta_capabilities.write().await;
+        let key = (profile.to_string(), beta.to_string());
+        // Never overwrite an admin override from any other source.
+        if let Some(existing) = map.get(&key)
+            && existing.source == ProbeSource::AdminOverride
+            && source != ProbeSource::AdminOverride
+        {
+            return;
+        }
+        map.insert(
+            key,
+            CapabilityEntry {
+                supported: false,
+                learned_at: Instant::now(),
+                source,
+            },
+        );
+    }
+
+    /// Return `(profile, beta)` pairs that the health loop should seed-probe.
+    ///
+    /// A pair is included when:
+    /// - No cache entry exists for it, OR
+    /// - The entry exists, is not `AdminOverride`, and its TTL has elapsed.
+    ///
+    /// `AdminOverride` entries are never re-probed; they stay until explicitly cleared.
+    pub async fn expired_seed_pairs(&self, profiles: &[String]) -> Vec<(String, String)> {
+        let map = self.beta_capabilities.read().await;
+        let now = Instant::now();
+        let mut pairs = Vec::new();
+        for profile in profiles {
+            for &(_, beta_name, _) in SUFFIX_BETA_MAP {
+                let key = (profile.clone(), beta_name.to_string());
+                match map.get(&key) {
+                    None => {
+                        // Absent — must probe.
+                        pairs.push((profile.clone(), beta_name.to_string()));
+                    }
+                    Some(entry) => {
+                        if entry.source == ProbeSource::AdminOverride {
+                            // Admin overrides are never re-probed.
+                        } else if entry.learned_at + CAPABILITY_TTL <= now {
+                            // Expired non-override — needs re-probe.
+                            pairs.push((profile.clone(), beta_name.to_string()));
+                        }
+                        // Fresh non-override — skip.
+                    }
+                }
+            }
+        }
+        pairs
+    }
+}
+
+// ── Seed-probe helpers ────────────────────────────────────────────────────────
+
+/// Outcome of a single seed-probe InvokeModel call.
+///
+/// Used by the health loop to determine how to update the beta capability cache.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProbeOutcome {
+    /// The model accepted the beta (HTTP 200).
+    Supported,
+    /// The model rejected the beta with a ValidationException that names it.
+    Unsupported,
+    /// The result was inconclusive: throttle, 5xx, network error, or a
+    /// ValidationException that does NOT name the beta. Cache is unchanged;
+    /// the pair will be re-probed on the next health-loop tick.
+    Inconclusive,
+}
+
+/// Classify a raw `InvokeModel` probe result into a `ProbeOutcome`.
+///
+/// This is a pure function — no I/O, no `async`.
+///
+/// Arguments:
+/// - `success`: `true` when `invoke_model().send().await` returned `Ok(_)`.
+/// - `is_validation_exception`: `true` when the SDK error is a `ValidationException`.
+/// - `error_message`: the full Debug-formatted SDK error string (used for beta-name matching).
+/// - `beta`: the beta name we probed (e.g. `"context-1m-2025-08-07"`).
+///
+/// Mapping:
+/// - `success == true` → `Supported`
+/// - `is_validation_exception == true` AND `error_message` contains `beta` (case-insensitive) → `Unsupported`
+/// - anything else → `Inconclusive`
+pub fn classify_probe_outcome(
+    success: bool,
+    is_validation_exception: bool,
+    error_message: &str,
+    beta: &str,
+) -> ProbeOutcome {
+    if success {
+        return ProbeOutcome::Supported;
+    }
+    if is_validation_exception && error_message.to_lowercase().contains(&beta.to_lowercase()) {
+        return ProbeOutcome::Unsupported;
+    }
+    ProbeOutcome::Inconclusive
+}
+
+/// Apply a probe outcome to an `EndpointClient`'s beta capability cache.
+///
+/// - `Supported` → `mark_supported(profile, beta, SeedProbe)`
+/// - `Unsupported` → `mark_unsupported(profile, beta, SeedProbe)`
+/// - `Inconclusive` → no-op (cache unchanged)
+pub async fn apply_probe_outcome(
+    client: &EndpointClient,
+    profile: &str,
+    beta: &str,
+    outcome: ProbeOutcome,
+) {
+    match outcome {
+        ProbeOutcome::Supported => {
+            client
+                .mark_supported(profile, beta, ProbeSource::SeedProbe)
+                .await;
+        }
+        ProbeOutcome::Unsupported => {
+            client
+                .mark_unsupported(profile, beta, ProbeSource::SeedProbe)
+                .await;
+        }
+        ProbeOutcome::Inconclusive => {
+            // No cache change — retry next tick.
+        }
     }
 }
 
@@ -76,6 +318,11 @@ impl EndpointPool {
     /// Load/reload endpoint clients from database endpoint configs.
     /// For endpoints with role_arn, uses STS AssumeRole (via AssumeRoleProvider).
     /// For endpoints without role_arn (NULL), uses the gateway's own credentials.
+    ///
+    /// Existing `beta_capabilities` and `available_models` Arcs are preserved for
+    /// endpoints that are already in the pool (matched by UUID), so that learned
+    /// capability data survives routine config reloads triggered by cache_version bumps.
+    /// Only genuinely new endpoints get a fresh empty cache.
     pub async fn load_endpoints(
         &self,
         endpoints: Vec<Endpoint>,
@@ -84,11 +331,30 @@ impl EndpointPool {
         let mut new_clients = HashMap::new();
         let mut new_default: Option<Uuid> = None;
 
+        // Snapshot the current pool so we can preserve cache Arcs for unchanged endpoints.
+        let preserved: HashMap<Uuid, PreservedCaches> = {
+            let old_clients = self.clients.read().await;
+            old_clients
+                .iter()
+                .map(|(id, c)| {
+                    (
+                        *id,
+                        (
+                            Arc::clone(&c.beta_capabilities),
+                            Arc::clone(&c.available_models),
+                        ),
+                    )
+                })
+                .collect()
+        };
+
         for ep in endpoints {
             if ep.is_default {
                 new_default = Some(ep.id);
             }
-            let client = Self::create_client(&ep, base_aws_config).await;
+            let preserved_caches = preserved.get(&ep.id).cloned();
+            let client =
+                Self::create_client_with_caches(&ep, base_aws_config, preserved_caches).await;
             if let Some(c) = client {
                 new_clients.insert(ep.id, Arc::new(c));
             }
@@ -102,9 +368,10 @@ impl EndpointPool {
         *default_id = new_default;
     }
 
-    async fn create_client(
+    async fn create_client_with_caches(
         endpoint: &Endpoint,
         _base_config: &aws_config::SdkConfig,
+        preserved_caches: Option<PreservedCaches>,
     ) -> Option<EndpointClient> {
         let region = aws_config::Region::new(endpoint.region.clone());
 
@@ -137,6 +404,16 @@ impl EndpointPool {
         let control_client = aws_sdk_bedrock::Client::new(&sdk_config);
         let quota_client = aws_sdk_servicequotas::Client::new(&sdk_config);
 
+        // Reuse existing cache Arcs when reloading a known endpoint, so that
+        // learned capability data and available-model lists survive config reloads.
+        let (beta_capabilities, available_models) = match preserved_caches {
+            Some((beta_cap, avail_models)) => (beta_cap, avail_models),
+            None => (
+                Arc::new(RwLock::new(HashMap::new())),
+                Arc::new(RwLock::new(vec![])),
+            ),
+        };
+
         Some(EndpointClient {
             config: endpoint.clone(),
             runtime_client,
@@ -144,7 +421,8 @@ impl EndpointPool {
             quota_cache: crate::quota::QuotaCache::new(quota_client),
             healthy: AtomicBool::new(false),
             last_health_check: AtomicI64::new(0),
-            available_models: Arc::new(RwLock::new(vec![])),
+            available_models,
+            beta_capabilities,
         })
     }
 
@@ -396,6 +674,7 @@ mod tests {
             healthy: AtomicBool::new(true),
             last_health_check: AtomicI64::new(0),
             available_models: Arc::new(RwLock::new(vec![])),
+            beta_capabilities: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -1105,6 +1384,7 @@ mod tests_slice2 {
             healthy: AtomicBool::new(true),
             last_health_check: AtomicI64::new(0),
             available_models: Arc::new(RwLock::new(vec![])),
+            beta_capabilities: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -1410,6 +1690,7 @@ mod tests_slice3 {
             healthy: AtomicBool::new(true),
             last_health_check: AtomicI64::new(0),
             available_models: Arc::new(RwLock::new(vec![])),
+            beta_capabilities: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -1850,6 +2131,7 @@ mod tests_dynamic_model_slice1 {
             healthy: AtomicBool::new(true),
             last_health_check: AtomicI64::new(0),
             available_models: Arc::new(tokio::sync::RwLock::new(models)),
+            beta_capabilities: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
         }
     }
 
@@ -2033,6 +2315,7 @@ mod tests_model_filtering_slice3 {
             healthy: AtomicBool::new(true),
             last_health_check: AtomicI64::new(0),
             available_models: Arc::new(RwLock::new(models)),
+            beta_capabilities: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -2342,6 +2625,7 @@ mod tests_slice5 {
             healthy: AtomicBool::new(true),
             last_health_check: AtomicI64::new(0),
             available_models: Arc::new(RwLock::new(vec![])),
+            beta_capabilities: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -2446,6 +2730,693 @@ mod tests_slice5 {
         assert_eq!(
             selected.config.id, ids[0],
             "unknown strategy must fall through to primary_fallback behavior (first healthy endpoint)"
+        );
+    }
+}
+
+// ── 1M context / capability-cache — Slice 1 contract tests ──
+//
+// These tests are written BEFORE the production types exist. They will
+// fail to compile until the Builder adds:
+//   - `pub struct CapabilityEntry { pub supported: bool, pub learned_at: Instant, pub source: ProbeSource }`
+//   - `pub enum ProbeSource { SeedProbe, RequestSuccess, RequestRejection, AdminOverride }`
+//   - `pub const CAPABILITY_TTL: Duration`
+//   - `pub const SUFFIX_BETA_MAP: &[(&str, &str, &str)]`
+//   - Field `pub beta_capabilities: Arc<RwLock<HashMap<(String, String), CapabilityEntry>>>` on `EndpointClient`
+//   - Methods `is_beta_supported`, `mark_supported`, `mark_unsupported`, `expired_seed_pairs`
+//     on `EndpointClient`
+
+#[cfg(test)]
+mod tests_1m_capability_cache {
+    use super::*;
+    use std::sync::atomic::AtomicBool;
+    use std::time::{Duration, Instant};
+
+    // ── helpers ────────────────────────────────────────────────────────────
+
+    fn make_test_endpoint_for_cache(id: uuid::Uuid) -> crate::db::schema::Endpoint {
+        crate::db::schema::Endpoint {
+            id,
+            name: "test-ep".to_string(),
+            role_arn: None,
+            external_id: None,
+            inference_profile_arn: None,
+            region: "us-east-1".to_string(),
+            routing_prefix: "us".to_string(),
+            priority: 0,
+            is_default: false,
+            enabled: true,
+            created_at: chrono::Utc::now(),
+        }
+    }
+
+    /// Build a minimal `EndpointClient` with no real AWS credentials.
+    /// Only the `beta_capabilities` field is exercised in these tests.
+    fn make_cache_client() -> EndpointClient {
+        let ep = make_test_endpoint_for_cache(uuid::Uuid::new_v4());
+        let runtime_client = aws_sdk_bedrockruntime::Client::from_conf(
+            aws_sdk_bedrockruntime::Config::builder()
+                .behavior_version(aws_sdk_bedrockruntime::config::BehaviorVersion::latest())
+                .region(aws_config::Region::new("us-east-1"))
+                .build(),
+        );
+        let control_client = aws_sdk_bedrock::Client::from_conf(
+            aws_sdk_bedrock::Config::builder()
+                .behavior_version(aws_sdk_bedrock::config::BehaviorVersion::latest())
+                .region(aws_config::Region::new("us-east-1"))
+                .build(),
+        );
+        let quota_client = aws_sdk_servicequotas::Client::from_conf(
+            aws_sdk_servicequotas::Config::builder()
+                .behavior_version(aws_sdk_servicequotas::config::BehaviorVersion::latest())
+                .region(aws_config::Region::new("us-east-1"))
+                .build(),
+        );
+        EndpointClient {
+            config: ep,
+            runtime_client,
+            control_client,
+            quota_cache: crate::quota::QuotaCache::new(quota_client),
+            healthy: AtomicBool::new(true),
+            last_health_check: std::sync::atomic::AtomicI64::new(0),
+            available_models: Arc::new(tokio::sync::RwLock::new(vec![])),
+            // Builder must add this field:
+            beta_capabilities: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
+        }
+    }
+
+    // ── Test 1 ─────────────────────────────────────────────────────────────
+
+    /// Querying a key that was never inserted must return `None`.
+    #[tokio::test]
+    async fn is_beta_supported_returns_none_when_absent() {
+        let client = make_cache_client();
+        let result = client
+            .is_beta_supported("us.anthropic.claude-opus-4-7", "context-1m-2025-08-07")
+            .await;
+        assert_eq!(
+            result, None,
+            "is_beta_supported must return None for a key that has never been inserted"
+        );
+    }
+
+    // ── Test 2 ─────────────────────────────────────────────────────────────
+
+    /// After `mark_supported`, querying the same key must return `Some(true)`.
+    #[tokio::test]
+    async fn mark_supported_then_query_returns_some_true() {
+        let client = make_cache_client();
+        client
+            .mark_supported(
+                "us.anthropic.claude-opus-4-7",
+                "context-1m-2025-08-07",
+                ProbeSource::SeedProbe,
+            )
+            .await;
+        let result = client
+            .is_beta_supported("us.anthropic.claude-opus-4-7", "context-1m-2025-08-07")
+            .await;
+        assert_eq!(
+            result,
+            Some(true),
+            "is_beta_supported must return Some(true) immediately after mark_supported"
+        );
+    }
+
+    // ── Test 3 ─────────────────────────────────────────────────────────────
+
+    /// Last writer wins: `mark_unsupported` after `mark_supported` on the same
+    /// key must leave the cache reflecting `supported = false`.
+    #[tokio::test]
+    async fn mark_unsupported_overrides_earlier_supported() {
+        let client = make_cache_client();
+        client
+            .mark_supported(
+                "us.anthropic.claude-sonnet-4-6",
+                "context-1m-2025-08-07",
+                ProbeSource::SeedProbe,
+            )
+            .await;
+        client
+            .mark_unsupported(
+                "us.anthropic.claude-sonnet-4-6",
+                "context-1m-2025-08-07",
+                ProbeSource::RequestRejection,
+            )
+            .await;
+        let result = client
+            .is_beta_supported("us.anthropic.claude-sonnet-4-6", "context-1m-2025-08-07")
+            .await;
+        assert_eq!(
+            result,
+            Some(false),
+            "mark_unsupported after mark_supported must yield Some(false) — last writer wins"
+        );
+    }
+
+    // ── Test 4 ─────────────────────────────────────────────────────────────
+
+    /// Last writer wins (opposite direction): `mark_supported` after
+    /// `mark_unsupported` on the same key must yield `Some(true)`.
+    #[tokio::test]
+    async fn mark_supported_overrides_earlier_unsupported() {
+        let client = make_cache_client();
+        client
+            .mark_unsupported(
+                "us.anthropic.claude-haiku-4-5",
+                "context-1m-2025-08-07",
+                ProbeSource::SeedProbe,
+            )
+            .await;
+        client
+            .mark_supported(
+                "us.anthropic.claude-haiku-4-5",
+                "context-1m-2025-08-07",
+                ProbeSource::RequestSuccess,
+            )
+            .await;
+        let result = client
+            .is_beta_supported("us.anthropic.claude-haiku-4-5", "context-1m-2025-08-07")
+            .await;
+        assert_eq!(
+            result,
+            Some(true),
+            "mark_supported after mark_unsupported must yield Some(true) — last writer wins"
+        );
+    }
+
+    // ── Test 5 ─────────────────────────────────────────────────────────────
+
+    /// A non-`AdminOverride` entry with `learned_at` older than `CAPABILITY_TTL`
+    /// must be treated as absent — `is_beta_supported` must return `None`.
+    #[tokio::test]
+    async fn non_override_entry_expires_after_ttl() {
+        let client = make_cache_client();
+        // Directly insert a backdated entry (learned_at = now - TTL - 1s)
+        {
+            let mut map = client.beta_capabilities.write().await;
+            map.insert(
+                (
+                    "us.anthropic.claude-opus-4-7".to_string(),
+                    "context-1m-2025-08-07".to_string(),
+                ),
+                CapabilityEntry {
+                    supported: true,
+                    learned_at: Instant::now() - (CAPABILITY_TTL + Duration::from_secs(1)),
+                    source: ProbeSource::SeedProbe,
+                },
+            );
+        }
+        let result = client
+            .is_beta_supported("us.anthropic.claude-opus-4-7", "context-1m-2025-08-07")
+            .await;
+        assert_eq!(
+            result, None,
+            "is_beta_supported must return None for a SeedProbe entry whose TTL has elapsed"
+        );
+    }
+
+    // ── Test 6 ─────────────────────────────────────────────────────────────
+
+    /// An `AdminOverride` entry must be returned even when `learned_at` is far
+    /// in the past (TTL is ignored for admin overrides).
+    #[tokio::test]
+    async fn admin_override_ignores_ttl() {
+        let client = make_cache_client();
+        // Directly insert a backdated AdminOverride entry (learned_at = now - 48h)
+        {
+            let mut map = client.beta_capabilities.write().await;
+            map.insert(
+                (
+                    "us.anthropic.claude-opus-4-7".to_string(),
+                    "context-1m-2025-08-07".to_string(),
+                ),
+                CapabilityEntry {
+                    supported: true,
+                    learned_at: Instant::now() - Duration::from_secs(48 * 3600),
+                    source: ProbeSource::AdminOverride,
+                },
+            );
+        }
+        let result = client
+            .is_beta_supported("us.anthropic.claude-opus-4-7", "context-1m-2025-08-07")
+            .await;
+        assert_eq!(
+            result,
+            Some(true),
+            "AdminOverride entries must not expire regardless of learned_at age"
+        );
+    }
+
+    // ── Test 7 ─────────────────────────────────────────────────────────────
+
+    /// A fresh client with no cache entries must report every
+    /// `(profile, beta)` pair from `SUFFIX_BETA_MAP` as needing a seed probe.
+    #[tokio::test]
+    async fn expired_seed_pairs_returns_absent_pairs() {
+        let client = make_cache_client();
+        let profiles = vec!["us.anthropic.claude-opus-4-7".to_string()];
+        let pairs = client.expired_seed_pairs(&profiles).await;
+
+        // SUFFIX_BETA_MAP currently has one entry: ("[1m]", "context-1m-2025-08-07", "1M context")
+        // So for one profile we expect exactly one pair.
+        assert_eq!(
+            pairs.len(),
+            1,
+            "fresh client must report one pair per profile × SUFFIX_BETA_MAP entry"
+        );
+        assert!(
+            pairs.contains(&(
+                "us.anthropic.claude-opus-4-7".to_string(),
+                "context-1m-2025-08-07".to_string()
+            )),
+            "the absent pair must be (profile, context-1m-2025-08-07)"
+        );
+    }
+
+    // ── Test 8 ─────────────────────────────────────────────────────────────
+
+    /// A pair with a fresh (non-expired) entry must NOT appear in
+    /// `expired_seed_pairs`.
+    #[tokio::test]
+    async fn expired_seed_pairs_skips_fresh_entries() {
+        let client = make_cache_client();
+        // Pre-populate with a fresh SeedProbe entry (just now)
+        client
+            .mark_supported(
+                "us.anthropic.claude-opus-4-7",
+                "context-1m-2025-08-07",
+                ProbeSource::SeedProbe,
+            )
+            .await;
+
+        let profiles = vec!["us.anthropic.claude-opus-4-7".to_string()];
+        let pairs = client.expired_seed_pairs(&profiles).await;
+
+        assert!(
+            pairs.is_empty(),
+            "expired_seed_pairs must return empty when all pairs have fresh cache entries"
+        );
+    }
+
+    // ── Test 9 ─────────────────────────────────────────────────────────────
+
+    /// A `SeedProbe` entry whose TTL has elapsed must re-appear in
+    /// `expired_seed_pairs` (re-probe is needed).
+    #[tokio::test]
+    async fn expired_seed_pairs_returns_expired_non_override() {
+        let client = make_cache_client();
+        // Directly insert a backdated SeedProbe entry
+        {
+            let mut map = client.beta_capabilities.write().await;
+            map.insert(
+                (
+                    "us.anthropic.claude-opus-4-7".to_string(),
+                    "context-1m-2025-08-07".to_string(),
+                ),
+                CapabilityEntry {
+                    supported: true,
+                    learned_at: Instant::now() - (CAPABILITY_TTL + Duration::from_secs(60)),
+                    source: ProbeSource::SeedProbe,
+                },
+            );
+        }
+
+        let profiles = vec!["us.anthropic.claude-opus-4-7".to_string()];
+        let pairs = client.expired_seed_pairs(&profiles).await;
+
+        assert_eq!(
+            pairs.len(),
+            1,
+            "expired SeedProbe entry must appear in expired_seed_pairs (re-probe needed)"
+        );
+        assert!(
+            pairs.contains(&(
+                "us.anthropic.claude-opus-4-7".to_string(),
+                "context-1m-2025-08-07".to_string()
+            )),
+            "the expired pair must be (profile, context-1m-2025-08-07)"
+        );
+    }
+
+    // ── Test 10 ────────────────────────────────────────────────────────────
+
+    /// An `AdminOverride` entry must NEVER appear in `expired_seed_pairs`,
+    /// even when its `learned_at` is far in the past. Admin overrides are set
+    /// explicitly by an operator and must not be re-probed automatically.
+    #[tokio::test]
+    async fn expired_seed_pairs_skips_admin_overrides() {
+        let client = make_cache_client();
+        // Directly insert a backdated AdminOverride entry
+        {
+            let mut map = client.beta_capabilities.write().await;
+            map.insert(
+                (
+                    "us.anthropic.claude-opus-4-7".to_string(),
+                    "context-1m-2025-08-07".to_string(),
+                ),
+                CapabilityEntry {
+                    supported: false,
+                    learned_at: Instant::now() - Duration::from_secs(48 * 3600),
+                    source: ProbeSource::AdminOverride,
+                },
+            );
+        }
+
+        let profiles = vec!["us.anthropic.claude-opus-4-7".to_string()];
+        let pairs = client.expired_seed_pairs(&profiles).await;
+
+        assert!(
+            pairs.is_empty(),
+            "AdminOverride entries must not appear in expired_seed_pairs — operators set them explicitly"
+        );
+    }
+}
+
+// ── Task 2: Health-loop seed probing — contract tests ──
+//
+// These tests are written BEFORE the production types exist. They will fail to
+// compile until the Builder adds, somewhere in `src/endpoint/mod.rs` (or a
+// sibling module `src/endpoint/probe.rs` re-exported from here):
+//
+//   pub enum ProbeOutcome { Supported, Unsupported, Inconclusive }
+//
+//   pub fn classify_probe_outcome(
+//       success: bool,
+//       is_validation_exception: bool,
+//       error_message: &str,
+//       beta: &str,
+//   ) -> ProbeOutcome { ... }
+//
+//   pub async fn apply_probe_outcome(
+//       client: &EndpointClient,
+//       profile: &str,
+//       beta: &str,
+//       outcome: ProbeOutcome,
+//   ) { ... }
+//
+// `classify_probe_outcome` is a pure function — no await, no I/O.
+// `apply_probe_outcome` calls `mark_supported` / `mark_unsupported` on the
+// client, or does nothing for `Inconclusive`.
+
+#[cfg(test)]
+mod tests_seed_probe {
+    use super::*;
+    use std::sync::atomic::AtomicBool;
+
+    // ── helper: build a minimal EndpointClient (same pattern as tests_1m_capability_cache) ──
+
+    fn make_cache_client() -> EndpointClient {
+        let ep = crate::db::schema::Endpoint {
+            id: uuid::Uuid::new_v4(),
+            name: "probe-test-ep".to_string(),
+            role_arn: None,
+            external_id: None,
+            inference_profile_arn: None,
+            region: "us-east-1".to_string(),
+            routing_prefix: "us".to_string(),
+            priority: 0,
+            is_default: false,
+            enabled: true,
+            created_at: chrono::Utc::now(),
+        };
+        let runtime_client = aws_sdk_bedrockruntime::Client::from_conf(
+            aws_sdk_bedrockruntime::Config::builder()
+                .behavior_version(aws_sdk_bedrockruntime::config::BehaviorVersion::latest())
+                .region(aws_config::Region::new("us-east-1"))
+                .build(),
+        );
+        let control_client = aws_sdk_bedrock::Client::from_conf(
+            aws_sdk_bedrock::Config::builder()
+                .behavior_version(aws_sdk_bedrock::config::BehaviorVersion::latest())
+                .region(aws_config::Region::new("us-east-1"))
+                .build(),
+        );
+        let quota_client = aws_sdk_servicequotas::Client::from_conf(
+            aws_sdk_servicequotas::Config::builder()
+                .behavior_version(aws_sdk_servicequotas::config::BehaviorVersion::latest())
+                .region(aws_config::Region::new("us-east-1"))
+                .build(),
+        );
+        EndpointClient {
+            config: ep,
+            runtime_client,
+            control_client,
+            quota_cache: crate::quota::QuotaCache::new(quota_client),
+            healthy: AtomicBool::new(true),
+            last_health_check: std::sync::atomic::AtomicI64::new(0),
+            available_models: Arc::new(tokio::sync::RwLock::new(vec![])),
+            beta_capabilities: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
+        }
+    }
+
+    // ── Tests 1-7: classify_probe_outcome — pure function, no async ──
+
+    /// Test 1: HTTP 200 (success=true) must always yield `ProbeOutcome::Supported`,
+    /// regardless of the error_message and is_validation_exception values.
+    #[test]
+    fn classify_success_returns_supported() {
+        let outcome = classify_probe_outcome(true, false, "", "context-1m-2025-08-07");
+        assert_eq!(
+            outcome,
+            ProbeOutcome::Supported,
+            "success=true must yield ProbeOutcome::Supported"
+        );
+    }
+
+    /// Test 2: ValidationException whose message contains the exact beta name
+    /// must yield `ProbeOutcome::Unsupported`.
+    #[test]
+    fn classify_validation_with_beta_named_returns_unsupported() {
+        let outcome = classify_probe_outcome(
+            false,
+            true,
+            "ValidationException: Invalid beta flag context-1m-2025-08-07 for model X",
+            "context-1m-2025-08-07",
+        );
+        assert_eq!(
+            outcome,
+            ProbeOutcome::Unsupported,
+            "ValidationException whose message names the beta must yield ProbeOutcome::Unsupported"
+        );
+    }
+
+    /// Test 3: Beta name matching must be case-insensitive.
+    ///
+    /// Bedrock's error format is not contractually cased; CCAG must not miss a
+    /// rejection because the SDK upcased the beta name.
+    #[test]
+    fn classify_validation_with_beta_named_case_insensitive() {
+        // Beta name in the error message is uppercased — must still match.
+        let outcome = classify_probe_outcome(
+            false,
+            true,
+            "ValidationException: Invalid beta flag CONTEXT-1M-2025-08-07 for model X",
+            "context-1m-2025-08-07",
+        );
+        assert_eq!(
+            outcome,
+            ProbeOutcome::Unsupported,
+            "classify_probe_outcome must match the beta name case-insensitively"
+        );
+    }
+
+    /// Test 4: A ValidationException that does NOT name the beta must yield
+    /// `ProbeOutcome::Inconclusive`.
+    ///
+    /// Rationale: a validation error unrelated to the beta (e.g. quota,
+    /// malformed input, access denied) must not poison the cache as
+    /// "unsupported". We cannot distinguish the cause, so we leave the cache
+    /// unchanged and retry on the next tick.
+    #[test]
+    fn classify_validation_without_beta_named_returns_inconclusive() {
+        let outcome = classify_probe_outcome(
+            false,
+            true,
+            "ValidationException: AccessDeniedException: User is not authorized",
+            "context-1m-2025-08-07",
+        );
+        assert_eq!(
+            outcome,
+            ProbeOutcome::Inconclusive,
+            "ValidationException that does not name the beta must yield ProbeOutcome::Inconclusive"
+        );
+    }
+
+    /// Test 5: ThrottlingException must yield `ProbeOutcome::Inconclusive`.
+    ///
+    /// Throttling tells us nothing about beta support; we must retry next tick
+    /// rather than caching a false negative.
+    #[test]
+    fn classify_throttling_returns_inconclusive() {
+        let outcome = classify_probe_outcome(
+            false,
+            false,
+            "ThrottlingException: Rate exceeded",
+            "context-1m-2025-08-07",
+        );
+        assert_eq!(
+            outcome,
+            ProbeOutcome::Inconclusive,
+            "ThrottlingException must yield ProbeOutcome::Inconclusive"
+        );
+    }
+
+    /// Test 6: InternalServerError / 5xx must yield `ProbeOutcome::Inconclusive`.
+    ///
+    /// Transient server-side errors must not be recorded as definitive
+    /// unsupported evidence.
+    #[test]
+    fn classify_5xx_returns_inconclusive() {
+        let outcome = classify_probe_outcome(
+            false,
+            false,
+            "InternalServerError: An internal server error occurred",
+            "context-1m-2025-08-07",
+        );
+        assert_eq!(
+            outcome,
+            ProbeOutcome::Inconclusive,
+            "InternalServerError must yield ProbeOutcome::Inconclusive"
+        );
+    }
+
+    /// Test 7: Network/dispatch failures must yield `ProbeOutcome::Inconclusive`.
+    ///
+    /// A connection reset or DNS failure is not evidence of beta support or
+    /// rejection — it means we could not reach Bedrock at all.
+    #[test]
+    fn classify_network_error_returns_inconclusive() {
+        let outcome = classify_probe_outcome(
+            false,
+            false,
+            "dispatch failure: connection reset by peer",
+            "context-1m-2025-08-07",
+        );
+        assert_eq!(
+            outcome,
+            ProbeOutcome::Inconclusive,
+            "Network/dispatch failure must yield ProbeOutcome::Inconclusive"
+        );
+    }
+
+    // ── Tests 8-11: apply_probe_outcome — integration-shaped, drives EndpointClient ──
+
+    /// Test 8: `ProbeOutcome::Supported` must write `(supported=true, source=SeedProbe)`
+    /// into the client's beta capability cache.
+    #[tokio::test]
+    async fn probe_outcome_supported_marks_cache() {
+        let client = make_cache_client();
+        let profile = "us.anthropic.claude-opus-4-7";
+        let beta = "context-1m-2025-08-07";
+
+        // Pre-condition: cache is empty
+        assert_eq!(
+            client.is_beta_supported(profile, beta).await,
+            None,
+            "cache must be empty before apply_probe_outcome"
+        );
+
+        apply_probe_outcome(&client, profile, beta, ProbeOutcome::Supported).await;
+
+        let result = client.is_beta_supported(profile, beta).await;
+        assert_eq!(
+            result,
+            Some(true),
+            "ProbeOutcome::Supported must write Some(true) into the cache"
+        );
+
+        // Also verify source is SeedProbe
+        let map = client.beta_capabilities.read().await;
+        let entry = map
+            .get(&(profile.to_string(), beta.to_string()))
+            .expect("entry must exist after Supported outcome");
+        assert_eq!(
+            entry.source,
+            ProbeSource::SeedProbe,
+            "apply_probe_outcome(Supported) must record source=SeedProbe"
+        );
+    }
+
+    /// Test 9: `ProbeOutcome::Unsupported` must write `(supported=false, source=SeedProbe)`
+    /// into the client's beta capability cache.
+    #[tokio::test]
+    async fn probe_outcome_unsupported_marks_cache_false() {
+        let client = make_cache_client();
+        let profile = "us.anthropic.claude-haiku-4-5-20251001-v1:0";
+        let beta = "context-1m-2025-08-07";
+
+        apply_probe_outcome(&client, profile, beta, ProbeOutcome::Unsupported).await;
+
+        let result = client.is_beta_supported(profile, beta).await;
+        assert_eq!(
+            result,
+            Some(false),
+            "ProbeOutcome::Unsupported must write Some(false) into the cache"
+        );
+
+        let map = client.beta_capabilities.read().await;
+        let entry = map
+            .get(&(profile.to_string(), beta.to_string()))
+            .expect("entry must exist after Unsupported outcome");
+        assert_eq!(
+            entry.source,
+            ProbeSource::SeedProbe,
+            "apply_probe_outcome(Unsupported) must record source=SeedProbe"
+        );
+    }
+
+    /// Test 10: `ProbeOutcome::Inconclusive` on a fresh (empty) cache must leave
+    /// the cache unchanged — `is_beta_supported` must still return `None`.
+    ///
+    /// This is the "throttling / 5xx / network error" path: we learned nothing,
+    /// so we do not touch the cache and the pair will be re-probed next tick.
+    #[tokio::test]
+    async fn probe_outcome_inconclusive_leaves_cache_unchanged() {
+        let client = make_cache_client();
+        let profile = "us.anthropic.claude-sonnet-4-6-20250514";
+        let beta = "context-1m-2025-08-07";
+
+        apply_probe_outcome(&client, profile, beta, ProbeOutcome::Inconclusive).await;
+
+        let result = client.is_beta_supported(profile, beta).await;
+        assert_eq!(
+            result, None,
+            "ProbeOutcome::Inconclusive on empty cache must leave it empty (still None)"
+        );
+    }
+
+    /// Test 11: `ProbeOutcome::Inconclusive` must NOT overwrite an existing cache
+    /// entry.
+    ///
+    /// Scenario: a previous successful probe wrote `Some(true)`. Then a
+    /// throttling event fires before the 24h TTL expires. The `Inconclusive`
+    /// outcome must not clobber the earlier `Supported` value.
+    #[tokio::test]
+    async fn probe_outcome_inconclusive_does_not_overwrite_existing() {
+        let client = make_cache_client();
+        let profile = "us.anthropic.claude-opus-4-7";
+        let beta = "context-1m-2025-08-07";
+
+        // Pre-populate with a supported entry (simulates prior successful probe)
+        client
+            .mark_supported(profile, beta, ProbeSource::SeedProbe)
+            .await;
+
+        assert_eq!(
+            client.is_beta_supported(profile, beta).await,
+            Some(true),
+            "pre-condition: cache must have Some(true) before Inconclusive outcome"
+        );
+
+        // Apply an Inconclusive outcome (e.g. throttling on re-probe attempt)
+        apply_probe_outcome(&client, profile, beta, ProbeOutcome::Inconclusive).await;
+
+        let result = client.is_beta_supported(profile, beta).await;
+        assert_eq!(
+            result,
+            Some(true),
+            "ProbeOutcome::Inconclusive must not overwrite an existing Some(true) cache entry"
         );
     }
 }
