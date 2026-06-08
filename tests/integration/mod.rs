@@ -1,4 +1,5 @@
 pub mod accept_model_tests;
+pub mod admin_mappings_tests;
 pub mod admin_tests;
 pub mod aip_compat_shim_tests;
 pub mod aip_legacy_migration_tests;

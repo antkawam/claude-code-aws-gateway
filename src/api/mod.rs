@@ -171,10 +171,7 @@ pub fn router(state: Arc<GatewayState>) -> Router {
             "/admin/mappings",
             get(admin::list_mappings).post(admin::create_mapping),
         )
-        .route(
-            "/admin/mappings/discover",
-            post(admin::discover_mapping),
-        )
+        .route("/admin/mappings/discover", post(admin::discover_mapping))
         .route(
             "/admin/mappings/{prefix}",
             put(admin::update_mapping).delete(admin::delete_mapping),

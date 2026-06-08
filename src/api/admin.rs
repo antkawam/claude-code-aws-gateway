@@ -4661,7 +4661,9 @@ fn validate_mapping_input(
 ) -> Result<(), Response> {
     // anthropic_prefix: non-empty, ≤64 chars, no leading/trailing whitespace
     if anthropic_prefix.is_empty() {
-        return Err(mapping_validation_error("anthropic_prefix must not be empty"));
+        return Err(mapping_validation_error(
+            "anthropic_prefix must not be empty",
+        ));
     }
     if anthropic_prefix.len() > 64 {
         return Err(mapping_validation_error(
@@ -4755,10 +4757,7 @@ fn mapping_conflict_error(message: &str) -> Response {
 }
 
 /// GET /admin/mappings — list all model mappings with full metadata.
-pub async fn list_mappings(
-    State(state): State<Arc<GatewayState>>,
-    headers: HeaderMap,
-) -> Response {
+pub async fn list_mappings(State(state): State<Arc<GatewayState>>, headers: HeaderMap) -> Response {
     if let Err(resp) = check_admin_auth(&headers, &state).await {
         return resp;
     }
@@ -4859,9 +4858,7 @@ pub async fn update_mapping(
             );
             Json(json!(row)).into_response()
         }
-        Ok(None) => mapping_not_found_error(&format!(
-            "No mapping found for prefix '{prefix}'"
-        )),
+        Ok(None) => mapping_not_found_error(&format!("No mapping found for prefix '{prefix}'")),
         Err(e) => admin_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
     }
 }
@@ -4888,9 +4885,7 @@ pub async fn delete_mapping(
             );
             Json(json!({ "deleted": true })).into_response()
         }
-        Ok(false) => mapping_not_found_error(&format!(
-            "No mapping found for prefix '{prefix}'"
-        )),
+        Ok(false) => mapping_not_found_error(&format!("No mapping found for prefix '{prefix}'")),
         Err(e) => admin_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
     }
 }

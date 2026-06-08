@@ -84,16 +84,11 @@ pub async fn get_mapping_full(
 
 /// Delete a mapping by prefix. Returns `true` if a row was deleted,
 /// `false` if the prefix did not exist. Bumps `cache_version`.
-pub async fn delete_mapping(
-    pool: &PgPool,
-    anthropic_prefix: &str,
-) -> Result<bool, sqlx::Error> {
-    let result = sqlx::query(
-        r#"DELETE FROM model_mappings WHERE anthropic_prefix = $1"#,
-    )
-    .bind(anthropic_prefix)
-    .execute(pool)
-    .await?;
+pub async fn delete_mapping(pool: &PgPool, anthropic_prefix: &str) -> Result<bool, sqlx::Error> {
+    let result = sqlx::query(r#"DELETE FROM model_mappings WHERE anthropic_prefix = $1"#)
+        .bind(anthropic_prefix)
+        .execute(pool)
+        .await?;
 
     if result.rows_affected() == 0 {
         return Ok(false);
