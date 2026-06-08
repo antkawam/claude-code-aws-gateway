@@ -2137,10 +2137,9 @@ input[type="date"].oa-filter-select { background-image: none; padding-right: 8px
               CCAG selects an endpoint per-request based on the team's routing strategy, endpoint priority, and health status.
               Adding multiple endpoints lets you pool quota across accounts or regions.
             </p>
-            <p style="margin:0 0 4px;color:var(--text);font-weight:500;font-size:11px">Routing Target</p>
+            <p style="margin:0 0 4px;color:var(--text);font-weight:500;font-size:11px">Application Inference Profiles (AIPs)</p>
             <ul style="margin:0 0 10px;padding-left:18px">
-              <li><strong>Cross-region inference (standard)</strong> — Bedrock routes the request to the nearest healthy region within your chosen scope (US, EU, APAC, etc.) using system-defined inference profiles.</li>
-              <li><strong>Application inference profile</strong> — Invokes a specific profile ARN directly. Use this for custom profiles with cost-tracking tags or custom throttle limits, or for cross-account access granted via a resource policy (no role assumption needed in that case).</li>
+              <li>AIPs are configured per-model on each endpoint. Use the AIP Overrides panel after creating an endpoint to map specific models to tagged AIP ARNs; models without an override use the system CRI for the endpoint's region scope.</li>
             </ul>
             <p style="margin:0 0 4px;color:var(--text);font-weight:500;font-size:11px">Credentials</p>
             <ul style="margin:0 0 10px;padding-left:18px">
@@ -3056,53 +3055,26 @@ input[type="date"].oa-filter-select { background-image: none; padding-right: 8px
         <input class="form-input" id="me-name" placeholder="e.g. US Production, EU Backup">
       </div>
 
-      <!-- Section 1: Routing Target -->
+      <!-- Section 1: Deployment Region -->
       <div style="margin-bottom:16px">
-        <div style="font-size:11px;text-transform:uppercase;letter-spacing:0.06em;color:var(--text-muted);margin-bottom:8px">Routing Target</div>
-        <div style="display:flex;flex-direction:column;gap:6px">
-          <label style="display:flex;align-items:flex-start;gap:10px;padding:10px 12px;border:1px solid var(--border);border-radius:var(--radius);cursor:pointer;transition:border-color 0.15s" id="me-routing-standard-label">
-            <input type="radio" name="me-routing" value="standard" onchange="onRoutingChange()" style="margin-top:2px;flex-shrink:0">
-            <div>
-              <div style="font-size:13px;font-weight:500">Cross-region inference <span class="badge badge-blue" style="font-size:10px;margin-left:4px">Standard</span></div>
-              <div class="form-hint" style="margin:2px 0 0">Bedrock routes requests across regions in your chosen scope using system-defined inference profiles.</div>
-            </div>
-          </label>
-          <label style="display:flex;align-items:flex-start;gap:10px;padding:10px 12px;border:1px solid var(--border);border-radius:var(--radius);cursor:pointer;transition:border-color 0.15s" id="me-routing-profile-label">
-            <input type="radio" name="me-routing" value="profile" onchange="onRoutingChange()" style="margin-top:2px;flex-shrink:0">
-            <div>
-              <div style="font-size:13px;font-weight:500">Application inference profile</div>
-              <div class="form-hint" style="margin:2px 0 0">Invoke a specific profile ARN — for custom profiles with cost tags, or cross-account access via resource policy.</div>
-            </div>
-          </label>
-        </div>
-
-        <div id="me-standard-fields" style="margin-top:12px">
-          <div class="form-row">
-            <div class="form-group" style="flex:2">
-              <label class="form-label">Geographic Scope</label>
-              <select class="form-select" id="me-scope" onchange="onScopeChange()">
-                <option value="us">US (Virginia, Oregon, Ohio, N. California, Canada)</option>
-                <option value="eu">Europe (Frankfurt, Paris, London, Stockholm, Ireland)</option>
-                <option value="apac">Asia Pacific (Tokyo, Mumbai, Singapore, Seoul, Osaka)</option>
-                <option value="au">Australia (Sydney, Melbourne)</option>
-                <option value="global">Global (all regions)</option>
-                <option value="us-gov">US GovCloud (GovCloud West, GovCloud East)</option>
-              </select>
-              <div class="form-hint" id="me-scope-hint">Requests are routed across regions within this scope by Bedrock's cross-region inference.</div>
-            </div>
-            <div class="form-group" style="flex:1">
-              <label class="form-label">Home Region</label>
-              <input class="form-input" id="me-region" placeholder="us-east-1">
-              <div class="form-hint">API connection region — pick one within the scope.</div>
-            </div>
+        <div style="font-size:11px;text-transform:uppercase;letter-spacing:0.06em;color:var(--text-muted);margin-bottom:8px">Deployment Region</div>
+        <div class="form-row">
+          <div class="form-group" style="flex:2">
+            <label class="form-label">Geographic Scope</label>
+            <select class="form-select" id="me-scope" onchange="onScopeChange()">
+              <option value="us">US (Virginia, Oregon, Ohio, N. California, Canada)</option>
+              <option value="eu">Europe (Frankfurt, Paris, London, Stockholm, Ireland)</option>
+              <option value="apac">Asia Pacific (Tokyo, Mumbai, Singapore, Seoul, Osaka)</option>
+              <option value="au">Australia (Sydney, Melbourne)</option>
+              <option value="global">Global (all regions)</option>
+              <option value="us-gov">US GovCloud (GovCloud West, GovCloud East)</option>
+            </select>
+            <div class="form-hint" id="me-scope-hint">Requests are routed across regions within this scope by Bedrock's cross-region inference.</div>
           </div>
-        </div>
-
-        <div id="me-profile-fields" style="display:none;margin-top:12px">
-          <div class="form-group">
-            <label class="form-label">Inference Profile ARN</label>
-            <input class="form-input" id="me-profile-arn" placeholder="arn:aws:bedrock:us-east-1:123456789012:application-inference-profile/..." oninput="onProfileArnChange()">
-            <div class="form-hint" id="me-profile-arn-hint">Region and account are auto-detected from the ARN.</div>
+          <div class="form-group" style="flex:1">
+            <label class="form-label">Home Region</label>
+            <input class="form-input" id="me-region" placeholder="us-east-1">
+            <div class="form-hint">API connection region — pick one within the scope.</div>
           </div>
         </div>
       </div>
@@ -4840,6 +4812,7 @@ function toggleEndpointCard(id) {
     details.style.display = '';
     if (chevron) chevron.style.transform = 'rotate(90deg)';
     loadEndpointCapability(id);
+    loadAipOverrides(id);
   }
 }
 
@@ -4906,6 +4879,7 @@ function renderEndpoints() {
           </div>` : ''}
         </div>
         <div id="ep-capability-${ep.id}" style="margin-top:12px"></div>
+        <div id="ep-aip-overrides-${ep.id}" style="margin-top:12px"></div>
         <div style="display:flex;align-items:center;justify-content:space-between;margin-top:10px" onclick="event.stopPropagation()">
           <div style="display:flex;gap:6px">
             ${!ep.is_default ? `<button class="btn btn-sm" onclick="setDefaultEndpoint('${ep.id}')" title="Set as default endpoint for teams with no assignment">Set as Default</button>` : ''}
@@ -4920,6 +4894,7 @@ function renderEndpoints() {
   eps.forEach(ep => {
     if (expandedEndpoints.has(ep.id)) {
       loadEndpointCapability(ep.id);
+      loadAipOverrides(ep.id);
     }
   });
 }
@@ -5115,6 +5090,131 @@ async function loadEndpointCapability(id) {
   el.innerHTML = finalHtml;
 }
 
+// ---- AIP Overrides panel ----
+
+async function loadAipOverrides(id) {
+  const el = document.getElementById('ep-aip-overrides-' + id);
+  if (!el) return;
+  el.innerHTML = '<span style="color:var(--text-muted);font-size:12px">Loading AIP overrides…</span>';
+  const res = await api('GET', `/admin/endpoints/${id}/aip-overrides`);
+  renderAipOverridesPanel(id, res.overrides || res || []);
+}
+
+function renderAipOverridesPanel(id, overrides) {
+  const el = document.getElementById('ep-aip-overrides-' + id);
+  if (!el) return;
+
+  const rowsHtml = overrides.length === 0
+    ? `<div style="font-size:12px;color:var(--text-muted);padding:8px 0">No AIP overrides for this endpoint. Models route via cross-region inference.</div>`
+    : `<table style="width:100%;border-collapse:collapse;font-size:12px">
+        <thead>
+          <tr style="color:var(--text-muted);font-size:11px;text-transform:uppercase;letter-spacing:0.05em">
+            <th style="text-align:left;padding:4px 8px 6px 0;font-weight:500">Model</th>
+            <th style="text-align:left;padding:4px 8px 6px 0;font-weight:500">AIP ARN</th>
+            <th style="text-align:left;padding:4px 8px 6px 0;font-weight:500">Set</th>
+            <th style="text-align:left;padding:4px 8px 6px 0;font-weight:500">By</th>
+            <th style="padding:4px 0 6px 0;font-weight:500"></th>
+          </tr>
+        </thead>
+        <tbody>
+          ${overrides.map(o => {
+            const arn = o.aip_arn || '';
+            const shortArn = arn.length > 55 ? arn.slice(0, 25) + '…' + arn.slice(-27) : arn;
+            const setAt = o.set_at ? relativeTime(o.set_at) : '';
+            return `<tr>
+              <td style="padding:4px 8px 4px 0;vertical-align:middle"><code style="font-family:var(--font-mono);font-size:11px">${esc(o.model_id)}</code></td>
+              <td style="padding:4px 8px 4px 0;vertical-align:middle;max-width:260px;overflow:hidden" title="${esc(arn)}"><code style="font-family:var(--font-mono);font-size:11px;white-space:nowrap">${esc(shortArn)}</code></td>
+              <td style="padding:4px 8px 4px 0;vertical-align:middle;white-space:nowrap;color:var(--text-muted)">${esc(setAt)}</td>
+              <td style="padding:4px 8px 4px 0;vertical-align:middle;color:var(--text-muted)">${esc(o.set_by || '')}</td>
+              <td style="padding:4px 0 4px 0;vertical-align:middle;text-align:right">
+                <button class="btn btn-danger btn-sm" onclick="removeAipOverride('${esc(id)}','${esc(o.model_id)}')" style="padding:2px 8px;font-size:11px">Remove</button>
+              </td>
+            </tr>`;
+          }).join('')}
+        </tbody>
+      </table>`;
+
+  const panelHtml = `<div style="padding:8px 12px;background:var(--bg-inset);border-radius:var(--radius);border:1px solid var(--border)" onclick="event.stopPropagation()">
+    <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:6px">
+      <div>
+        <span style="font-size:11px;text-transform:uppercase;letter-spacing:0.05em;color:var(--text-muted);font-weight:500">AIP Overrides</span>
+        <span style="display:block;font-size:11px;color:var(--text-muted);margin-top:2px">Map specific models to tagged AIP ARNs. Models without an override use the system CRI for this endpoint's region scope.</span>
+      </div>
+      <button class="btn btn-secondary btn-sm" style="white-space:nowrap;margin-left:12px" onclick="showAipAddForm('${esc(id)}')">Add Override</button>
+    </div>
+    ${rowsHtml}
+    <div id="ep-aip-add-form-${esc(id)}" style="display:none;margin-top:10px;padding-top:10px;border-top:1px solid var(--border)">
+      <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:flex-end">
+        <div class="form-group" style="flex:1;min-width:140px;margin-bottom:0">
+          <label class="form-label" style="font-size:11px">Model ID</label>
+          <input class="form-input" id="ep-aip-model-${esc(id)}" placeholder="claude-sonnet-4-5" style="font-family:var(--font-mono);font-size:12px">
+        </div>
+        <div class="form-group" style="flex:3;min-width:220px;margin-bottom:0">
+          <label class="form-label" style="font-size:11px">AIP ARN</label>
+          <input class="form-input" id="ep-aip-arn-${esc(id)}" placeholder="arn:aws:bedrock:us-east-1:123456789012:application-inference-profile/..." style="font-family:var(--font-mono);font-size:12px">
+        </div>
+        <div class="form-group" style="flex:2;min-width:140px;margin-bottom:0">
+          <label class="form-label" style="font-size:11px">Reason (optional)</label>
+          <input class="form-input" id="ep-aip-reason-${esc(id)}" placeholder="cost-tracking, cross-account…" style="font-size:12px">
+        </div>
+        <div style="display:flex;gap:6px;margin-bottom:0;padding-bottom:1px">
+          <button class="btn btn-primary btn-sm" onclick="saveAipOverride('${esc(id)}')">Save</button>
+          <button class="btn btn-secondary btn-sm" onclick="hideAipAddForm('${esc(id)}')">Cancel</button>
+        </div>
+      </div>
+    </div>
+  </div>`;
+
+  el.innerHTML = panelHtml;
+}
+
+function showAipAddForm(id) {
+  const form = document.getElementById('ep-aip-add-form-' + id);
+  if (form) { form.style.display = ''; document.getElementById('ep-aip-model-' + id)?.focus(); }
+}
+
+function hideAipAddForm(id) {
+  const form = document.getElementById('ep-aip-add-form-' + id);
+  if (form) {
+    form.style.display = 'none';
+    const modelEl = document.getElementById('ep-aip-model-' + id);
+    const arnEl = document.getElementById('ep-aip-arn-' + id);
+    const reasonEl = document.getElementById('ep-aip-reason-' + id);
+    if (modelEl) modelEl.value = '';
+    if (arnEl) arnEl.value = '';
+    if (reasonEl) reasonEl.value = '';
+  }
+}
+
+async function saveAipOverride(id) {
+  const model_id = (document.getElementById('ep-aip-model-' + id)?.value || '').trim();
+  const aip_arn = (document.getElementById('ep-aip-arn-' + id)?.value || '').trim();
+  const reason = (document.getElementById('ep-aip-reason-' + id)?.value || '').trim() || undefined;
+  if (!model_id) { toast('Model ID is required', 'error'); return; }
+  if (!aip_arn) { toast('AIP ARN is required', 'error'); return; }
+  const body = reason ? { model_id, aip_arn, reason } : { model_id, aip_arn };
+  const res = await api('POST', `/admin/endpoints/${id}/aip-overrides`, body);
+  if (res.error) { toast(res.error.message || 'Failed to save override', 'error'); return; }
+  toast('AIP override saved', 'success');
+  loadAipOverrides(id);
+}
+
+async function removeAipOverride(id, model_id) {
+  if (!confirm(`Remove AIP override for model "${model_id}"?`)) return;
+  const res = await api('DELETE', `/admin/endpoints/${id}/aip-overrides/${encodeURIComponent(model_id)}`);
+  if (res.error) { toast(res.error.message || 'Failed to remove override', 'error'); return; }
+  toast('AIP override removed', 'success');
+  loadAipOverrides(id);
+}
+
+function relativeTime(iso) {
+  const diff = Date.now() - new Date(iso).getTime();
+  if (diff < 60000) return 'just now';
+  if (diff < 3600000) return Math.floor(diff / 60000) + 'm ago';
+  if (diff < 86400000) return Math.floor(diff / 3600000) + 'h ago';
+  return Math.floor(diff / 86400000) + 'd ago';
+}
+
 async function validateEndpoint(id) {
   toast('Validating endpoint…', 'info');
   delete capabilityCache[id]; // force fresh load after health state changes
@@ -5133,7 +5233,7 @@ async function validateEndpoint(id) {
     } catch (e) { /* ignore */ }
     // Expand card and load quotas/models (endpoint is now healthy in data)
     if (!expandedEndpoints.has(id)) toggleEndpointCard(id);
-    else { loadEndpointCapability(id); }
+    else { loadEndpointCapability(id); loadAipOverrides(id); }
   } catch (e) {
     // Parse error message for common AWS failure patterns
     const raw = e.message || '';
@@ -5201,13 +5301,6 @@ function routingPrefixFromRegion(region) {
   return 'us';
 }
 
-function onRoutingChange() {
-  const mode = document.querySelector('input[name="me-routing"]:checked').value;
-  document.getElementById('me-standard-fields').style.display = mode === 'standard' ? '' : 'none';
-  document.getElementById('me-profile-fields').style.display = mode === 'profile' ? '' : 'none';
-  document.getElementById('me-routing-standard-label').style.borderColor = mode === 'standard' ? 'var(--accent)' : '';
-  document.getElementById('me-routing-profile-label').style.borderColor = mode === 'profile' ? 'var(--accent)' : '';
-}
 
 function onCredsChange() {
   const mode = document.querySelector('input[name="me-creds"]:checked').value;
@@ -5216,20 +5309,6 @@ function onCredsChange() {
   document.getElementById('me-creds-assume-label').style.borderColor = mode === 'assume' ? 'var(--accent)' : '';
 }
 
-function onProfileArnChange() {
-  const arn = document.getElementById('me-profile-arn').value.trim();
-  const region = regionFromBedrockArn(arn);
-  const account = accountFromArn(arn);
-  const hint = document.getElementById('me-profile-arn-hint');
-  if (region || account) {
-    const parts = [];
-    if (region) parts.push(`Region: ${region}`);
-    if (account) parts.push(`Account: ${account}`);
-    hint.textContent = parts.join(' · ');
-  } else {
-    hint.textContent = 'Region and account are auto-detected from the ARN.';
-  }
-}
 
 function onScopeChange() {
   const scope = document.getElementById('me-scope').value;
@@ -5252,23 +5331,11 @@ function showEndpointModal(ep) {
   document.getElementById('me-enabled-group').style.display = ep ? '' : 'none';
   if (ep) document.getElementById('me-enabled').checked = ep.enabled;
 
-  // Routing target
-  const hasProfile = ep && !!ep.inference_profile_arn;
-  document.querySelector(`input[name="me-routing"][value="${hasProfile ? 'profile' : 'standard'}"]`).checked = true;
-  document.getElementById('me-standard-fields').style.display = hasProfile ? 'none' : '';
-  document.getElementById('me-profile-fields').style.display = hasProfile ? '' : 'none';
-  document.getElementById('me-routing-standard-label').style.borderColor = hasProfile ? '' : 'var(--accent)';
-  document.getElementById('me-routing-profile-label').style.borderColor = hasProfile ? 'var(--accent)' : '';
-  if (hasProfile) {
-    document.getElementById('me-profile-arn').value = ep.inference_profile_arn;
-    onProfileArnChange();
-  } else {
-    document.getElementById('me-profile-arn').value = '';
-    document.getElementById('me-scope').value = ep ? ep.routing_prefix : 'us';
-    document.getElementById('me-region').value = '';
-    onScopeChange();
-    if (ep) document.getElementById('me-region').value = ep.region;
-  }
+  // Deployment region defaults
+  document.getElementById('me-scope').value = ep ? ep.routing_prefix : 'us';
+  document.getElementById('me-region').value = '';
+  onScopeChange();
+  if (ep) document.getElementById('me-region').value = ep.region;
 
   // Credentials
   const hasRole = ep && !!ep.role_arn;
@@ -5292,21 +5359,11 @@ async function saveEndpoint() {
   const name = document.getElementById('me-name').value.trim();
   if (!name) { toast('Name is required', 'error'); return; }
 
-  const routingMode = document.querySelector('input[name="me-routing"]:checked').value;
   const credsMode = document.querySelector('input[name="me-creds"]:checked').value;
 
-  let region, routing_prefix, inference_profile_arn = null;
-  if (routingMode === 'profile') {
-    inference_profile_arn = document.getElementById('me-profile-arn').value.trim() || null;
-    if (!inference_profile_arn) { toast('Inference profile ARN is required', 'error'); return; }
-    region = regionFromBedrockArn(inference_profile_arn);
-    if (!region) { toast('Could not detect region from ARN — check the format', 'error'); return; }
-    routing_prefix = routingPrefixFromRegion(region);
-  } else {
-    region = document.getElementById('me-region').value.trim();
-    routing_prefix = document.getElementById('me-scope').value;
-    if (!region) { toast('Home region is required', 'error'); return; }
-  }
+  const region = document.getElementById('me-region').value.trim();
+  const routing_prefix = document.getElementById('me-scope').value;
+  if (!region) { toast('Home region is required', 'error'); return; }
 
   let role_arn = null, external_id = null;
   if (credsMode === 'assume') {
@@ -5319,11 +5376,11 @@ async function saveEndpoint() {
 
   if (editingEndpointId) {
     const enabled = document.getElementById('me-enabled').checked;
-    const res = await api('PUT', `/admin/endpoints/${editingEndpointId}`, { name, region, routing_prefix, role_arn, external_id, inference_profile_arn, priority, enabled });
+    const res = await api('PUT', `/admin/endpoints/${editingEndpointId}`, { name, region, routing_prefix, role_arn, external_id, priority, enabled });
     if (res.updated) { toast('Endpoint updated', 'success'); closeModal(); loadAll(); }
     else toast(res.error?.message || 'Failed to update', 'error');
   } else {
-    const res = await api('POST', '/admin/endpoints', { name, region, routing_prefix, role_arn, external_id, inference_profile_arn, priority });
+    const res = await api('POST', '/admin/endpoints', { name, region, routing_prefix, role_arn, external_id, priority });
     if (res.id) { toast('Endpoint created', 'success'); closeModal(); loadAll(); }
     else toast(res.error?.message || 'Failed to create', 'error');
   }

@@ -14,6 +14,21 @@ use crate::auth::CachedKey;
 use crate::db;
 use crate::proxy::GatewayState;
 
+// ── Deprecation header constants (Slice 3 backwards-compat shim) ─────────────
+
+/// Value of the `Deprecation` response header per RFC 8594.
+const DEPRECATION_HEADER_VALUE: &str = "true";
+
+/// Value of the `Sunset` response header — one minor release ahead (2027-01-01).
+const SUNSET_HEADER_VALUE: &str = "Wed, 01 Jan 2027 00:00:00 GMT";
+
+/// Value written to `set_by` for override rows auto-inserted by the compat shim.
+const COMPAT_SHIM_SET_BY: &str = "compat-shim-on-create";
+
+/// Reason string stored in override rows written by the compat shim.
+const COMPAT_SHIM_REASON: &str =
+    "compat shim from POST /admin/endpoints inference_profile_arn field";
+
 /// Format an AWS SDK error into a clean, user-facing message.
 /// Extracts the service error code + message when available; falls back to
 /// a human-readable description for dispatch/credentials failures.
@@ -2172,6 +2187,45 @@ pub async fn list_endpoints(
     }
 }
 
+/// Injectable helper for the compat shim: calls `get_foundation_model(legacy_arn)`
+/// and inserts one row into `endpoint_aip_overrides` with
+/// `set_by = "compat-shim-on-create"`.
+///
+/// Returns `Ok(model_id)` on success, `Err(reason)` on any failure.  The caller
+/// (`create_endpoint`) should log the error as a warning and continue — the
+/// endpoint creation itself is never rolled back.
+///
+/// The closure-based seam mirrors `migrate_legacy_aip_endpoints` in
+/// `src/migrations/aip_legacy.rs` and allows the integration test suite to
+/// inject a mock without real Bedrock credentials.
+pub async fn try_create_compat_override<F, Fut>(
+    endpoint_id: uuid::Uuid,
+    legacy_arn: &str,
+    pool: &sqlx::PgPool,
+    get_foundation_model: F,
+) -> Result<String, String>
+where
+    F: Fn(&str) -> Fut + Send + Sync,
+    Fut: std::future::Future<Output = Result<String, String>> + Send,
+{
+    // Resolve the Anthropic logical model ID via the injected closure.
+    let model_id = get_foundation_model(legacy_arn).await?;
+
+    // Insert the override row.
+    crate::db::endpoint_aip_overrides::insert(
+        pool,
+        endpoint_id,
+        &model_id,
+        legacy_arn,
+        COMPAT_SHIM_SET_BY,
+        Some(COMPAT_SHIM_REASON),
+    )
+    .await
+    .map_err(|e| format!("DB insert failed: {e}"))?;
+
+    Ok(model_id)
+}
+
 #[derive(Deserialize)]
 pub struct CreateEndpointRequest {
     pub name: String,
@@ -2195,7 +2249,7 @@ pub async fn create_endpoint(
     let pool = state.db().await;
     let pool = &pool;
 
-    match db::endpoints::create_endpoint(
+    let endpoint = match db::endpoints::create_endpoint(
         pool,
         &body.name,
         body.role_arn.as_deref(),
@@ -2207,19 +2261,190 @@ pub async fn create_endpoint(
     )
     .await
     {
-        Ok(endpoint) => {
-            tracing::info!(id = %endpoint.id, name = %endpoint.name, "Created endpoint");
-            // Reload endpoints into pool
-            if let Ok(endpoints) = db::endpoints::get_enabled_endpoints(pool).await {
-                state
-                    .endpoint_pool
-                    .load_endpoints(endpoints, &state.aws_config)
-                    .await;
+        Ok(ep) => ep,
+        Err(e) => return admin_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    };
+
+    tracing::info!(id = %endpoint.id, name = %endpoint.name, "Created endpoint");
+
+    // ── Compat shim: if inference_profile_arn was supplied, try to auto-insert
+    // an aip_overrides row so new API clients get the richer shape immediately.
+    let mut aip_overrides: Vec<crate::db::endpoint_aip_overrides::AipOverride> = Vec::new();
+    let has_legacy_arn = body.inference_profile_arn.is_some();
+
+    if let Some(ref legacy_arn) = body.inference_profile_arn {
+        let control_client = state.bedrock_control_client.clone();
+        let model_cache = state.model_cache.clone();
+        let arn_owned = legacy_arn.clone();
+
+        let get_foundation_model = move |_arn: &str| {
+            let control = control_client.clone();
+            let mc = model_cache.clone();
+            let arn2 = arn_owned.clone();
+            async move {
+                let resp = control
+                    .get_inference_profile()
+                    .inference_profile_identifier(&arn2)
+                    .send()
+                    .await
+                    .map_err(|e| format!("GetInferenceProfile failed for {arn2}: {e:?}"))?;
+
+                let fm_arn = resp
+                    .models()
+                    .iter()
+                    .next()
+                    .and_then(|m| m.model_arn())
+                    .map(|s| s.to_string())
+                    .ok_or_else(|| {
+                        format!("GetInferenceProfile returned no model ARN for {arn2}")
+                    })?;
+
+                let tail = crate::translate::models::parse_foundation_model_from_arn(&fm_arn)?;
+                let anthropic_id = crate::translate::models::bedrock_to_anthropic(tail, Some(&mc));
+                Ok(anthropic_id)
             }
-            (StatusCode::CREATED, Json(json!(endpoint))).into_response()
+        };
+
+        match try_create_compat_override(endpoint.id, legacy_arn, pool, get_foundation_model).await
+        {
+            Ok(model_id) => {
+                tracing::info!(
+                    endpoint_id = %endpoint.id,
+                    model_id = %model_id,
+                    "Compat shim auto-inserted AIP override row"
+                );
+                let _ = db::settings::bump_cache_version(pool).await;
+                // Reload overrides for response body
+                if let Ok(rows) =
+                    db::endpoint_aip_overrides::list_by_endpoint(pool, endpoint.id).await
+                {
+                    aip_overrides = rows;
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    endpoint_id = %endpoint.id,
+                    error = %e,
+                    "Compat shim failed to insert AIP override row — auto-migration retries at next startup"
+                );
+                // Endpoint creation is not rolled back; aip_overrides stays empty.
+            }
         }
-        Err(e) => admin_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
     }
+
+    // Reload endpoints into pool
+    if let Ok(endpoints) = db::endpoints::get_enabled_endpoints(pool).await {
+        state
+            .endpoint_pool
+            .load_endpoints_with_db(endpoints, &state.aws_config, pool)
+            .await;
+    }
+
+    // Build response: always include aip_overrides array and inference_profile_arn.
+    let mut resp_headers = axum::http::HeaderMap::new();
+    if has_legacy_arn {
+        resp_headers.insert(
+            "deprecation",
+            axum::http::HeaderValue::from_static(DEPRECATION_HEADER_VALUE),
+        );
+        resp_headers.insert(
+            "sunset",
+            axum::http::HeaderValue::from_static(SUNSET_HEADER_VALUE),
+        );
+    }
+
+    let body_json = json!({
+        "id": endpoint.id,
+        "name": endpoint.name,
+        "role_arn": endpoint.role_arn,
+        "external_id": endpoint.external_id,
+        "inference_profile_arn": endpoint.inference_profile_arn,
+        "region": endpoint.region,
+        "routing_prefix": endpoint.routing_prefix,
+        "priority": endpoint.priority,
+        "is_default": endpoint.is_default,
+        "enabled": endpoint.enabled,
+        "created_at": endpoint.created_at,
+        "aip_overrides": aip_overrides,
+    });
+
+    (StatusCode::CREATED, resp_headers, Json(body_json)).into_response()
+}
+
+/// GET /admin/endpoints/{id}
+///
+/// Returns the endpoint row enriched with:
+/// - `aip_overrides: [...]` — always present, possibly empty.
+/// - `inference_profile_arn` — derived as follows:
+///   - exactly one override row → that row's `aip_arn`
+///   - zero rows + legacy column non-null → legacy column value
+///   - otherwise → null
+///
+/// Adds `Deprecation` and `Sunset` headers when `inference_profile_arn` is
+/// non-null in the response.
+pub async fn get_endpoint_by_id(
+    State(state): State<Arc<GatewayState>>,
+    headers: HeaderMap,
+    Path(endpoint_id): Path<Uuid>,
+) -> Response {
+    if let Err(resp) = check_admin_auth(&headers, &state).await {
+        return resp;
+    }
+    let pool = state.db().await;
+    let pool = &pool;
+
+    let endpoint = match db::endpoints::get_endpoint(pool, endpoint_id).await {
+        Ok(Some(ep)) => ep,
+        Ok(None) => return error_response(StatusCode::NOT_FOUND, "Endpoint not found"),
+        Err(e) => return admin_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    };
+
+    let aip_overrides = match db::endpoint_aip_overrides::list_by_endpoint(pool, endpoint_id).await
+    {
+        Ok(rows) => rows,
+        Err(e) => return admin_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    };
+
+    // Determine the legacy-compat `inference_profile_arn` field value:
+    //   - exactly 1 override row → that row's aip_arn
+    //   - 0 rows + legacy column non-null → legacy column
+    //   - otherwise → null
+    let legacy_ipa: Option<String> = if aip_overrides.len() == 1 {
+        Some(aip_overrides[0].aip_arn.clone())
+    } else if aip_overrides.is_empty() {
+        endpoint.inference_profile_arn.clone()
+    } else {
+        None
+    };
+
+    let mut resp_headers = axum::http::HeaderMap::new();
+    if legacy_ipa.is_some() {
+        resp_headers.insert(
+            "deprecation",
+            axum::http::HeaderValue::from_static(DEPRECATION_HEADER_VALUE),
+        );
+        resp_headers.insert(
+            "sunset",
+            axum::http::HeaderValue::from_static(SUNSET_HEADER_VALUE),
+        );
+    }
+
+    let body_json = json!({
+        "id": endpoint.id,
+        "name": endpoint.name,
+        "role_arn": endpoint.role_arn,
+        "external_id": endpoint.external_id,
+        "inference_profile_arn": legacy_ipa,
+        "region": endpoint.region,
+        "routing_prefix": endpoint.routing_prefix,
+        "priority": endpoint.priority,
+        "is_default": endpoint.is_default,
+        "enabled": endpoint.enabled,
+        "created_at": endpoint.created_at,
+        "aip_overrides": aip_overrides,
+    });
+
+    (StatusCode::OK, resp_headers, Json(body_json)).into_response()
 }
 
 #[derive(Deserialize)]
@@ -2268,7 +2493,7 @@ pub async fn update_endpoint(
             if let Ok(endpoints) = db::endpoints::get_enabled_endpoints(pool).await {
                 state
                     .endpoint_pool
-                    .load_endpoints(endpoints, &state.aws_config)
+                    .load_endpoints_with_db(endpoints, &state.aws_config, pool)
                     .await;
             }
             Json(json!({ "updated": true })).into_response()
@@ -2296,7 +2521,7 @@ pub async fn delete_endpoint(
             if let Ok(endpoints) = db::endpoints::get_enabled_endpoints(pool).await {
                 state
                     .endpoint_pool
-                    .load_endpoints(endpoints, &state.aws_config)
+                    .load_endpoints_with_db(endpoints, &state.aws_config, pool)
                     .await;
             }
             Json(json!({ "deleted": true })).into_response()
@@ -2384,7 +2609,7 @@ pub async fn set_team_endpoints(
             if let Ok(all_endpoints) = db::endpoints::list_endpoints(pool).await {
                 state
                     .endpoint_pool
-                    .load_endpoints(all_endpoints, &state.aws_config)
+                    .load_endpoints_with_db(all_endpoints, &state.aws_config, pool)
                     .await;
             }
             Json(json!({ "updated": true })).into_response()
@@ -2410,7 +2635,7 @@ pub async fn set_default_endpoint(
             if let Ok(all_endpoints) = db::endpoints::list_endpoints(pool).await {
                 state
                     .endpoint_pool
-                    .load_endpoints(all_endpoints, &state.aws_config)
+                    .load_endpoints_with_db(all_endpoints, &state.aws_config, pool)
                     .await;
             }
             Json(json!({ "updated": true })).into_response()
@@ -4186,6 +4411,174 @@ pub async fn delete_beta_override(
                 client.forget_capability(&profile_id, &beta_name).await;
             }
             // Bump cache_version so other gateway replicas evict the override within 5s.
+            let _ = db::settings::bump_cache_version(pool).await;
+            Json(json!({ "deleted": true })).into_response()
+        }
+        Err(e) => admin_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    }
+}
+
+// ============================================================
+// AIP Overrides Admin API
+// ============================================================
+
+#[derive(Deserialize)]
+pub struct CreateAipOverrideRequest {
+    /// The Anthropic model ID (e.g. `claude-sonnet-4-5`). Required.
+    pub model_id: Option<String>,
+    /// An ARN starting with `arn:aws:bedrock:`. Required.
+    pub aip_arn: Option<String>,
+    /// Optional human-readable note.
+    pub reason: Option<String>,
+}
+
+/// GET /admin/endpoints/{id}/aip-overrides
+pub async fn list_aip_overrides(
+    State(state): State<Arc<GatewayState>>,
+    headers: HeaderMap,
+    Path(endpoint_id): Path<Uuid>,
+) -> Response {
+    if let Err(resp) = check_admin_auth(&headers, &state).await {
+        return resp;
+    }
+    let pool = state.db().await;
+    let pool = &pool;
+
+    // 404 if endpoint doesn't exist
+    match db::endpoints::get_endpoint(pool, endpoint_id).await {
+        Ok(Some(_)) => {}
+        Ok(None) => return error_response(StatusCode::NOT_FOUND, "Endpoint not found"),
+        Err(e) => return admin_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    }
+
+    match db::endpoint_aip_overrides::list_by_endpoint(pool, endpoint_id).await {
+        Ok(rows) => Json(json!({ "overrides": rows })).into_response(),
+        Err(e) => admin_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    }
+}
+
+/// POST /admin/endpoints/{id}/aip-overrides
+pub async fn create_aip_override(
+    State(state): State<Arc<GatewayState>>,
+    headers: HeaderMap,
+    Path(endpoint_id): Path<Uuid>,
+    Json(body): Json<CreateAipOverrideRequest>,
+) -> Response {
+    let admin_sub = match check_admin_auth_identity(&headers, &state).await {
+        Ok(sub) => sub,
+        Err(resp) => return resp,
+    };
+    let pool = state.db().await;
+    let pool = &pool;
+
+    // Validate model_id is present
+    let model_id = match body.model_id.as_deref().filter(|s| !s.is_empty()) {
+        Some(m) => m.to_string(),
+        None => return error_response(StatusCode::BAD_REQUEST, "model_id is required"),
+    };
+
+    // Validate AIP ARN
+    let aip_arn = match body.aip_arn.as_deref() {
+        Some(arn) if arn.starts_with("arn:aws:bedrock:") => arn.to_string(),
+        Some(_) | None => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                "aip_arn must start with arn:aws:bedrock:",
+            );
+        }
+    };
+
+    // 404 if endpoint doesn't exist
+    match db::endpoints::get_endpoint(pool, endpoint_id).await {
+        Ok(Some(_)) => {}
+        Ok(None) => return error_response(StatusCode::NOT_FOUND, "Endpoint not found"),
+        Err(e) => return admin_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    }
+
+    match db::endpoint_aip_overrides::insert(
+        pool,
+        endpoint_id,
+        &model_id,
+        &aip_arn,
+        &admin_sub,
+        body.reason.as_deref(),
+    )
+    .await
+    {
+        Ok(()) => {
+            let _ = db::settings::bump_cache_version(pool).await;
+            // Echo back the inserted row by fetching it
+            match db::endpoint_aip_overrides::list_by_endpoint(pool, endpoint_id).await {
+                Ok(rows) => {
+                    if let Some(row) = rows.into_iter().find(|r| r.model_id == model_id) {
+                        (StatusCode::CREATED, Json(json!(row))).into_response()
+                    } else {
+                        (
+                            StatusCode::CREATED,
+                            Json(json!({ "model_id": model_id, "aip_arn": aip_arn })),
+                        )
+                            .into_response()
+                    }
+                }
+                Err(_) => (
+                    StatusCode::CREATED,
+                    Json(json!({ "model_id": model_id, "aip_arn": aip_arn })),
+                )
+                    .into_response(),
+            }
+        }
+        Err(e) => {
+            // Detect Postgres PK violation (SQLSTATE 23505) → 409 Conflict
+            if let Some(db_err) = e.downcast_ref::<sqlx::Error>()
+                && let sqlx::Error::Database(dbe) = db_err
+                && dbe.code().as_deref() == Some("23505")
+            {
+                return (
+                    StatusCode::CONFLICT,
+                    Json(json!({
+                        "type": "error",
+                        "error": {
+                            "type": "conflict",
+                            "message": "An AIP override for this (endpoint_id, model_id) pair already exists"
+                        }
+                    })),
+                )
+                    .into_response();
+            }
+            admin_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string())
+        }
+    }
+}
+
+/// DELETE /admin/endpoints/{id}/aip-overrides/{model_id}
+pub async fn delete_aip_override(
+    State(state): State<Arc<GatewayState>>,
+    headers: HeaderMap,
+    Path((endpoint_id, model_id)): Path<(Uuid, String)>,
+) -> Response {
+    if let Err(resp) = check_admin_auth(&headers, &state).await {
+        return resp;
+    }
+    let pool = state.db().await;
+    let pool = &pool;
+
+    // 404 if endpoint doesn't exist
+    match db::endpoints::get_endpoint(pool, endpoint_id).await {
+        Ok(Some(_)) => {}
+        Ok(None) => return error_response(StatusCode::NOT_FOUND, "Endpoint not found"),
+        Err(e) => return admin_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    }
+
+    match db::endpoint_aip_overrides::delete_by_model(pool, endpoint_id, &model_id).await {
+        Ok(1) => {
+            let _ = db::settings::bump_cache_version(pool).await;
+            Json(json!({ "deleted": true })).into_response()
+        }
+        Ok(0) => error_response(
+            StatusCode::NOT_FOUND,
+            "AIP override not found for this model",
+        ),
+        Ok(_) => {
             let _ = db::settings::bump_cache_version(pool).await;
             Json(json!({ "deleted": true })).into_response()
         }

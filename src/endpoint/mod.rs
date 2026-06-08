@@ -70,6 +70,14 @@ pub struct EndpointClient {
     /// `AdminOverride` entries ignore TTL and are never overwritten by automatic probing.
     /// Non-override entries expire after `CAPABILITY_TTL` (24 h).
     pub beta_capabilities: Arc<RwLock<HashMap<(String, String), CapabilityEntry>>>,
+    /// Per-model AIP override map: Anthropic logical model ID → AIP ARN.
+    /// Populated at endpoint load time from `endpoint_aip_overrides` DB rows.
+    /// Empty for endpoints that have not been configured with any AIP overrides.
+    pub aip_overrides: HashMap<String, String>,
+    /// Subset of `available_models` whose entries were resolved from AIP overrides
+    /// (not already present in the CRI list). Updated each health-loop tick alongside
+    /// `available_models`. Used by `should_probe_profile` to gate capability probes.
+    pub aip_derived_profile_ids: tokio::sync::RwLock<Vec<String>>,
 }
 
 impl EndpointClient {
@@ -202,6 +210,26 @@ impl EndpointClient {
         }
         pairs
     }
+
+    /// Returns the AIP ARN for `model_id` from the new `aip_overrides` map, or
+    /// `None` if no override exists for this model.
+    ///
+    /// This helper reads **only** the `aip_overrides` HashMap (populated from the
+    /// `endpoint_aip_overrides` table). It does NOT fall back to
+    /// `config.inference_profile_arn` (the legacy column). The legacy fallback is
+    /// the responsibility of the request dispatcher — this strict boundary makes
+    /// each code path testable in isolation.
+    pub fn aip_override_for(&self, model_id: &str) -> Option<&str> {
+        self.aip_overrides.get(model_id).map(|s| s.as_str())
+    }
+
+    /// Returns `true` iff the `aip_overrides` map has at least one entry.
+    ///
+    /// Like `aip_override_for`, this ignores `config.inference_profile_arn`.
+    /// An endpoint with only the legacy column set returns `false` here.
+    pub fn has_any_aip_overrides(&self) -> bool {
+        !self.aip_overrides.is_empty()
+    }
 }
 
 // ── Seed-probe helpers ────────────────────────────────────────────────────────
@@ -323,10 +351,40 @@ impl EndpointPool {
     /// endpoints that are already in the pool (matched by UUID), so that learned
     /// capability data survives routine config reloads triggered by cache_version bumps.
     /// Only genuinely new endpoints get a fresh empty cache.
+    ///
+    /// `aip_overrides` are NOT loaded (empty maps on every client). Use
+    /// [`load_endpoints_with_db`] when a DB pool is available to also populate
+    /// per-endpoint AIP override maps.
     pub async fn load_endpoints(
         &self,
         endpoints: Vec<Endpoint>,
         base_aws_config: &aws_config::SdkConfig,
+    ) {
+        self.load_endpoints_inner(endpoints, base_aws_config, None)
+            .await
+    }
+
+    /// Load/reload endpoint clients from database endpoint configs and populate
+    /// each client's `aip_overrides` map from the `endpoint_aip_overrides` table.
+    ///
+    /// Equivalent to [`load_endpoints`] but fetches per-endpoint AIP override rows
+    /// so that `EndpointClient::aip_override_for` and `has_any_aip_overrides` work
+    /// correctly at runtime.
+    pub async fn load_endpoints_with_db(
+        &self,
+        endpoints: Vec<Endpoint>,
+        base_aws_config: &aws_config::SdkConfig,
+        pool: &sqlx::PgPool,
+    ) {
+        self.load_endpoints_inner(endpoints, base_aws_config, Some(pool))
+            .await
+    }
+
+    async fn load_endpoints_inner(
+        &self,
+        endpoints: Vec<Endpoint>,
+        base_aws_config: &aws_config::SdkConfig,
+        pool: Option<&sqlx::PgPool>,
     ) {
         let mut new_clients = HashMap::new();
         let mut new_default: Option<Uuid> = None;
@@ -352,9 +410,28 @@ impl EndpointPool {
             if ep.is_default {
                 new_default = Some(ep.id);
             }
+
+            // Load AIP overrides from DB when a pool is available.
+            let aip_overrides: HashMap<String, String> = if let Some(p) = pool {
+                match crate::db::endpoint_aip_overrides::list_by_endpoint(p, ep.id).await {
+                    Ok(rows) => rows.into_iter().map(|r| (r.model_id, r.aip_arn)).collect(),
+                    Err(e) => {
+                        tracing::warn!(endpoint_id = %ep.id, %e, "Failed to load AIP overrides for endpoint — using empty map");
+                        HashMap::new()
+                    }
+                }
+            } else {
+                HashMap::new()
+            };
+
             let preserved_caches = preserved.get(&ep.id).cloned();
-            let client =
-                Self::create_client_with_caches(&ep, base_aws_config, preserved_caches).await;
+            let client = Self::create_client_with_caches(
+                &ep,
+                base_aws_config,
+                preserved_caches,
+                aip_overrides,
+            )
+            .await;
             if let Some(c) = client {
                 new_clients.insert(ep.id, Arc::new(c));
             }
@@ -372,6 +449,7 @@ impl EndpointPool {
         endpoint: &Endpoint,
         _base_config: &aws_config::SdkConfig,
         preserved_caches: Option<PreservedCaches>,
+        aip_overrides: HashMap<String, String>,
     ) -> Option<EndpointClient> {
         let region = aws_config::Region::new(endpoint.region.clone());
 
@@ -423,6 +501,8 @@ impl EndpointPool {
             last_health_check: AtomicI64::new(0),
             available_models,
             beta_capabilities,
+            aip_overrides,
+            aip_derived_profile_ids: tokio::sync::RwLock::new(vec![]),
         })
     }
 
@@ -625,6 +705,226 @@ impl EndpointPool {
     }
 }
 
+/// Result returned by [`compute_health_state`].
+pub struct HealthState {
+    /// Whether the endpoint is considered healthy.
+    pub healthy: bool,
+    /// Deduplicated union of CRI profiles + AIP-resolved model IDs.
+    pub available_models: Vec<String>,
+    /// Subset of `available_models` whose entries were contributed exclusively
+    /// by AIP overrides (not already present in the CRI list).
+    /// Empty for pure-CRI endpoints and on any failure.
+    pub aip_derived_profile_ids: Vec<String>,
+}
+
+/// Compute the unified health state for a single endpoint.
+///
+/// Encapsulates the spec §Slice 2 Health loop changes logic:
+///
+/// 1. **CRI fails** → `(false, vec![])`. `get_foundation_model` is never called.
+/// 2. **CRI ok + zero `aip_overrides` + no legacy ARN** → `(true, cri_list)`.
+///    `get_foundation_model` is never called.
+/// 3. **CRI ok + zero `aip_overrides` + legacy ARN set** → call
+///    `get_foundation_model(legacy_arn)` once. On success parse and return
+///    `(true, vec!["<prefix>.<bedrock_suffix>"])`. On failure `(false, vec![])`.
+///    (Auto-migration safety net — behaves as today when new table is empty.)
+/// 4. **CRI ok + `aip_overrides` non-empty** → call `get_foundation_model` once
+///    per override. If ANY fails → `(false, vec![])`. If all succeed → deduplicated
+///    union of `cri_list` ∪ AIP-resolved entries, `(true, union)`.
+///
+/// Returns a [`HealthState`] struct with `healthy`, `available_models`, and
+/// `aip_derived_profile_ids` (the subset of `available_models` that came
+/// exclusively from AIP overrides, i.e. not already covered by the CRI list).
+pub async fn compute_health_state<F, Fut>(
+    cri_list_result: Result<Vec<String>, String>,
+    aip_overrides: &HashMap<String, String>,
+    get_foundation_model: F,
+    routing_prefix: &str,
+    legacy_inference_profile_arn: Option<&str>,
+) -> HealthState
+where
+    F: Fn(String) -> Fut,
+    Fut: std::future::Future<Output = Result<String, String>>,
+{
+    // ── Branch 1: CRI failure → immediately unhealthy ─────────────────────────
+    let cri_list = match cri_list_result {
+        Ok(list) => list,
+        Err(_) => {
+            return HealthState {
+                healthy: false,
+                available_models: vec![],
+                aip_derived_profile_ids: vec![],
+            };
+        }
+    };
+
+    // ── Branch 2: CRI ok, no new overrides, no legacy ARN → pure CRI ──────────
+    if aip_overrides.is_empty() && legacy_inference_profile_arn.is_none() {
+        return HealthState {
+            healthy: true,
+            available_models: cri_list,
+            aip_derived_profile_ids: vec![],
+        };
+    }
+
+    // ── Branch 3: CRI ok, no new overrides, legacy ARN set ────────────────────
+    if aip_overrides.is_empty() {
+        // Safety: guarded by `is_empty()` + `is_none()` check above — if we
+        // reach here, `legacy_inference_profile_arn` is `Some`.
+        let legacy_arn = legacy_inference_profile_arn.expect("guarded above");
+        match get_foundation_model(legacy_arn.to_string()).await {
+            Ok(fm_arn) => {
+                match crate::translate::models::parse_foundation_model_from_arn(&fm_arn) {
+                    Ok(bedrock_suffix) => {
+                        let model_id = format!("{routing_prefix}.{bedrock_suffix}");
+                        // Legacy ARN path: the single resolved entry is AIP-derived
+                        // (there is no CRI list to compare against).
+                        let aip_derived = vec![model_id.clone()];
+                        return HealthState {
+                            healthy: true,
+                            available_models: vec![model_id],
+                            aip_derived_profile_ids: aip_derived,
+                        };
+                    }
+                    Err(_) => {
+                        return HealthState {
+                            healthy: false,
+                            available_models: vec![],
+                            aip_derived_profile_ids: vec![],
+                        };
+                    }
+                }
+            }
+            Err(_) => {
+                return HealthState {
+                    healthy: false,
+                    available_models: vec![],
+                    aip_derived_profile_ids: vec![],
+                };
+            }
+        }
+    }
+
+    // ── Branch 4: CRI ok + aip_overrides non-empty ────────────────────────────
+    // Build union: CRI list first (exact dedup), then AIP-resolved entries.
+    //
+    // Dedup strategy for AIP entries: skip adding an AIP-resolved model if any
+    // already-present entry is a prefix of the new model ID. This handles both:
+    //   - Exact match (same string already in union).
+    //   - Short-form CRI entry covering a long-form AIP entry, e.g.
+    //     CRI "us.anthropic.claude-sonnet-4-5" already covers the AIP-resolved
+    //     "us.anthropic.claude-sonnet-4-5-20250929-v1:0".
+    let mut union: Vec<String> = Vec::new();
+    let mut aip_derived: Vec<String> = Vec::new();
+
+    // Seed with CRI list first (no duplicates expected, but guard anyway).
+    for model in &cri_list {
+        if !union.contains(model) {
+            union.push(model.clone());
+        }
+    }
+
+    // Helper: returns true iff `candidate` is already semantically covered
+    // by an entry in `union` (exact match OR existing is a prefix of candidate).
+    fn is_covered(union: &[String], candidate: &str) -> bool {
+        union
+            .iter()
+            .any(|existing| candidate.starts_with(existing.as_str()))
+    }
+
+    // Resolve each AIP override. Sequential — mirrors existing health-loop style.
+    for aip_arn in aip_overrides.values() {
+        match get_foundation_model(aip_arn.clone()).await {
+            Ok(fm_arn) => {
+                match crate::translate::models::parse_foundation_model_from_arn(&fm_arn) {
+                    Ok(bedrock_suffix) => {
+                        let model_id = format!("{routing_prefix}.{bedrock_suffix}");
+                        if !is_covered(&union, &model_id) {
+                            // This entry is not already in the CRI list → AIP-derived.
+                            aip_derived.push(model_id.clone());
+                            union.push(model_id);
+                        }
+                        // If already covered by CRI, it is NOT added to aip_derived.
+                    }
+                    Err(_) => {
+                        return HealthState {
+                            healthy: false,
+                            available_models: vec![],
+                            aip_derived_profile_ids: vec![],
+                        };
+                    }
+                }
+            }
+            Err(_) => {
+                return HealthState {
+                    healthy: false,
+                    available_models: vec![],
+                    aip_derived_profile_ids: vec![],
+                };
+            }
+        }
+    }
+
+    HealthState {
+        healthy: true,
+        available_models: union,
+        aip_derived_profile_ids: aip_derived,
+    }
+}
+
+/// Returns `true` if a capability probe should be run for `profile_id`.
+///
+/// - If `capability_probe_aip_enabled` is `true`, all profiles are probed.
+/// - If `false`, profiles present in `aip_derived_profile_ids` are skipped;
+///   CRI-only profiles (not in that slice) continue to be probed.
+pub fn should_probe_profile(
+    profile_id: &str,
+    aip_derived_profile_ids: &[String],
+    capability_probe_aip_enabled: bool,
+) -> bool {
+    if capability_probe_aip_enabled {
+        return true;
+    }
+    // Flag is false: skip if this profile is AIP-derived.
+    !aip_derived_profile_ids.iter().any(|id| id == profile_id)
+}
+
+/// Resolves the effective value of the `CAPABILITY_PROBE_AIP` flag from two
+/// optional sources, in priority order:
+///
+/// 1. `db_setting` — value from the `proxy_settings` table (highest priority).
+/// 2. `env_value`  — value of the `CAPABILITY_PROBE_AIP` env var.
+/// 3. Hard-coded default: `true`.
+///
+/// Parsing is case-insensitive: `"true"` / `"True"` / `"TRUE"` → `true`,
+/// `"false"` / `"False"` / `"FALSE"` → `false`. Any other value falls through
+/// to the next source.
+pub fn effective_capability_probe_aip(db_setting: Option<&str>, env_value: Option<&str>) -> bool {
+    fn parse_bool(s: &str) -> Option<bool> {
+        let trimmed = s.trim();
+        if trimmed.eq_ignore_ascii_case("true") {
+            Some(true)
+        } else if trimmed.eq_ignore_ascii_case("false") {
+            Some(false)
+        } else {
+            None
+        }
+    }
+
+    if let Some(db) = db_setting
+        && let Some(v) = parse_bool(db)
+    {
+        return v;
+    }
+    if let Some(env) = env_value
+        && let Some(v) = parse_bool(env)
+    {
+        return v;
+    }
+    // Default: probe everything.
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -675,6 +975,8 @@ mod tests {
             last_health_check: AtomicI64::new(0),
             available_models: Arc::new(RwLock::new(vec![])),
             beta_capabilities: Arc::new(RwLock::new(HashMap::new())),
+            aip_overrides: HashMap::new(),
+            aip_derived_profile_ids: tokio::sync::RwLock::new(vec![]),
         }
     }
 
@@ -1385,6 +1687,8 @@ mod tests_slice2 {
             last_health_check: AtomicI64::new(0),
             available_models: Arc::new(RwLock::new(vec![])),
             beta_capabilities: Arc::new(RwLock::new(HashMap::new())),
+            aip_overrides: HashMap::new(),
+            aip_derived_profile_ids: tokio::sync::RwLock::new(vec![]),
         }
     }
 
@@ -1691,6 +1995,8 @@ mod tests_slice3 {
             last_health_check: AtomicI64::new(0),
             available_models: Arc::new(RwLock::new(vec![])),
             beta_capabilities: Arc::new(RwLock::new(HashMap::new())),
+            aip_overrides: HashMap::new(),
+            aip_derived_profile_ids: tokio::sync::RwLock::new(vec![]),
         }
     }
 
@@ -2132,6 +2438,8 @@ mod tests_dynamic_model_slice1 {
             last_health_check: AtomicI64::new(0),
             available_models: Arc::new(tokio::sync::RwLock::new(models)),
             beta_capabilities: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
+            aip_overrides: HashMap::new(),
+            aip_derived_profile_ids: tokio::sync::RwLock::new(vec![]),
         }
     }
 
@@ -2316,6 +2624,8 @@ mod tests_model_filtering_slice3 {
             last_health_check: AtomicI64::new(0),
             available_models: Arc::new(RwLock::new(models)),
             beta_capabilities: Arc::new(RwLock::new(HashMap::new())),
+            aip_overrides: HashMap::new(),
+            aip_derived_profile_ids: tokio::sync::RwLock::new(vec![]),
         }
     }
 
@@ -2626,6 +2936,8 @@ mod tests_slice5 {
             last_health_check: AtomicI64::new(0),
             available_models: Arc::new(RwLock::new(vec![])),
             beta_capabilities: Arc::new(RwLock::new(HashMap::new())),
+            aip_overrides: HashMap::new(),
+            aip_derived_profile_ids: tokio::sync::RwLock::new(vec![]),
         }
     }
 
@@ -2802,6 +3114,8 @@ mod tests_1m_capability_cache {
             available_models: Arc::new(tokio::sync::RwLock::new(vec![])),
             // Builder must add this field:
             beta_capabilities: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
+            aip_overrides: HashMap::new(),
+            aip_derived_profile_ids: tokio::sync::RwLock::new(vec![]),
         }
     }
 
@@ -3167,6 +3481,8 @@ mod tests_seed_probe {
             last_health_check: std::sync::atomic::AtomicI64::new(0),
             available_models: Arc::new(tokio::sync::RwLock::new(vec![])),
             beta_capabilities: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
+            aip_overrides: HashMap::new(),
+            aip_derived_profile_ids: tokio::sync::RwLock::new(vec![]),
         }
     }
 
@@ -3417,6 +3733,1163 @@ mod tests_seed_probe {
             result,
             Some(true),
             "ProbeOutcome::Inconclusive must not overwrite an existing Some(true) cache entry"
+        );
+    }
+}
+// ── AIP override helpers — Task 1 (Slice 1) tests ──
+//
+// These tests cover the two new methods that the builder will add to
+// `EndpointClient`:
+//
+//   - `aip_override_for(model_id: &str) -> Option<&str>`
+//     Returns the AIP ARN from the in-memory `aip_overrides` HashMap when a
+//     matching entry exists, `None` otherwise.
+//
+//   - `has_any_aip_overrides() -> bool`
+//     Returns `true` iff `aip_overrides` is non-empty.
+//
+// The `aip_overrides: HashMap<String, String>` field is populated at load time
+// by reading `endpoint_aip_overrides` rows from the DB — the builder wires that
+// in `load_endpoints` / `create_client`. Here we test the helper methods
+// directly by constructing an `EndpointClient` with a known map.
+//
+// None of these tests require a database connection.
+
+#[cfg(test)]
+mod tests_aip_override_helpers {
+    use super::*;
+    use std::collections::HashMap;
+
+    /// Build a minimal `EndpointClient` with the provided `aip_overrides` map
+    /// and an optional `inference_profile_arn` on the config (legacy column).
+    ///
+    /// The AWS SDK clients are constructed with dummy configs — they are never
+    /// invoked in these unit tests.
+    fn make_client_with_overrides(
+        aip_overrides: HashMap<String, String>,
+        legacy_inference_profile_arn: Option<String>,
+    ) -> EndpointClient {
+        use std::sync::atomic::AtomicBool;
+        use std::sync::atomic::AtomicI64;
+
+        let id = Uuid::new_v4();
+        let config = crate::db::schema::Endpoint {
+            id,
+            name: "test-ep".to_string(),
+            role_arn: None,
+            external_id: None,
+            inference_profile_arn: legacy_inference_profile_arn,
+            region: "us-east-1".to_string(),
+            routing_prefix: "us".to_string(),
+            priority: 0,
+            is_default: false,
+            enabled: true,
+            created_at: chrono::Utc::now(),
+        };
+
+        let runtime_client = aws_sdk_bedrockruntime::Client::from_conf(
+            aws_sdk_bedrockruntime::Config::builder()
+                .behavior_version(aws_sdk_bedrockruntime::config::BehaviorVersion::latest())
+                .region(aws_config::Region::new("us-east-1"))
+                .build(),
+        );
+        let control_client = aws_sdk_bedrock::Client::from_conf(
+            aws_sdk_bedrock::Config::builder()
+                .behavior_version(aws_sdk_bedrock::config::BehaviorVersion::latest())
+                .region(aws_config::Region::new("us-east-1"))
+                .build(),
+        );
+        let quota_client = aws_sdk_servicequotas::Client::from_conf(
+            aws_sdk_servicequotas::Config::builder()
+                .behavior_version(aws_sdk_servicequotas::config::BehaviorVersion::latest())
+                .region(aws_config::Region::new("us-east-1"))
+                .build(),
+        );
+
+        EndpointClient {
+            config,
+            runtime_client,
+            control_client,
+            quota_cache: crate::quota::QuotaCache::new(quota_client),
+            healthy: AtomicBool::new(true),
+            last_health_check: AtomicI64::new(0),
+            available_models: Arc::new(RwLock::new(vec![])),
+            beta_capabilities: Arc::new(RwLock::new(HashMap::new())),
+            aip_overrides,
+            aip_derived_profile_ids: tokio::sync::RwLock::new(vec![]),
+        }
+    }
+
+    // ── aip_override_for ──────────────────────────────────────────────────────
+
+    /// `aip_override_for` returns `Some(arn)` when an exact model_id entry
+    /// exists in the `aip_overrides` map.
+    #[test]
+    fn test_aip_override_for_returns_arn_when_present() {
+        let mut map = HashMap::new();
+        let expected_arn =
+            "arn:aws:bedrock:us-east-1:123456789012:application-inference-profile/sonnet-tagged";
+        map.insert("claude-sonnet-4-5".to_string(), expected_arn.to_string());
+
+        let client = make_client_with_overrides(map, None);
+
+        let result = client.aip_override_for("claude-sonnet-4-5");
+        assert_eq!(
+            result,
+            Some(expected_arn),
+            "aip_override_for must return Some(arn) for a model present in the map"
+        );
+    }
+
+    /// `aip_override_for` returns `None` when the requested model has no entry
+    /// in the `aip_overrides` map, even when other models are present.
+    #[test]
+    fn test_aip_override_for_returns_none_for_absent_model() {
+        let mut map = HashMap::new();
+        map.insert(
+            "claude-sonnet-4-5".to_string(),
+            "arn:aws:bedrock:us-east-1:123456789012:application-inference-profile/sonnet-tagged"
+                .to_string(),
+        );
+        map.insert(
+            "claude-opus-4-7".to_string(),
+            "arn:aws:bedrock:us-east-1:123456789012:application-inference-profile/opus-tagged"
+                .to_string(),
+        );
+
+        let client = make_client_with_overrides(map, None);
+
+        let result = client.aip_override_for("claude-haiku-4-5");
+        assert!(
+            result.is_none(),
+            "aip_override_for must return None for a model not in the override map"
+        );
+    }
+
+    /// `aip_override_for` returns `None` when the map is empty.
+    #[test]
+    fn test_aip_override_for_returns_none_when_map_empty() {
+        let client = make_client_with_overrides(HashMap::new(), None);
+
+        let result = client.aip_override_for("claude-sonnet-4-5");
+        assert!(
+            result.is_none(),
+            "aip_override_for must return None when aip_overrides map is empty"
+        );
+    }
+
+    /// Boundary test: when no row exists in the new table (`aip_overrides` is
+    /// empty) but `inference_profile_arn` is set on the legacy column,
+    /// `aip_override_for` STILL returns `None`.
+    ///
+    /// The helper reads only the new `aip_overrides` map. The legacy fallback
+    /// (force-substitution from `config.inference_profile_arn`) is the
+    /// responsibility of the request dispatcher (Task 4), not this helper.
+    /// This test codifies the boundary between the two code paths.
+    #[test]
+    fn test_aip_override_for_ignores_legacy_inference_profile_arn() {
+        let legacy_arn =
+            "arn:aws:bedrock:us-east-1:123456789012:application-inference-profile/legacy-sonnet";
+
+        // Empty new-table map, but legacy column is set
+        let client = make_client_with_overrides(HashMap::new(), Some(legacy_arn.to_string()));
+
+        // The helper must return None — it does NOT fall through to the legacy column.
+        // The dispatcher will check config.inference_profile_arn separately.
+        let result = client.aip_override_for("claude-sonnet-4-5");
+        assert!(
+            result.is_none(),
+            "aip_override_for must return None when aip_overrides is empty, even if \
+             config.inference_profile_arn is set (legacy fallback is the dispatcher's job)"
+        );
+    }
+
+    /// `aip_override_for` performs exact-key matching only. A partial model name
+    /// (e.g. `"claude-sonnet"`) must NOT match the full key `"claude-sonnet-4-5"`.
+    #[test]
+    fn test_aip_override_for_exact_key_match_only() {
+        let mut map = HashMap::new();
+        map.insert(
+            "claude-sonnet-4-5".to_string(),
+            "arn:aws:bedrock:us-east-1:123456789012:application-inference-profile/sonnet-tagged"
+                .to_string(),
+        );
+
+        let client = make_client_with_overrides(map, None);
+
+        // Partial key must not match
+        assert!(
+            client.aip_override_for("claude-sonnet").is_none(),
+            "aip_override_for must not match on a partial model name"
+        );
+        // Different version must not match
+        assert!(
+            client.aip_override_for("claude-sonnet-4-6").is_none(),
+            "aip_override_for must not match a different version of the same model family"
+        );
+    }
+
+    // ── has_any_aip_overrides ─────────────────────────────────────────────────
+
+    /// `has_any_aip_overrides` returns `true` when at least one entry exists.
+    #[test]
+    fn test_has_any_aip_overrides_true_when_non_empty() {
+        let mut map = HashMap::new();
+        map.insert(
+            "claude-sonnet-4-5".to_string(),
+            "arn:aws:bedrock:us-east-1:123456789012:application-inference-profile/sonnet"
+                .to_string(),
+        );
+
+        let client = make_client_with_overrides(map, None);
+        assert!(
+            client.has_any_aip_overrides(),
+            "has_any_aip_overrides must return true when the map has entries"
+        );
+    }
+
+    /// `has_any_aip_overrides` returns `false` when the map is empty.
+    #[test]
+    fn test_has_any_aip_overrides_false_when_empty() {
+        let client = make_client_with_overrides(HashMap::new(), None);
+        assert!(
+            !client.has_any_aip_overrides(),
+            "has_any_aip_overrides must return false when aip_overrides is empty"
+        );
+    }
+
+    /// `has_any_aip_overrides` returns `false` even when the legacy
+    /// `inference_profile_arn` is set, as long as the new map is empty.
+    ///
+    /// This mirrors the boundary test for `aip_override_for`: the legacy column
+    /// is invisible to the new helpers.
+    #[test]
+    fn test_has_any_aip_overrides_false_with_only_legacy_column() {
+        let legacy_arn =
+            "arn:aws:bedrock:us-east-1:123456789012:application-inference-profile/legacy";
+        let client = make_client_with_overrides(HashMap::new(), Some(legacy_arn.to_string()));
+
+        assert!(
+            !client.has_any_aip_overrides(),
+            "has_any_aip_overrides must return false when aip_overrides is empty, \
+             even if the legacy inference_profile_arn column is set"
+        );
+    }
+
+    /// Multiple entries: `has_any_aip_overrides` remains `true` after inserting
+    /// multiple models, and `aip_override_for` returns the correct ARN for each.
+    #[test]
+    fn test_multiple_overrides_all_accessible() {
+        let sonnet_arn =
+            "arn:aws:bedrock:us-east-1:123456789012:application-inference-profile/sonnet";
+        let opus_arn = "arn:aws:bedrock:us-east-1:123456789012:application-inference-profile/opus";
+
+        let mut map = HashMap::new();
+        map.insert("claude-sonnet-4-5".to_string(), sonnet_arn.to_string());
+        map.insert("claude-opus-4-7".to_string(), opus_arn.to_string());
+
+        let client = make_client_with_overrides(map, None);
+
+        assert!(
+            client.has_any_aip_overrides(),
+            "has_any_aip_overrides must be true for a map with 2 entries"
+        );
+        assert_eq!(
+            client.aip_override_for("claude-sonnet-4-5"),
+            Some(sonnet_arn),
+            "must return correct sonnet ARN"
+        );
+        assert_eq!(
+            client.aip_override_for("claude-opus-4-7"),
+            Some(opus_arn),
+            "must return correct opus ARN"
+        );
+        assert!(
+            client.aip_override_for("claude-haiku-4-5").is_none(),
+            "haiku has no override, must return None"
+        );
+    }
+}
+
+// ── Health loop union — Task 3 (Slice 2A) tests ──────────────────────────────
+//
+// These tests exercise `compute_health_state`, a pure-ish async function the
+// builder will add to this module. The function encapsulates the unified
+// health-loop body from spec §Slice 2 Health loop changes:
+//
+//   pub async fn compute_health_state<F, Fut>(
+//       cri_list_result: Result<Vec<String>, String>,
+//       aip_overrides: &HashMap<String, String>,
+//       get_foundation_model: F,
+//       routing_prefix: &str,
+//       legacy_inference_profile_arn: Option<&str>,
+//   ) -> (bool, Vec<String>)
+//   where
+//       F: Fn(String) -> Fut,
+//       Fut: Future<Output = Result<String, String>>,
+//
+// Parameters:
+//   cri_list_result   — The Ok/Err outcome of `ListInferenceProfiles` filtered to
+//                       this endpoint's routing prefix. `Ok(vec)` carries the
+//                       profile IDs already filtered to `<prefix>.` form (e.g.
+//                       `["us.anthropic.claude-haiku-4-5", ...]`).
+//   aip_overrides     — The endpoint's `aip_overrides` HashMap (model_id → AIP ARN).
+//                       From `EndpointClient.aip_overrides`.
+//   get_foundation_model — Async callback that takes an AIP ARN (`String`) and
+//                       returns `Ok(foundation_model_arn)` or `Err(reason)`. In
+//                       production this calls `GetInferenceProfile`; in tests it
+//                       is a simple closure.
+//   routing_prefix    — The endpoint's routing prefix (e.g. `"us"`). Used to
+//                       construct the `<prefix>.<bedrock_suffix>` model ID for
+//                       each resolved AIP foundation model.
+//   legacy_inference_profile_arn — `client.config.inference_profile_arn.as_deref()`.
+//                       Non-None only for endpoints that haven't completed the
+//                       auto-migration to the new table. When non-None AND
+//                       `aip_overrides` is empty, the function falls back to the
+//                       legacy single-ARN path (validate via get_foundation_model,
+//                       populate available_models with the resolved foundation model).
+//
+// Returns:
+//   (healthy: bool, available_models: Vec<String>)
+//
+//   - `healthy` is true iff CRI list succeeded AND every AIP override resolved.
+//   - `available_models` is the deduplicated union of CRI profiles + AIP-resolved
+//     `<routing_prefix>.<bedrock_suffix>` model IDs. On any failure, the function
+//     returns `(false, <empty-or-partial-vec>)` — callers must not rely on
+//     partial content when healthy=false.
+//
+// None of these tests require a database connection or AWS credentials.
+// The `get_foundation_model` callback is a sync-wrapped async closure.
+
+// ── tests_health_loop_union ─────────────────────────────────────────────────
+//
+// These tests exercise `compute_health_state`.  After Task 5 (Slice 2C), the
+// function returns a `HealthState` struct instead of a bare tuple:
+//
+//   pub struct HealthState {
+//       pub healthy: bool,
+//       pub available_models: Vec<String>,
+//       pub aip_derived_profile_ids: Vec<String>,
+//   }
+//
+// All tests in this block destructure `HealthState` using the struct field
+// syntax.  Tests 1-8 are the original Task 3 tests updated to the new return
+// type; tests 9-10 are new Task 5 additions.
+
+#[cfg(test)]
+mod tests_health_loop_union {
+    use super::*;
+    use std::collections::HashMap;
+
+    // ── Test 1: CRI + two AIP overrides → healthy union ───────────────────────
+
+    /// An endpoint with a successful CRI list and two healthy AIP overrides
+    /// must produce healthy=true and available_models = dedup'd union of CRI
+    /// profiles + AIP-resolved foundation models.
+    ///
+    /// CRI list:  ["us.anthropic.claude-haiku-4-5", "us.anthropic.claude-sonnet-4-5"]
+    /// AIP overrides:
+    ///   "claude-sonnet-4-5" → sonnet AIP ARN (foundation model resolves to same
+    ///                          Bedrock suffix as the CRI entry → dedup)
+    ///   "claude-opus-4-7"   → opus   AIP ARN (foundation model resolves to new entry)
+    ///
+    /// Expected available_models (order-insensitive):
+    ///   ["us.anthropic.claude-haiku-4-5",
+    ///    "us.anthropic.claude-sonnet-4-5",
+    ///    "us.anthropic.claude-opus-4-7"]
+    #[tokio::test]
+    async fn test_health_cri_plus_two_aip_overrides_healthy_union() {
+        let cri_result = Ok(vec![
+            "us.anthropic.claude-haiku-4-5".to_string(),
+            "us.anthropic.claude-sonnet-4-5".to_string(),
+        ]);
+
+        let mut aip_overrides = HashMap::new();
+        aip_overrides.insert(
+            "claude-sonnet-4-5".to_string(),
+            "arn:aws:bedrock:us-east-1:123456789012:application-inference-profile/sonnet-tagged"
+                .to_string(),
+        );
+        aip_overrides.insert(
+            "claude-opus-4-7".to_string(),
+            "arn:aws:bedrock:us-east-1:123456789012:application-inference-profile/opus-tagged"
+                .to_string(),
+        );
+
+        // Mock callback: each AIP ARN resolves to a foundation-model ARN whose
+        // tail is the Bedrock model suffix (without the routing prefix).
+        let get_fm = |arn: String| async move {
+            if arn.contains("sonnet-tagged") {
+                // Resolves to same suffix as the CRI entry — will be deduped.
+                Ok("arn:aws:bedrock:us-east-1::foundation-model/anthropic.claude-sonnet-4-5-20250929-v1:0"
+                    .to_string())
+            } else if arn.contains("opus-tagged") {
+                Ok(
+                    "arn:aws:bedrock:us-east-1::foundation-model/anthropic.claude-opus-4-7"
+                        .to_string(),
+                )
+            } else {
+                Err(format!("unexpected ARN in test: {arn}"))
+            }
+        };
+
+        let HealthState {
+            healthy,
+            mut available_models,
+            aip_derived_profile_ids: _,
+        } = compute_health_state(
+            cri_result,
+            &aip_overrides,
+            get_fm,
+            "us",
+            None, // no legacy ARN
+        )
+        .await;
+
+        assert!(
+            healthy,
+            "endpoint must be healthy when CRI list succeeded and all AIP overrides resolved"
+        );
+
+        available_models.sort();
+        assert_eq!(
+            available_models.len(),
+            3,
+            "available_models must contain exactly 3 entries (Haiku + Sonnet + Opus, \
+             with Sonnet deduped from CRI and AIP); got: {available_models:?}"
+        );
+        assert!(
+            available_models.contains(&"us.anthropic.claude-haiku-4-5".to_string()),
+            "available_models must include the Haiku CRI entry; got: {available_models:?}"
+        );
+        assert!(
+            available_models
+                .iter()
+                .any(|m| m.contains("claude-sonnet-4-5")),
+            "available_models must include a Sonnet entry; got: {available_models:?}"
+        );
+        assert!(
+            available_models
+                .iter()
+                .any(|m| m.contains("claude-opus-4-7")),
+            "available_models must include an Opus entry resolved from the AIP; \
+             got: {available_models:?}"
+        );
+    }
+
+    // ── Test 2: One failing AIP override → healthy=false ──────────────────────
+
+    /// When one AIP override returns an error from get_foundation_model, the
+    /// endpoint must be marked unhealthy and available_models must NOT be
+    /// advanced (to avoid advertising models that are unreachable).
+    ///
+    /// CRI list succeeds, but the Opus AIP call fails.
+    #[tokio::test]
+    async fn test_health_one_failing_aip_override_marks_unhealthy() {
+        let cri_result = Ok(vec![
+            "us.anthropic.claude-haiku-4-5".to_string(),
+            "us.anthropic.claude-sonnet-4-5".to_string(),
+        ]);
+
+        let mut aip_overrides = HashMap::new();
+        aip_overrides.insert(
+            "claude-sonnet-4-5".to_string(),
+            "arn:aws:bedrock:us-east-1:123456789012:application-inference-profile/sonnet-ok"
+                .to_string(),
+        );
+        aip_overrides.insert(
+            "claude-opus-4-7".to_string(),
+            "arn:aws:bedrock:us-east-1:123456789012:application-inference-profile/opus-fail"
+                .to_string(),
+        );
+
+        let get_fm = |arn: String| async move {
+            if arn.contains("sonnet-ok") {
+                Ok("arn:aws:bedrock:us-east-1::foundation-model/anthropic.claude-sonnet-4-5-20250929-v1:0"
+                    .to_string())
+            } else {
+                // Opus AIP call fails — simulates GetInferenceProfile returning an error.
+                Err("GetInferenceProfile failed: ResourceNotFoundException".to_string())
+            }
+        };
+
+        let HealthState {
+            healthy,
+            available_models,
+            aip_derived_profile_ids: _,
+        } = compute_health_state(cri_result, &aip_overrides, get_fm, "us", None).await;
+
+        assert!(
+            !healthy,
+            "endpoint must be unhealthy when any AIP override fails to resolve; \
+             got healthy=true with available_models={available_models:?}"
+        );
+        // available_models must NOT be advanced when the endpoint is unhealthy.
+        assert!(
+            available_models.is_empty(),
+            "available_models must be empty when the endpoint is unhealthy \
+             (spec: 'available_models not advanced'); got: {available_models:?}"
+        );
+    }
+
+    // ── Test 3: CRI-only endpoint (zero AIP overrides) → unchanged behavior ───
+
+    /// Regression guard: an endpoint with no AIP overrides must behave exactly
+    /// as today — available_models is the CRI list, healthy iff CRI succeeded.
+    #[tokio::test]
+    async fn test_health_cri_only_no_aip_overrides_regression() {
+        let cri_result = Ok(vec![
+            "us.anthropic.claude-haiku-4-5".to_string(),
+            "us.anthropic.claude-sonnet-4-5".to_string(),
+            "us.anthropic.claude-opus-4-7".to_string(),
+        ]);
+
+        // No AIP overrides — get_foundation_model should never be called.
+        let get_fm = |arn: String| async move {
+            panic!(
+                "get_foundation_model must NOT be called when aip_overrides is empty; \
+                 called with ARN: {arn}"
+            );
+            #[allow(unreachable_code)]
+            Err(String::new())
+        };
+
+        let HealthState {
+            healthy,
+            available_models,
+            aip_derived_profile_ids: _,
+        } = compute_health_state(
+            cri_result,
+            &HashMap::new(), // empty overrides
+            get_fm,
+            "us",
+            None,
+        )
+        .await;
+
+        assert!(
+            healthy,
+            "CRI-only endpoint must be healthy when CRI list succeeded"
+        );
+        let mut available_models = available_models;
+        available_models.sort();
+        assert_eq!(
+            available_models,
+            vec![
+                "us.anthropic.claude-haiku-4-5",
+                "us.anthropic.claude-opus-4-7",
+                "us.anthropic.claude-sonnet-4-5",
+            ],
+            "available_models must be exactly the CRI list for a CRI-only endpoint"
+        );
+    }
+
+    /// Regression guard: CRI failure on a CRI-only endpoint marks it unhealthy.
+    #[tokio::test]
+    async fn test_health_cri_only_failure_marks_unhealthy() {
+        let cri_result: Result<Vec<String>, String> =
+            Err("ListInferenceProfiles failed: AccessDeniedException".to_string());
+
+        let get_fm = |arn: String| async move {
+            panic!(
+                "get_foundation_model must NOT be called when aip_overrides is empty; \
+                 called with ARN: {arn}"
+            );
+            #[allow(unreachable_code)]
+            Err(String::new())
+        };
+
+        let HealthState {
+            healthy,
+            available_models,
+            aip_derived_profile_ids: _,
+        } = compute_health_state(cri_result, &HashMap::new(), get_fm, "us", None).await;
+
+        assert!(
+            !healthy,
+            "CRI-only endpoint must be unhealthy when CRI list fails"
+        );
+        assert!(
+            available_models.is_empty(),
+            "available_models must be empty when CRI list fails; got: {available_models:?}"
+        );
+    }
+
+    // ── Test 4: Legacy inference_profile_arn (no new table) → today's behavior ─
+
+    /// Auto-migration safety net: when `aip_overrides` is empty AND the legacy
+    /// `inference_profile_arn` column is set, the function must fall back to the
+    /// legacy single-ARN path:
+    ///   - Call get_foundation_model with the legacy ARN.
+    ///   - If it succeeds, populate available_models with the resolved
+    ///     `<routing_prefix>.<bedrock_suffix>` model ID.
+    ///   - healthy = success of the get_foundation_model call.
+    ///
+    /// This branch fires only when the auto-migration has NOT yet run for this
+    /// endpoint (empty new table + legacy column still set).
+    #[tokio::test]
+    async fn test_health_legacy_arn_no_new_table_preserves_today_behavior() {
+        // CRI list succeeds (it's always called)
+        let cri_result = Ok(vec![]);
+
+        let legacy_arn =
+            "arn:aws:bedrock:us-east-1:123456789012:application-inference-profile/legacy-sonnet";
+
+        let get_fm = |arn: String| async move {
+            assert_eq!(
+                arn, legacy_arn,
+                "get_foundation_model must be called with the legacy ARN"
+            );
+            // Resolves to a Sonnet foundation model ARN.
+            Ok("arn:aws:bedrock:us-east-1::foundation-model/anthropic.claude-sonnet-4-5-20250929-v1:0"
+                .to_string())
+        };
+
+        let HealthState {
+            healthy,
+            available_models,
+            aip_derived_profile_ids: _,
+        } = compute_health_state(
+            cri_result,
+            &HashMap::new(), // empty new table
+            get_fm,
+            "us",
+            Some(legacy_arn), // legacy column is set
+        )
+        .await;
+
+        assert!(
+            healthy,
+            "endpoint must be healthy when the legacy ARN resolves successfully"
+        );
+        assert_eq!(
+            available_models.len(),
+            1,
+            "available_models must have exactly one entry (the legacy AIP's foundation model); \
+             got: {available_models:?}"
+        );
+        assert!(
+            available_models[0].contains("claude-sonnet-4-5"),
+            "available_models entry must represent the resolved foundation model in \
+             '<routing_prefix>.<bedrock_suffix>' form; got: {}",
+            available_models[0]
+        );
+        assert!(
+            available_models[0].starts_with("us."),
+            "available_models entry must start with the routing prefix 'us.'; \
+             got: {}",
+            available_models[0]
+        );
+    }
+
+    /// Legacy path failure: when the legacy ARN's get_foundation_model call fails,
+    /// the endpoint must be unhealthy and available_models must be empty.
+    #[tokio::test]
+    async fn test_health_legacy_arn_failure_marks_unhealthy() {
+        let cri_result = Ok(vec![]);
+
+        let legacy_arn =
+            "arn:aws:bedrock:us-east-1:123456789012:application-inference-profile/legacy-broken";
+
+        let get_fm = |arn: String| async move {
+            assert!(arn.contains("legacy-broken"), "unexpected ARN: {arn}");
+            Err("GetInferenceProfile failed: ResourceNotFoundException".to_string())
+        };
+
+        let HealthState {
+            healthy,
+            available_models,
+            aip_derived_profile_ids: _,
+        } = compute_health_state(cri_result, &HashMap::new(), get_fm, "us", Some(legacy_arn)).await;
+
+        assert!(
+            !healthy,
+            "endpoint must be unhealthy when the legacy ARN fails to resolve"
+        );
+        assert!(
+            available_models.is_empty(),
+            "available_models must be empty when legacy ARN resolution fails; \
+             got: {available_models:?}"
+        );
+    }
+
+    // ── Test 5: Dedup — AIP foundation model already in CRI list ──────────────
+
+    /// When an AIP override resolves to a foundation model whose
+    /// `<routing_prefix>.<bedrock_suffix>` form is already present in the CRI list,
+    /// the model must appear exactly once in available_models.
+    ///
+    /// This guards against the double-emit scenario where both the CRI branch and
+    /// the AIP branch independently contribute the same Sonnet entry.
+    #[tokio::test]
+    async fn test_health_dedup_aip_foundation_model_coincides_with_cri() {
+        // CRI list already contains the Sonnet entry.
+        let cri_result = Ok(vec![
+            "us.anthropic.claude-haiku-4-5".to_string(),
+            "us.anthropic.claude-sonnet-4-5-20250929-v1:0".to_string(),
+        ]);
+
+        let mut aip_overrides = HashMap::new();
+        // This AIP resolves to the SAME Bedrock suffix as the CRI Sonnet entry.
+        aip_overrides.insert(
+            "claude-sonnet-4-5".to_string(),
+            "arn:aws:bedrock:us-east-1:123456789012:application-inference-profile/sonnet-dup"
+                .to_string(),
+        );
+
+        let get_fm = |_arn: String| async move {
+            // Resolves to the same foundation model as the CRI "sonnet" entry.
+            Ok("arn:aws:bedrock:us-east-1::foundation-model/anthropic.claude-sonnet-4-5-20250929-v1:0"
+                .to_string())
+        };
+
+        let HealthState {
+            healthy,
+            available_models,
+            aip_derived_profile_ids: _,
+        } = compute_health_state(cri_result, &aip_overrides, get_fm, "us", None).await;
+
+        assert!(healthy, "endpoint must be healthy");
+
+        let sonnet_count = available_models
+            .iter()
+            .filter(|m| m.contains("claude-sonnet-4-5"))
+            .count();
+        assert_eq!(
+            sonnet_count, 1,
+            "Sonnet must appear exactly once in available_models after dedup; \
+             got {sonnet_count} occurrences in: {available_models:?}"
+        );
+        assert_eq!(
+            available_models.len(),
+            2,
+            "available_models must have exactly 2 entries (Haiku + Sonnet deduped); \
+             got: {available_models:?}"
+        );
+    }
+
+    // ── Test 6: CRI failure with AIP overrides → unhealthy regardless of AIP ───
+
+    /// If the CRI ListInferenceProfiles call fails, the endpoint is unhealthy
+    /// even if all AIP overrides would have resolved successfully.
+    /// (Health rule: CRI AND every AIP override must succeed.)
+    #[tokio::test]
+    async fn test_health_cri_failure_with_aip_overrides_unhealthy() {
+        let cri_result: Result<Vec<String>, String> =
+            Err("ListInferenceProfiles failed: ThrottlingException".to_string());
+
+        let mut aip_overrides = HashMap::new();
+        aip_overrides.insert(
+            "claude-sonnet-4-5".to_string(),
+            "arn:aws:bedrock:us-east-1:123456789012:application-inference-profile/sonnet-ok"
+                .to_string(),
+        );
+
+        let get_fm = |_arn: String| async move {
+            Ok("arn:aws:bedrock:us-east-1::foundation-model/anthropic.claude-sonnet-4-5-20250929-v1:0"
+                .to_string())
+        };
+
+        let HealthState {
+            healthy,
+            available_models,
+            aip_derived_profile_ids: _,
+        } = compute_health_state(cri_result, &aip_overrides, get_fm, "us", None).await;
+
+        assert!(
+            !healthy,
+            "endpoint must be unhealthy when CRI list fails, regardless of AIP resolution"
+        );
+        assert!(
+            available_models.is_empty(),
+            "available_models must be empty when CRI list fails; got: {available_models:?}"
+        );
+    }
+
+    // ── Test 7 (new — Task 5): aip_derived_profile_ids populated correctly ─────
+
+    /// An endpoint with two AIP overrides and a non-overlapping CRI list.
+    /// `aip_derived_profile_ids` must contain exactly the two `<prefix>.<suffix>`
+    /// strings resolved from AIP overrides, NOT the CRI-only entries.
+    ///
+    /// CRI list: ["us.anthropic.claude-haiku-4-5"]  (Haiku — CRI only)
+    /// AIP overrides:
+    ///   "claude-sonnet-4-5" → sonnet-only AIP ARN  (distinct from CRI)
+    ///   "claude-opus-4-7"   → opus AIP ARN          (distinct from CRI)
+    ///
+    /// Expected aip_derived_profile_ids contains the resolved Sonnet and Opus
+    /// model IDs; Haiku must NOT appear in aip_derived_profile_ids.
+    #[tokio::test]
+    async fn test_health_state_aip_derived_profile_ids_populated() {
+        let cri_result = Ok(vec!["us.anthropic.claude-haiku-4-5".to_string()]);
+
+        let mut aip_overrides = HashMap::new();
+        aip_overrides.insert(
+            "claude-sonnet-4-5".to_string(),
+            "arn:aws:bedrock:us-east-1:123456789012:application-inference-profile/sonnet-aip"
+                .to_string(),
+        );
+        aip_overrides.insert(
+            "claude-opus-4-7".to_string(),
+            "arn:aws:bedrock:us-east-1:123456789012:application-inference-profile/opus-aip"
+                .to_string(),
+        );
+
+        let get_fm = |arn: String| async move {
+            if arn.contains("sonnet-aip") {
+                Ok("arn:aws:bedrock:us-east-1::foundation-model/anthropic.claude-sonnet-4-5-20250929-v1:0"
+                    .to_string())
+            } else if arn.contains("opus-aip") {
+                Ok(
+                    "arn:aws:bedrock:us-east-1::foundation-model/anthropic.claude-opus-4-7"
+                        .to_string(),
+                )
+            } else {
+                Err(format!("unexpected ARN: {arn}"))
+            }
+        };
+
+        let HealthState {
+            healthy,
+            available_models,
+            mut aip_derived_profile_ids,
+        } = compute_health_state(cri_result, &aip_overrides, get_fm, "us", None).await;
+
+        assert!(healthy, "endpoint must be healthy");
+        assert_eq!(
+            available_models.len(),
+            3,
+            "available_models must have 3 entries (Haiku + Sonnet + Opus); \
+             got: {available_models:?}"
+        );
+
+        // The AIP-derived set must contain exactly the two AIP-resolved entries.
+        aip_derived_profile_ids.sort();
+        assert_eq!(
+            aip_derived_profile_ids.len(),
+            2,
+            "aip_derived_profile_ids must contain exactly 2 entries (Sonnet + Opus); \
+             got: {aip_derived_profile_ids:?}"
+        );
+        assert!(
+            aip_derived_profile_ids
+                .iter()
+                .any(|id| id.contains("claude-sonnet-4-5")),
+            "aip_derived_profile_ids must include the AIP-resolved Sonnet entry; \
+             got: {aip_derived_profile_ids:?}"
+        );
+        assert!(
+            aip_derived_profile_ids
+                .iter()
+                .any(|id| id.contains("claude-opus-4-7")),
+            "aip_derived_profile_ids must include the AIP-resolved Opus entry; \
+             got: {aip_derived_profile_ids:?}"
+        );
+        // Haiku is CRI-only and must NOT appear in aip_derived_profile_ids.
+        assert!(
+            !aip_derived_profile_ids
+                .iter()
+                .any(|id| id.contains("claude-haiku-4-5")),
+            "aip_derived_profile_ids must NOT include the CRI-only Haiku entry; \
+             got: {aip_derived_profile_ids:?}"
+        );
+    }
+
+    // ── Test 8 (new — Task 5): overlapping AIP + CRI → CRI provenance wins ────
+
+    /// When an AIP override resolves to a `<prefix>.<suffix>` that is already
+    /// in the CRI list, the dedup logic treats it as CRI provenance.  The model
+    /// must appear in `available_models` exactly once, and it must NOT appear
+    /// in `aip_derived_profile_ids`.
+    ///
+    /// CRI list: ["us.anthropic.claude-haiku-4-5",
+    ///            "us.anthropic.claude-sonnet-4-5-20250929-v1:0"]
+    /// AIP override: "claude-sonnet-4-5" → ARN that resolves to the same Sonnet suffix
+    ///
+    /// Expected: aip_derived_profile_ids is EMPTY (overlap treated as CRI).
+    #[tokio::test]
+    async fn test_health_state_aip_derived_excludes_cri_dedup_overlap() {
+        let cri_result = Ok(vec![
+            "us.anthropic.claude-haiku-4-5".to_string(),
+            "us.anthropic.claude-sonnet-4-5-20250929-v1:0".to_string(),
+        ]);
+
+        let mut aip_overrides = HashMap::new();
+        // AIP resolves to the same suffix that is already in the CRI list.
+        aip_overrides.insert(
+            "claude-sonnet-4-5".to_string(),
+            "arn:aws:bedrock:us-east-1:123456789012:application-inference-profile/sonnet-overlap"
+                .to_string(),
+        );
+
+        let get_fm = |_arn: String| async move {
+            Ok("arn:aws:bedrock:us-east-1::foundation-model/anthropic.claude-sonnet-4-5-20250929-v1:0"
+                .to_string())
+        };
+
+        let HealthState {
+            healthy,
+            available_models,
+            aip_derived_profile_ids,
+        } = compute_health_state(cri_result, &aip_overrides, get_fm, "us", None).await;
+
+        assert!(healthy, "endpoint must be healthy");
+        assert_eq!(
+            available_models.len(),
+            2,
+            "available_models must have exactly 2 entries (Haiku + Sonnet deduped); \
+             got: {available_models:?}"
+        );
+
+        // Because the AIP-resolved Sonnet is already covered by a CRI entry,
+        // CRI provenance wins and aip_derived_profile_ids must be empty.
+        assert!(
+            aip_derived_profile_ids.is_empty(),
+            "aip_derived_profile_ids must be empty when all AIP-resolved entries \
+             are already covered by CRI; got: {aip_derived_profile_ids:?}"
+        );
+    }
+}
+
+// ── Capability-probe opt-out — Task 5 (Slice 2C) tests ───────────────────────
+//
+// These tests exercise two pure helpers added to this module:
+//
+//   pub fn should_probe_profile(
+//       profile_id: &str,
+//       aip_derived_profile_ids: &[String],
+//       capability_probe_aip_enabled: bool,
+//   ) -> bool
+//
+// and (in a separate module below):
+//
+//   pub fn effective_capability_probe_aip(
+//       db_setting: Option<&str>,
+//       env_value: Option<&str>,
+//   ) -> bool
+//
+// Behaviour of `should_probe_profile`:
+//   - flag true  → always return true.
+//   - flag false, profile is in aip_derived_profile_ids → return false.
+//   - flag false, profile is NOT in aip_derived_profile_ids → return true.
+//
+// None of these tests require a database connection or AWS credentials.
+
+#[cfg(test)]
+mod tests_capability_probe_aip {
+    use super::*;
+
+    // ── Test 1: flag=true, AIP-derived entry → probe ──────────────────────────
+
+    /// When `capability_probe_aip_enabled` is `true`, every profile is probed
+    /// regardless of whether it is AIP-derived.  This is the default path.
+    #[test]
+    fn test_should_probe_returns_true_when_flag_enabled_aip_entry() {
+        let aip_derived = vec!["us.anthropic.claude-sonnet-4-5-20250929-v1:0".to_string()];
+        let result = should_probe_profile(
+            "us.anthropic.claude-sonnet-4-5-20250929-v1:0",
+            &aip_derived,
+            true, // flag enabled
+        );
+        assert!(
+            result,
+            "should_probe_profile must return true when flag is enabled, \
+             even for an AIP-derived entry"
+        );
+    }
+
+    // ── Test 2: flag=true, CRI-only entry → probe ─────────────────────────────
+
+    /// When `capability_probe_aip_enabled` is `true`, CRI-only profiles are
+    /// also always probed (this was the pre-Task-5 behaviour).
+    #[test]
+    fn test_should_probe_returns_true_when_flag_enabled_cri_entry() {
+        let aip_derived: Vec<String> =
+            vec!["us.anthropic.claude-sonnet-4-5-20250929-v1:0".to_string()];
+        let result = should_probe_profile(
+            "us.anthropic.claude-haiku-4-5", // Haiku — CRI only, not in aip_derived
+            &aip_derived,
+            true, // flag enabled
+        );
+        assert!(
+            result,
+            "should_probe_profile must return true for a CRI-only profile \
+             when flag is enabled"
+        );
+    }
+
+    // ── Test 3: flag=false, AIP-derived entry → skip ─────────────────────────
+
+    /// When `capability_probe_aip_enabled` is `false` and the profile ID is
+    /// present in `aip_derived_profile_ids`, the probe must be skipped.
+    ///
+    /// This is the core gate behaviour added by Task 5.
+    #[test]
+    fn test_should_probe_skips_aip_entry_when_flag_disabled() {
+        let aip_derived = vec![
+            "us.anthropic.claude-sonnet-4-5-20250929-v1:0".to_string(),
+            "us.anthropic.claude-opus-4-7".to_string(),
+        ];
+        let result = should_probe_profile(
+            "us.anthropic.claude-sonnet-4-5-20250929-v1:0",
+            &aip_derived,
+            false, // flag disabled
+        );
+        assert!(
+            !result,
+            "should_probe_profile must return false (skip) when flag is disabled \
+             and the profile is AIP-derived"
+        );
+    }
+
+    // ── Test 4: flag=false, CRI-only entry → probe ───────────────────────────
+
+    /// When `capability_probe_aip_enabled` is `false` but the profile is NOT in
+    /// `aip_derived_profile_ids`, the probe must proceed (CRI entries are always
+    /// probed regardless of the flag).
+    #[test]
+    fn test_should_probe_runs_cri_entry_when_flag_disabled() {
+        let aip_derived = vec!["us.anthropic.claude-sonnet-4-5-20250929-v1:0".to_string()];
+        let result = should_probe_profile(
+            "us.anthropic.claude-haiku-4-5", // CRI only — not in aip_derived
+            &aip_derived,
+            false, // flag disabled
+        );
+        assert!(
+            result,
+            "should_probe_profile must return true (probe) for a CRI-only profile \
+             even when the capability probe AIP flag is disabled"
+        );
+    }
+
+    // ── Test 5: flag=false, empty AIP set → all profiles probed ──────────────
+
+    /// When `aip_derived_profile_ids` is empty (e.g. a pure CRI endpoint) and
+    /// the flag is `false`, every profile is still probed because none match
+    /// the (empty) AIP-derived set.
+    #[test]
+    fn test_should_probe_empty_aip_set_with_flag_disabled() {
+        let result = should_probe_profile(
+            "us.anthropic.claude-haiku-4-5",
+            &[], // empty AIP-derived set
+            false,
+        );
+        assert!(
+            result,
+            "should_probe_profile must return true when aip_derived_profile_ids \
+             is empty, regardless of flag value"
+        );
+    }
+}
+
+// ── Effective-flag resolution — Task 5 (Slice 2C) tests ─────────────────────
+//
+// These tests exercise:
+//
+//   pub fn effective_capability_probe_aip(
+//       db_setting: Option<&str>,    // value from proxy_settings.capability_probe_aip
+//       env_value: Option<&str>,     // value of CAPABILITY_PROBE_AIP env var if set
+//   ) -> bool
+//
+// Precedence:
+//   1. `db_setting` (if Some) — DB wins.
+//   2. `env_value`  (if Some and parseable) — env used when DB absent.
+//   3. Default `true` — both absent, or env value is malformed.
+//
+// Parsing is case-insensitive: "TRUE", "False", "1", "0", etc. are valid.
+
+#[cfg(test)]
+mod tests_effective_capability_probe_flag {
+    use super::*;
+
+    // ── Test 8: DB setting overrides env (DB=true, env=false → true) ──────────
+
+    /// DB setting `"true"` wins over env var `"false"`.  DB is the highest
+    /// precedence source.
+    #[test]
+    fn test_effective_flag_db_overrides_env_true_over_false() {
+        let result = effective_capability_probe_aip(
+            Some("true"),  // DB setting
+            Some("false"), // env var
+        );
+        assert!(result, "DB setting 'true' must win over env 'false'");
+    }
+
+    // ── Test 9: DB setting overrides env (DB=false, env=true → false) ─────────
+
+    /// DB setting `"false"` wins over env var `"true"`.
+    #[test]
+    fn test_effective_flag_db_overrides_env_false_over_true() {
+        let result = effective_capability_probe_aip(
+            Some("false"), // DB setting
+            Some("true"),  // env var
+        );
+        assert!(!result, "DB setting 'false' must win over env 'true'");
+    }
+
+    // ── Test 10: DB absent → env var used ────────────────────────────────────
+
+    /// When the DB has no row, the env var value is used.
+    #[test]
+    fn test_effective_flag_env_used_when_db_absent() {
+        let result = effective_capability_probe_aip(
+            None,          // no DB row
+            Some("false"), // env var says false
+        );
+        assert!(
+            !result,
+            "env var 'false' must be respected when no DB setting is present"
+        );
+    }
+
+    // ── Test 11: both absent → default true ──────────────────────────────────
+
+    /// When neither the DB row nor the env var is set, the effective flag is
+    /// the hard-coded default: `true` (probe everything).
+    #[test]
+    fn test_effective_flag_default_true_when_both_absent() {
+        let result = effective_capability_probe_aip(
+            None, // no DB row
+            None, // no env var
+        );
+        assert!(
+            result,
+            "effective_capability_probe_aip must default to true when both \
+             db_setting and env_value are absent"
+        );
+    }
+
+    // ── Test 12: malformed env var → fall back to default ────────────────────
+
+    /// An unrecognised env var value (e.g. `"yes"`, `"enabled"`) must fall
+    /// back to the default `true` rather than panic or incorrectly parse.
+    #[test]
+    fn test_effective_flag_malformed_falls_back_to_default() {
+        let result = effective_capability_probe_aip(
+            None,        // no DB row
+            Some("yes"), // unrecognised value
+        );
+        assert!(
+            result,
+            "malformed env var 'yes' must fall back to the default of true"
+        );
+    }
+
+    // ── Test 13: case-insensitive parsing ────────────────────────────────────
+
+    /// Both `"TRUE"` and `"False"` (mixed case) must parse correctly.
+    #[test]
+    fn test_effective_flag_case_insensitive() {
+        let upper_true = effective_capability_probe_aip(Some("TRUE"), None);
+        assert!(
+            upper_true,
+            "DB setting 'TRUE' (upper-case) must parse as true"
+        );
+
+        let mixed_false = effective_capability_probe_aip(Some("False"), None);
+        assert!(
+            !mixed_false,
+            "DB setting 'False' (mixed-case) must parse as false"
         );
     }
 }

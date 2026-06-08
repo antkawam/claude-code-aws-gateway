@@ -1,5 +1,6 @@
 pub mod beta_overrides;
 pub mod budget;
+pub mod endpoint_aip_overrides;
 pub mod endpoints;
 pub mod idp;
 pub mod keys;

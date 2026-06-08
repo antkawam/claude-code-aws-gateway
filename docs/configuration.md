@@ -131,7 +131,18 @@ CCAG supports Claude Code's 1M-context model variants via the `[1m]` suffix conv
 
 **No operator maintenance.** Self-deployers do not need a new CCAG binary release when Anthropic ships a new beta header that Bedrock accepts, or when AWS launches a new 1M-capable Claude model. The health-loop probe and rejection-learning paths handle both cases automatically.
 
+### Capability probes on AIP-mapped models
 
+When an endpoint has [AIP overrides](endpoints.md#aip-overrides) configured, the health loop's seed probes extend to AIP-mapped model entries by default (`CAPABILITY_PROBE_AIP=true`). Each AIP-mapped `(endpoint, profile, beta)` pair receives the same synthetic probe as a CRI-backed profile: approximately 50 input tokens, ≤5 output tokens, once per `CAPABILITY_TTL` (24 hours). Probes from the health-loop are separate from `GetInferenceProfile` calls (which are control-plane and always run regardless of this setting).
+
+**When to disable (`CAPABILITY_PROBE_AIP=false`):** operators using AIPs for strict cost attribution who do not want synthetic-probe spend appearing against tagged AIP profiles. Set the env var at deploy time or toggle `capability_probe_aip` in `proxy_settings` at runtime (no restart needed).
+
+**Consequences of disabling:** the capability cache for AIP-mapped entries stays empty until rejection-learning populates it from real traffic. As a result:
+
+- `/v1/models` does not emit beta-suffixed variants (e.g., `claude-sonnet-4-5[1m]`) for AIP-only models on this endpoint until the first real request triggers learning.
+- The first user request for an unsupported beta absorbs one round-trip penalty (Bedrock rejects, the gateway strips the beta and retries). Subsequent requests for that `(profile, beta)` pair use the cached result.
+
+**Pre-populating the cache manually:** operators who disable probing can force capability flags via `ccag betas override <endpoint-id> <profile-id> <beta-name> true|false [--reason "..."]`. Admin overrides ignore TTL and survive restarts.
 
 ### Pricing
 
@@ -139,6 +150,7 @@ CCAG supports Claude Code's 1M-context model variants via the `[1m]` suffix conv
 |---|---|---|
 | `PRICING_REFRESH_INTERVAL` | `86400` | Seconds between automatic refreshes of model pricing from the AWS Price List API (default 86400 = 24 hours). |
 | `PRICING_REFRESH_ENABLED` | `true` | Set to `false` or `0` to disable the automatic pricing refresh background loop. Useful when AWS credentials lack Pricing API access or for air-gapped environments. |
+| `CAPABILITY_PROBE_AIP` | `true` | Set to `false` to skip seed-probe invocations against AIP-mapped profiles (saves AIP throttle quota); CRI-backed profiles are still probed. Can also be toggled at runtime via the `capability_probe_aip` key in `proxy_settings`. |
 
 ### Infrastructure Alarms
 

@@ -1,9 +1,13 @@
 pub mod admin_tests;
+pub mod aip_compat_shim_tests;
+pub mod aip_legacy_migration_tests;
+pub mod aip_overrides_admin_tests;
 pub mod beta_overrides_admin_tests;
 pub mod beta_overrides_db_tests;
 pub mod beta_overrides_replay_tests;
 pub mod budget_tests;
 pub mod db_tests;
+pub mod endpoint_aip_overrides_tests;
 pub mod endpoint_tests;
 pub mod model_seed_tests;
 pub mod notification_tests;

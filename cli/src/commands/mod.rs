@@ -1,3 +1,4 @@
+pub mod aip_overrides;
 pub mod betas;
 pub mod config;
 pub mod endpoints;
