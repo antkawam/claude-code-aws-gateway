@@ -424,8 +424,8 @@ mod tests_cli_mappings {
     /// Compile-fails until Builder adds `Commands::Mappings` + `MappingsCommands`.
     #[test]
     fn list_parses_no_flags() {
-        let cli = parse(&["ccag", "mappings", "list"])
-            .expect("mappings list should parse without error");
+        let cli =
+            parse(&["ccag", "mappings", "list"]).expect("mappings list should parse without error");
         match cli.command {
             Commands::Mappings(MappingsCommands::List { json }) => {
                 assert!(!json, "json flag must default to false");
@@ -637,7 +637,10 @@ mod tests_cli_mappings {
         assert_eq!(cli.url, Some("http://localhost:9090".to_string()));
         assert_eq!(cli.token, Some("test-tok".to_string()));
         assert!(
-            matches!(cli.command, Commands::Mappings(MappingsCommands::List { .. })),
+            matches!(
+                cli.command,
+                Commands::Mappings(MappingsCommands::List { .. })
+            ),
             "expected Commands::Mappings(MappingsCommands::List)"
         );
     }

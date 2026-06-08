@@ -40,11 +40,7 @@ pub enum MappingsCommands {
     },
 }
 
-pub async fn run(
-    cmd: MappingsCommands,
-    url: Option<String>,
-    token: Option<String>,
-) -> Result<()> {
+pub async fn run(cmd: MappingsCommands, url: Option<String>, token: Option<String>) -> Result<()> {
     match cmd {
         MappingsCommands::List { json } => list(json, url, token).await,
         MappingsCommands::Add {
@@ -124,9 +120,7 @@ async fn add(
     let prefix = resp["anthropic_prefix"]
         .as_str()
         .unwrap_or(&anthropic_prefix);
-    let suffix = resp["bedrock_suffix"]
-        .as_str()
-        .unwrap_or(&bedrock_suffix);
+    let suffix = resp["bedrock_suffix"].as_str().unwrap_or(&bedrock_suffix);
     util::success(&format!("added: {prefix} -> {suffix}"));
 
     Ok(())
