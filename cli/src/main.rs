@@ -76,6 +76,10 @@ enum Commands {
     #[command(subcommand)]
     Betas(commands::betas::BetasCommands),
 
+    /// Manage model ID mappings
+    #[command(subcommand)]
+    Mappings(commands::mappings::MappingsCommands),
+
     /// Check deployment status and health
     Status(commands::status::StatusArgs),
 
@@ -132,6 +136,7 @@ async fn main() -> anyhow::Result<()> {
         Commands::Idps(cmd) => commands::idps::run(cmd, cli.url, cli.token).await,
         Commands::Scim(cmd) => commands::scim::run(cmd, cli.url, cli.token).await,
         Commands::Betas(cmd) => commands::betas::run(cmd, cli.url, cli.token).await,
+        Commands::Mappings(cmd) => commands::mappings::run(cmd, cli.url, cli.token).await,
         Commands::Status(args) => commands::status::run(args, cli.url).await,
         Commands::Logs(args) => commands::logs::run(args).await,
         Commands::Update => commands::update::run().await,
@@ -322,5 +327,332 @@ mod tests_cli_betas {
             }
             _ => panic!("expected Betas(ClearOverride) variant"),
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Layer A — CLI clap parser contract tests (Task 8: ccag mappings)
+//
+// These tests drive the clap `derive` parser directly via `Cli::try_parse_from`
+// with no I/O or network calls.  They will FAIL TO COMPILE until the Builder
+// implements the `mappings` subcommand.
+//
+// BUILDER CONTRACT — everything the Builder must satisfy for these tests to
+// pass:
+//
+//   Module:  `cli/src/commands/mappings.rs`
+//
+//   1. Add `pub mod mappings;` to `cli/src/commands/mod.rs`.
+//
+//   2. Add a `Mappings` variant to `Commands` in `cli/src/main.rs`:
+//        /// Manage model ID mappings
+//        #[command(subcommand)]
+//        Mappings(commands::mappings::MappingsCommands),
+//
+//   3. Add handler arm in `main()`:
+//        Commands::Mappings(cmd) => commands::mappings::run(cmd, cli.url, cli.token).await,
+//
+//   4. `MappingsCommands` must expose these variants (clap subcommands):
+//
+//        List {
+//            /// Output raw JSON instead of a table
+//            #[arg(long)]
+//            json: bool,
+//        }
+//
+//        Add {
+//            /// Short Anthropic-side prefix, e.g. "claude-sonnet-4-6"
+//            anthropic_prefix: String,
+//            /// Bedrock model suffix, must start with "anthropic."
+//            bedrock_suffix: String,
+//            /// Human-readable display name (optional)
+//            #[arg(long)]
+//            display: Option<String>,
+//        }
+//
+//        Delete {
+//            /// Anthropic prefix to delete
+//            anthropic_prefix: String,
+//            /// Skip the interactive confirmation prompt
+//            #[arg(long)]
+//            yes: bool,
+//        }
+//
+//        Discover {
+//            /// Raw model ID to probe, e.g. "claude-future-9-9"
+//            model: String,
+//        }
+//
+//   5. `run(cmd: MappingsCommands, url: Option<String>, token: Option<String>)`
+//      calls the following admin API endpoints via `AdminClient`:
+//        - List   → GET  /admin/mappings
+//        - Add    → POST /admin/mappings          body {anthropic_prefix, bedrock_suffix, anthropic_display?}
+//        - Delete → DELETE /admin/mappings/{anthropic_prefix}
+//        - Discover → POST /admin/mappings/discover  body {model}
+//
+//   6. `List` with `--json` prints the raw JSON response to stdout (same
+//      pattern as existing `list` commands that pass `--json`).
+//      Without `--json`, prints a table with columns:
+//        ANTHROPIC_PREFIX  BEDROCK_SUFFIX  DISPLAY  SOURCE  CREATED_VIA  LAST_USED_AT  CREATED_AT
+//
+//   7. `Delete` without `--yes` shows a confirmation prompt via `dialoguer`;
+//      with `--yes` proceeds immediately.
+//
+//   8. On server error (non-2xx), `run` returns Err(anyhow) — the binary
+//      prints the error to stderr and exits non-zero (standard anyhow main).
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod tests_cli_mappings {
+    use super::{Cli, Commands};
+    use clap::Parser;
+    // These imports will fail to compile until the Builder adds `mappings.rs`
+    // and registers the `Mappings` variant in `Commands`.
+    #[allow(unused_imports)]
+    use crate::commands::mappings::MappingsCommands;
+
+    fn parse(args: &[&str]) -> Result<Cli, clap::Error> {
+        Cli::try_parse_from(args)
+    }
+
+    // -----------------------------------------------------------------------
+    // list
+    // -----------------------------------------------------------------------
+
+    /// `ccag mappings list` — no flags — parses to `MappingsCommands::List` with
+    /// `json = false`.
+    ///
+    /// Compile-fails until Builder adds `Commands::Mappings` + `MappingsCommands`.
+    #[test]
+    fn list_parses_no_flags() {
+        let cli = parse(&["ccag", "mappings", "list"])
+            .expect("mappings list should parse without error");
+        match cli.command {
+            Commands::Mappings(MappingsCommands::List { json }) => {
+                assert!(!json, "json flag must default to false");
+            }
+            _ => panic!("expected Commands::Mappings(MappingsCommands::List)"),
+        }
+    }
+
+    /// `ccag mappings list --json` — parses to `MappingsCommands::List` with
+    /// `json = true`.
+    ///
+    /// Compile-fails until Builder adds `Commands::Mappings` + `MappingsCommands`.
+    #[test]
+    fn list_parses_json_flag() {
+        let cli = parse(&["ccag", "mappings", "list", "--json"])
+            .expect("mappings list --json should parse without error");
+        match cli.command {
+            Commands::Mappings(MappingsCommands::List { json }) => {
+                assert!(json, "json flag must be true when --json is present");
+            }
+            _ => panic!("expected Commands::Mappings(MappingsCommands::List)"),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // add
+    // -----------------------------------------------------------------------
+
+    /// `ccag mappings add <prefix> <suffix>` — no optional display — parses
+    /// with `display = None`.
+    ///
+    /// Compile-fails until Builder adds `Commands::Mappings` + `MappingsCommands`.
+    #[test]
+    fn add_parses_required_args_only() {
+        let cli = parse(&[
+            "ccag",
+            "mappings",
+            "add",
+            "claude-sonnet-4-6",
+            "anthropic.claude-sonnet-4-6-v1",
+        ])
+        .expect("mappings add with two positionals should parse without error");
+        match cli.command {
+            Commands::Mappings(MappingsCommands::Add {
+                anthropic_prefix,
+                bedrock_suffix,
+                display,
+            }) => {
+                assert_eq!(anthropic_prefix, "claude-sonnet-4-6");
+                assert_eq!(bedrock_suffix, "anthropic.claude-sonnet-4-6-v1");
+                assert!(
+                    display.is_none(),
+                    "display must be None when --display is omitted"
+                );
+            }
+            _ => panic!("expected Commands::Mappings(MappingsCommands::Add)"),
+        }
+    }
+
+    /// `ccag mappings add <prefix> <suffix> --display "Sonnet 4.6"` — parses
+    /// with `display = Some("Sonnet 4.6")`.
+    ///
+    /// Compile-fails until Builder adds `Commands::Mappings` + `MappingsCommands`.
+    #[test]
+    fn add_parses_with_display_flag() {
+        let cli = parse(&[
+            "ccag",
+            "mappings",
+            "add",
+            "claude-sonnet-4-6",
+            "anthropic.claude-sonnet-4-6-v1",
+            "--display",
+            "Sonnet 4.6",
+        ])
+        .expect("mappings add with --display should parse without error");
+        match cli.command {
+            Commands::Mappings(MappingsCommands::Add { display, .. }) => {
+                assert_eq!(
+                    display,
+                    Some("Sonnet 4.6".to_string()),
+                    "display must capture the --display value"
+                );
+            }
+            _ => panic!("expected Commands::Mappings(MappingsCommands::Add)"),
+        }
+    }
+
+    /// `ccag mappings add` with only one positional argument must fail (missing
+    /// `bedrock_suffix`).
+    ///
+    /// Compile-fails until Builder adds `Commands::Mappings` + `MappingsCommands`.
+    #[test]
+    fn add_rejects_missing_bedrock_suffix() {
+        let result = parse(&["ccag", "mappings", "add", "claude-sonnet-4-6"]);
+        assert!(
+            result.is_err(),
+            "add with missing bedrock_suffix must produce a clap parse error"
+        );
+    }
+
+    /// `ccag mappings add` with no positional arguments must fail (both required).
+    #[test]
+    fn add_rejects_no_args() {
+        let result = parse(&["ccag", "mappings", "add"]);
+        assert!(
+            result.is_err(),
+            "add with no args must produce a clap parse error"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // delete
+    // -----------------------------------------------------------------------
+
+    /// `ccag mappings delete <prefix>` — no flags — parses with `yes = false`.
+    ///
+    /// Compile-fails until Builder adds `Commands::Mappings` + `MappingsCommands`.
+    #[test]
+    fn delete_parses_without_yes_flag() {
+        let cli = parse(&["ccag", "mappings", "delete", "claude-sonnet-4-6"])
+            .expect("mappings delete with one positional should parse without error");
+        match cli.command {
+            Commands::Mappings(MappingsCommands::Delete {
+                anthropic_prefix,
+                yes,
+            }) => {
+                assert_eq!(anthropic_prefix, "claude-sonnet-4-6");
+                assert!(!yes, "yes flag must default to false");
+            }
+            _ => panic!("expected Commands::Mappings(MappingsCommands::Delete)"),
+        }
+    }
+
+    /// `ccag mappings delete <prefix> --yes` — parses with `yes = true` (skips
+    /// confirmation prompt in production code).
+    ///
+    /// Compile-fails until Builder adds `Commands::Mappings` + `MappingsCommands`.
+    #[test]
+    fn delete_parses_with_yes_flag() {
+        let cli = parse(&["ccag", "mappings", "delete", "claude-sonnet-4-6", "--yes"])
+            .expect("mappings delete --yes should parse without error");
+        match cli.command {
+            Commands::Mappings(MappingsCommands::Delete { yes, .. }) => {
+                assert!(yes, "yes flag must be true when --yes is present");
+            }
+            _ => panic!("expected Commands::Mappings(MappingsCommands::Delete)"),
+        }
+    }
+
+    /// `ccag mappings delete` with no positional argument must fail.
+    #[test]
+    fn delete_rejects_no_args() {
+        let result = parse(&["ccag", "mappings", "delete"]);
+        assert!(
+            result.is_err(),
+            "delete with no positional must produce a clap parse error"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // discover
+    // -----------------------------------------------------------------------
+
+    /// `ccag mappings discover <model>` — parses with the model ID captured.
+    ///
+    /// Compile-fails until Builder adds `Commands::Mappings` + `MappingsCommands`.
+    #[test]
+    fn discover_parses_model_arg() {
+        let cli = parse(&["ccag", "mappings", "discover", "claude-future-9-9"])
+            .expect("mappings discover should parse without error");
+        match cli.command {
+            Commands::Mappings(MappingsCommands::Discover { model }) => {
+                assert_eq!(model, "claude-future-9-9");
+            }
+            _ => panic!("expected Commands::Mappings(MappingsCommands::Discover)"),
+        }
+    }
+
+    /// `ccag mappings discover` with no positional argument must fail.
+    #[test]
+    fn discover_rejects_no_args() {
+        let result = parse(&["ccag", "mappings", "discover"]);
+        assert!(
+            result.is_err(),
+            "discover with no model arg must produce a clap parse error"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // global flags pass through
+    // -----------------------------------------------------------------------
+
+    /// Global `--url` and `--token` flags propagate to the subcommand parse
+    /// (they are stored on `Cli`, not `MappingsCommands`).
+    ///
+    /// Compile-fails until Builder adds `Commands::Mappings` + `MappingsCommands`.
+    #[test]
+    fn global_flags_parse_with_mappings_subcommand() {
+        let cli = parse(&[
+            "ccag",
+            "--url",
+            "http://localhost:9090",
+            "--token",
+            "test-tok",
+            "mappings",
+            "list",
+        ])
+        .expect("global flags + mappings list should parse without error");
+        assert_eq!(cli.url, Some("http://localhost:9090".to_string()));
+        assert_eq!(cli.token, Some("test-tok".to_string()));
+        assert!(
+            matches!(cli.command, Commands::Mappings(MappingsCommands::List { .. })),
+            "expected Commands::Mappings(MappingsCommands::List)"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // unknown subcommand
+    // -----------------------------------------------------------------------
+
+    /// An unknown subcommand under `mappings` must fail with a clap parse error.
+    #[test]
+    fn mappings_unknown_subcommand_fails() {
+        let result = parse(&["ccag", "mappings", "frobnicate"]);
+        assert!(
+            result.is_err(),
+            "unknown mappings subcommand must produce a clap parse error"
+        );
     }
 }
