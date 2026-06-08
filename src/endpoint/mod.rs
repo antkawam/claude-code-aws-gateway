@@ -214,13 +214,25 @@ impl EndpointClient {
     /// Returns the AIP ARN for `model_id` from the new `aip_overrides` map, or
     /// `None` if no override exists for this model.
     ///
+    /// Lookup order:
+    /// 1. Raw match on `model_id` — preserves admin alias-key precedence.
+    /// 2. Canonicalize `model_id` via `canonicalize_model_id`; if `Some(canonical)`,
+    ///    retry the HashMap with the canonical form.
+    ///
     /// This helper reads **only** the `aip_overrides` HashMap (populated from the
     /// `endpoint_aip_overrides` table). It does NOT fall back to
     /// `config.inference_profile_arn` (the legacy column). The legacy fallback is
     /// the responsibility of the request dispatcher — this strict boundary makes
     /// each code path testable in isolation.
     pub fn aip_override_for(&self, model_id: &str) -> Option<&str> {
-        self.aip_overrides.get(model_id).map(|s| s.as_str())
+        // 1. Try raw match first (admin can pin a non-canonical override key
+        //    if they have an alias-shaped use case).
+        if let Some(arn) = self.aip_overrides.get(model_id) {
+            return Some(arn.as_str());
+        }
+        // 2. Try canonical form.
+        let canonical = crate::translate::canonicalize::canonicalize_model_id(model_id)?;
+        self.aip_overrides.get(&canonical).map(|s| s.as_str())
     }
 
     /// Returns `true` iff the `aip_overrides` map has at least one entry.
@@ -692,6 +704,73 @@ impl EndpointPool {
     pub async fn len(&self) -> usize {
         let clients = self.clients.read().await;
         clients.len()
+    }
+
+    /// Scan all rows in `endpoint_aip_overrides` and flag any whose `model_id` is
+    /// not a canonical fixed-point (i.e. `canonicalize_model_id(model_id) !=
+    /// Some(model_id.to_string())`).
+    ///
+    /// For each non-canonical row:
+    /// - If the same `endpoint_id` already has a row keyed by the canonical form,
+    ///   emit `tracing::warn!` (the older dated row will shadow the canonical one in
+    ///   raw-match fast-path — admin attention needed).
+    /// - Otherwise emit `tracing::info!` flagging the non-canonical key.
+    ///
+    /// Rows are **never** modified or deleted by this scan.
+    pub async fn scan_non_canonical_aip_overrides(pool: &sqlx::PgPool) {
+        // Fetch all rows from the table.
+        let rows: Vec<(uuid::Uuid, String)> = match sqlx::query_as(
+            "SELECT endpoint_id, model_id FROM endpoint_aip_overrides ORDER BY endpoint_id, model_id",
+        )
+        .fetch_all(pool)
+        .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!(error = %e, "scan_non_canonical_aip_overrides: failed to fetch rows");
+                return;
+            }
+        };
+
+        // Build a set of (endpoint_id, model_id) pairs for O(1) sibling lookup.
+        let all_keys: std::collections::HashSet<(uuid::Uuid, String)> = rows
+            .iter()
+            .map(|(ep_id, model_id)| (*ep_id, model_id.clone()))
+            .collect();
+
+        for (endpoint_id, model_id) in &rows {
+            match crate::translate::canonicalize::canonicalize_model_id(model_id) {
+                None => {
+                    // Canonicalizer can't handle this key at all — flag as non-canonical.
+                    tracing::info!(
+                        %endpoint_id,
+                        model_id = %model_id,
+                        "non-canonical aip override key (canonicalization failed)"
+                    );
+                }
+                Some(ref canonical) if canonical != model_id => {
+                    // model_id is not the canonical fixed point.
+                    if all_keys.contains(&(*endpoint_id, canonical.clone())) {
+                        tracing::warn!(
+                            %endpoint_id,
+                            raw = %model_id,
+                            %canonical,
+                            "non_canonical_aip_override_collides_with_canonical_sibling"
+                        );
+                    } else {
+                        tracing::info!(
+                            %endpoint_id,
+                            model_id = %model_id,
+                            %canonical,
+                            "non-canonical aip override key (no sibling conflict)"
+                        );
+                    }
+                }
+                Some(_) => {
+                    // canonical == model_id: already a fixed-point; nothing to do.
+                }
+            }
+        }
     }
 
     /// Mark an endpoint as unhealthy.
@@ -4009,6 +4088,177 @@ mod tests_aip_override_helpers {
             "haiku has no override, must return None"
         );
     }
+
+    // ── AC5.1 — Canonicalization path ────────────────────────────────────────
+
+    /// AC5.1: `aip_override_for("claude-sonnet-4-6-20250514")` against a map
+    /// containing only `("claude-sonnet-4-6", "arn:...")` returns `Some("arn:...")`.
+    ///
+    /// After Task 5 the implementation must:
+    ///   1. Try raw match → miss (map has "claude-sonnet-4-6", not the dated form).
+    ///   2. Canonicalize input → "claude-sonnet-4-6".
+    ///   3. Hit canonical key → return ARN.
+    ///
+    /// PRE-IMPLEMENTATION FAILURE MODE: assertion-fail (returns None because the
+    /// current implementation does raw HashMap::get only).
+    #[test]
+    fn test_aip_override_for_canonicalize_dated_variant() {
+        let canonical_arn =
+            "arn:aws:bedrock:us-east-1:123456789012:application-inference-profile/sonnet-46";
+        let mut map = HashMap::new();
+        map.insert("claude-sonnet-4-6".to_string(), canonical_arn.to_string());
+
+        let client = make_client_with_overrides(map, None);
+
+        let result = client.aip_override_for("claude-sonnet-4-6-20250514");
+        assert_eq!(
+            result,
+            Some(canonical_arn),
+            "aip_override_for(\"claude-sonnet-4-6-20250514\") must find the \
+             \"claude-sonnet-4-6\" override via canonicalization (date-strip), \
+             got {:?}",
+            result
+        );
+    }
+
+    // ── AC5.2 — Auto-prefix path ──────────────────────────────────────────────
+
+    /// AC5.2: `aip_override_for("opus-4-6")` against a map containing only
+    /// `("claude-opus-4-6", "arn:...")` returns `Some("arn:...")`.
+    ///
+    /// After Task 5 the implementation must:
+    ///   1. Try raw match → miss (map has "claude-opus-4-6").
+    ///   2. Canonicalize "opus-4-6" → "claude-opus-4-6" (auto-prefix).
+    ///   3. Hit canonical key → return ARN.
+    ///
+    /// PRE-IMPLEMENTATION FAILURE MODE: assertion-fail (returns None).
+    #[test]
+    fn test_aip_override_for_auto_prefix_path() {
+        let canonical_arn =
+            "arn:aws:bedrock:us-east-1:123456789012:application-inference-profile/opus-46";
+        let mut map = HashMap::new();
+        map.insert("claude-opus-4-6".to_string(), canonical_arn.to_string());
+
+        let client = make_client_with_overrides(map, None);
+
+        let result = client.aip_override_for("opus-4-6");
+        assert_eq!(
+            result,
+            Some(canonical_arn),
+            "aip_override_for(\"opus-4-6\") must find the \"claude-opus-4-6\" override \
+             via auto-prefix canonicalization, got {:?}",
+            result
+        );
+    }
+
+    // ── AC5.3 — Canonicalizer rejects → no fallback ───────────────────────────
+
+    /// AC5.3: `aip_override_for("Sonnet 4.7")` against any map returns `None`.
+    ///
+    /// "Sonnet 4.7" contains a space, which is outside `[a-zA-Z0-9.:-]`, so
+    /// `canonicalize_model_id` returns `None`. There must be no further fallback;
+    /// the function must immediately return `None` without fabricating a match.
+    ///
+    /// PRE-IMPLEMENTATION FAILURE MODE: the current raw-HashMap-get implementation
+    /// already returns None for this input, so the test passes before Task 5.
+    /// It is a regression guard ensuring the canonical-fallback code path added in
+    /// Task 5 does NOT accidentally over-reach for inputs the canonicalizer rejects.
+    #[test]
+    fn test_aip_override_for_canonicalizer_rejection_returns_none() {
+        let mut map = HashMap::new();
+        map.insert(
+            "claude-sonnet-4-7".to_string(),
+            "arn:aws:bedrock:us-east-1:123456789012:application-inference-profile/sonnet-47"
+                .to_string(),
+        );
+
+        let client = make_client_with_overrides(map, None);
+
+        let result = client.aip_override_for("Sonnet 4.7");
+        assert!(
+            result.is_none(),
+            "aip_override_for(\"Sonnet 4.7\") must return None because the canonicalizer \
+             rejects inputs containing spaces; no fallback path must remain, got {:?}",
+            result
+        );
+    }
+
+    // ── AC5.4 — Raw match takes precedence over canonical match ───────────────
+
+    /// AC5.4: Given map `{"claude-sonnet-4-6-20250514" -> "raw-arn",
+    /// "claude-sonnet-4-6" -> "canonical-arn"}` and input
+    /// `"claude-sonnet-4-6-20250514"`, returns `"raw-arn"` (NOT `"canonical-arn"`).
+    ///
+    /// The raw match fast-path must be attempted first and must short-circuit
+    /// before the canonicalize-then-lookup step.
+    ///
+    /// PRE-IMPLEMENTATION FAILURE MODE: the current raw HashMap::get implementation
+    /// already passes this test. It is a regression guard ensuring that adding the
+    /// canonical fallback in Task 5 does NOT break raw-match precedence.
+    #[test]
+    fn test_aip_override_for_raw_takes_precedence_over_canonical() {
+        let raw_arn =
+            "arn:aws:bedrock:us-east-1:123456789012:application-inference-profile/raw-dated";
+        let canonical_arn =
+            "arn:aws:bedrock:us-east-1:123456789012:application-inference-profile/canonical";
+
+        let mut map = HashMap::new();
+        // Both the dated key AND the canonical key are present.
+        map.insert(
+            "claude-sonnet-4-6-20250514".to_string(),
+            raw_arn.to_string(),
+        );
+        map.insert("claude-sonnet-4-6".to_string(), canonical_arn.to_string());
+
+        let client = make_client_with_overrides(map, None);
+
+        let result = client.aip_override_for("claude-sonnet-4-6-20250514");
+        assert_eq!(
+            result,
+            Some(raw_arn),
+            "raw-match must take precedence: input \"claude-sonnet-4-6-20250514\" \
+             must return the raw-keyed ARN, not the canonical-keyed ARN; got {:?}",
+            result
+        );
+    }
+}
+
+// ── AC5.7 — Startup normalization pass (tracing output capture) ───────────────
+//
+// This module tests the startup-time AIP override normalization scan via the
+// seam `EndpointPool::scan_non_canonical_aip_overrides(pool: &PgPool)` that
+// the Builder must expose.
+//
+// # BUILDER CONTRACT (src/endpoint/mod.rs)
+//
+// The Builder must add a method:
+//
+//   impl EndpointPool {
+//       /// Scan all rows in `endpoint_aip_overrides`. For each row whose
+//       /// `model_id` is not a canonical fixed-point (i.e.
+//       /// `canonicalize_model_id(model_id) != Some(model_id.to_string())`):
+//       ///
+//       /// * If a row with the canonical `model_id` already exists for the same
+//       ///   `endpoint_id`, emit `tracing::warn!` with both rows' details.
+//       /// * Otherwise emit `tracing::info!` flagging the non-canonical key.
+//       ///
+//       /// Rows are NEVER modified or deleted by this scan.
+//       pub async fn scan_non_canonical_aip_overrides(pool: &sqlx::PgPool);
+//   }
+//
+// If the Builder chooses to integrate the scan into `load_endpoints_inner`
+// instead of a standalone method, this test module should be updated to call
+// the integration path (e.g. by inserting a row and calling
+// `load_endpoints_with_db`). The integration version of the test exists in
+// `tests/integration/canonicalize_admin_tests.rs` as AC5.7-integration and
+// is the fallback if this unit-level seam is not exposed.
+#[cfg(test)]
+mod tests_aip_normalization_startup {
+    // Intentionally empty until the Builder exposes
+    // `EndpointPool::scan_non_canonical_aip_overrides`.
+    // The integration-level AC5.7 test in
+    // `tests/integration/canonicalize_admin_tests.rs` covers the behavior
+    // end-to-end against a real DB.
 }
 
 // ── Health loop union — Task 3 (Slice 2A) tests ──────────────────────────────
