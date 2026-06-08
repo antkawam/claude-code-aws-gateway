@@ -58,7 +58,7 @@ Claude Code connects to CCAG as it would to the Anthropic API. The gateway trans
 
 - AWS account with [Bedrock model access](https://docs.aws.amazon.com/bedrock/latest/userguide/model-access.html) enabled for Claude models
 - AWS CLI configured with credentials
-- Docker
+- Docker (or [Podman](docs/faq.md#podman))
 
 ### Option A: Docker Compose
 
