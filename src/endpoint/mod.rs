@@ -706,6 +706,17 @@ impl EndpointPool {
         clients.len()
     }
 
+    /// Insert a pre-built `EndpointClient` directly into the pool.
+    ///
+    /// Only available when the `integration` feature is enabled.  Used by
+    /// integration tests to inject fixture clients without going through
+    /// `load_endpoints` (which requires real AWS credentials).
+    #[cfg(feature = "integration")]
+    pub async fn insert_client_for_testing(&self, client: EndpointClient) {
+        let mut clients = self.clients.write().await;
+        clients.insert(client.config.id, Arc::new(client));
+    }
+
     /// Scan all rows in `endpoint_aip_overrides` and flag any whose `model_id` is
     /// not a canonical fixed-point (i.e. `canonicalize_model_id(model_id) !=
     /// Some(model_id.to_string())`).
