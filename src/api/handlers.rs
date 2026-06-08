@@ -677,14 +677,32 @@ pub async fn messages(
         &websearch_mode,
     );
 
-    // If the endpoint has an application inference profile ARN configured, use it directly
-    // as the model ID — overrides the prefix-based cross-region inference profile.
-    if let Some(profile_arn) = selected_endpoint
-        .as_ref()
-        .and_then(|ep| ep.config.inference_profile_arn.as_deref())
-    {
-        bedrock_model = profile_arn.to_string();
-    } else {
+    // Resolve the dispatch target using the four-case AIP precedence chain:
+    //   1. New AIP override table has a row for this model → use that ARN.
+    //   2. New table has rows for other models but not this one → CRI unchanged (no substitution).
+    //   3. New table empty + legacy column set → force-substitute legacy ARN (compat).
+    //   4. New table empty + legacy column null → pure CRI unchanged.
+    let resolved = resolve_dispatch_target(
+        &bedrock_model,
+        &original_model,
+        selected_endpoint
+            .as_ref()
+            .and_then(|ep| ep.aip_override_for(&original_model)),
+        selected_endpoint
+            .as_ref()
+            .is_some_and(|ep| ep.has_any_aip_overrides()),
+        selected_endpoint
+            .as_ref()
+            .and_then(|ep| ep.config.inference_profile_arn.as_deref()),
+    );
+
+    // If we substituted (AIP override or legacy ARN), bedrock_model is now an ARN — skip discovery.
+    // If we didn't substitute (cases 2 and 4), bedrock_model is the CRI form — discovery-on-miss
+    // may still need to run.
+    let substituted = resolved != bedrock_model;
+    bedrock_model = resolved;
+
+    if !substituted {
         // Discovery-on-miss: if the model wasn't resolved (no dot = no prefix match),
         // try discovering it via ListInferenceProfiles.
         let control_client = selected_endpoint
@@ -4497,5 +4515,314 @@ mod tests_t5_suffix_variants {
             "last_id must be null for empty response; got: {:?}",
             json["last_id"]
         );
+    }
+}
+
+/// Resolve the final Bedrock model ID / ARN to use for dispatching a request.
+///
+/// Implements the four-case precedence chain from §Slice 2:
+/// 1. New AIP override table has a row for this model → use that ARN (per-model routing).
+/// 2. New table has rows for other models but not this one → fall through to CRI unchanged
+///    (no silent substitution — let discovery-on-miss handle unknown models).
+/// 3. New table empty + legacy column set → force-substitute the legacy ARN (compat net).
+/// 4. New table empty + legacy column null → pure CRI, return unchanged.
+pub fn resolve_dispatch_target(
+    cri_bedrock_model: &str,
+    _original_model: &str,
+    aip_override: Option<&str>,
+    has_any_aip_overrides: bool,
+    legacy_inference_profile_arn: Option<&str>,
+) -> String {
+    if let Some(arn) = aip_override {
+        // Case 1: new table has a row for this model.
+        return arn.to_string();
+    }
+    if has_any_aip_overrides {
+        // Case 2: new table has rows but not for this model — use CRI unchanged.
+        return cri_bedrock_model.to_string();
+    }
+    if let Some(legacy_arn) = legacy_inference_profile_arn {
+        // Case 3: new table empty, legacy column set — safety-net compat.
+        return legacy_arn.to_string();
+    }
+    // Case 4: pure CRI, no overrides at all.
+    cri_bedrock_model.to_string()
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Task 4 (Slice 2B) — Contract tests for the request-path dispatch-precedence chain
+//
+// These tests call `resolve_dispatch_target`, a pure helper that DOES NOT EXIST
+// yet. They are intentionally written to fail to compile until the builder adds
+// the function.  DO NOT add the function here — that is the builder's job.
+//
+// Spec reference: §Slice 2 "Request path changes", lines 154-193
+// Tasks file:     Task 4, lines 98-122
+//
+// Precedence table being tested:
+//   1. New table has a row for the requested model → dispatch AIP ARN (per-model).
+//   2. New table has rows for other models, but not this one → fall through to CRI
+//      (no silent substitution).
+//   3. New table empty + legacy column set → force-substitute legacy ARN (compat).
+//   4. New table empty + legacy column null → pure CRI, unchanged.
+//
+// The four arguments map exactly onto the information the caller gathers from
+// `EndpointClient` before calling the helper:
+//   - `cri_bedrock_model`              — what request::translate produced
+//   - `original_model`                 — the user-supplied model name (e.g. "claude-sonnet-4-5")
+//   - `aip_override`                   — ep.aip_override_for(original_model)
+//   - `has_any_aip_overrides`          — ep.has_any_aip_overrides()
+//   - `legacy_inference_profile_arn`   — ep.config.inference_profile_arn.as_deref()
+// ─────────────────────────────────────────────────────────────────────────────
+#[rustfmt::skip]
+#[cfg(test)]
+mod tests_dispatch_precedence {
+    // Import the function that the builder must provide.
+    // This import is what causes the intentional compile failure.
+    use super::resolve_dispatch_target;
+
+    // ── Helpers ───────────────────────────────────────────────────────────────
+
+    /// Sonnet CRI model ID as produced by request::translate with prefix "us".
+    const SONNET_CRI: &str = "us.anthropic.claude-sonnet-4-5-20250929-v1:0";
+    /// Opus CRI model ID.
+    const OPUS_CRI: &str = "us.anthropic.claude-opus-4-7-20251101-v1:0";
+    /// Haiku CRI model ID.
+    const HAIKU_CRI: &str = "us.anthropic.claude-haiku-4-5-20251001-v1:0";
+
+    /// AIP ARN for a tagged Sonnet application inference profile.
+    const SONNET_AIP_ARN: &str =
+        "arn:aws:bedrock:us-east-1:123456789012:application-inference-profile/sonnet-tagged";
+    /// AIP ARN for a tagged Opus application inference profile.
+    const OPUS_AIP_ARN: &str =
+        "arn:aws:bedrock:us-east-1:123456789012:application-inference-profile/opus-tagged";
+    /// Legacy ARN — was set in the `inference_profile_arn` column before migration.
+    const LEGACY_ARN: &str =
+        "arn:aws:bedrock:us-east-1:123456789012:application-inference-profile/sonnet-legacy";
+
+    // ── Test 1: new table has the requested model → dispatch AIP ARN ──────────
+    //
+    // Endpoint has one override row: claude-sonnet-4-5 → SONNET_AIP_ARN.
+    // Request is for claude-sonnet-4-5.
+    // Expected: dispatch target == SONNET_AIP_ARN.
+    #[test]
+    fn test_dispatch_aip_override_for_model_uses_override_arn() {
+        let result = resolve_dispatch_target(
+            SONNET_CRI,                // cri_bedrock_model
+            "claude-sonnet-4-5",       // original_model
+            Some(SONNET_AIP_ARN),      // aip_override  — ep.aip_override_for("claude-sonnet-4-5")
+            true,                      // has_any_aip_overrides
+            None,                      // legacy_inference_profile_arn
+        );
+
+        assert_eq!(
+            result, SONNET_AIP_ARN,
+            "When new table has a row for the requested model, dispatch target must \
+             be the AIP ARN from the override row, not the CRI form"
+        );
+    }
+
+    // ── Test 2: new table has Sonnet+Opus; request for Opus → Opus ARN ────────
+    //
+    // Endpoint has two override rows. Request is for claude-opus-4-7.
+    // aip_override_for("claude-opus-4-7") returns OPUS_AIP_ARN.
+    // Expected: dispatch target == OPUS_AIP_ARN (not SONNET_AIP_ARN, not CRI).
+    #[test]
+    fn test_dispatch_aip_override_for_different_model_dispatches_correct_arn() {
+        let result = resolve_dispatch_target(
+            OPUS_CRI,                  // cri_bedrock_model
+            "claude-opus-4-7",         // original_model
+            Some(OPUS_AIP_ARN),        // aip_override  — ep.aip_override_for("claude-opus-4-7")
+            true,                      // has_any_aip_overrides
+            None,                      // legacy_inference_profile_arn
+        );
+
+        assert_eq!(
+            result, OPUS_AIP_ARN,
+            "When new table has rows for multiple models, each model must dispatch its \
+             own AIP ARN; an Opus request must not use the Sonnet ARN or fall to CRI"
+        );
+    }
+
+    // ── Test 3: new table has rows but not for this model → CRI, no sub ───────
+    //
+    // Endpoint has Sonnet+Opus overrides.  Request is for claude-haiku-4-5.
+    // aip_override_for("claude-haiku-4-5") returns None; has_any_aip_overrides → true.
+    // Expected: dispatch target == HAIKU_CRI (fall through to CRI, no substitution).
+    #[test]
+    fn test_dispatch_no_override_with_other_overrides_falls_through_to_cri() {
+        let result = resolve_dispatch_target(
+            HAIKU_CRI,                 // cri_bedrock_model
+            "claude-haiku-4-5",        // original_model
+            None,                      // aip_override  — no row for haiku
+            true,                      // has_any_aip_overrides  — other models ARE configured
+            None,                      // legacy_inference_profile_arn
+        );
+
+        assert_eq!(
+            result, HAIKU_CRI,
+            "When new table has rows for other models but not for the requested model, \
+             the dispatch target must be the CRI form unchanged — no silent substitution"
+        );
+    }
+
+    // ── Test 4: new table empty + legacy column set → force-substitute ────────
+    //
+    // Endpoint has NO new-table rows (auto-migration hasn't run or failed).
+    // Legacy column = LEGACY_ARN.  Request is for claude-sonnet-4-5.
+    // Expected: dispatch target == LEGACY_ARN (safety net — today's behaviour).
+    #[test]
+    fn test_dispatch_legacy_arn_compat_when_new_table_empty() {
+        let result = resolve_dispatch_target(
+            SONNET_CRI,                // cri_bedrock_model
+            "claude-sonnet-4-5",       // original_model
+            None,                      // aip_override  — no new-table row
+            false,                     // has_any_aip_overrides — new table is empty
+            Some(LEGACY_ARN),          // legacy_inference_profile_arn
+        );
+
+        assert_eq!(
+            result, LEGACY_ARN,
+            "When new table is empty and legacy column is set, dispatch target must be \
+             the legacy ARN (safety-net compat path)"
+        );
+    }
+
+    // ── Test 5: legacy force-substitution applies regardless of model ─────────
+    //
+    // Same endpoint as Test 4 (new table empty, legacy column = LEGACY_ARN).
+    // Request is for claude-opus-4-7 — a DIFFERENT model than the ARN represents.
+    // Expected: dispatch target STILL == LEGACY_ARN.
+    //
+    // This documents today's semantics: when only the legacy column is set, ALL
+    // traffic on the endpoint is force-substituted through that single ARN,
+    // regardless of the requested model.  This behaviour is intentionally preserved
+    // until the auto-migration runs and populates the new table.
+    #[test]
+    fn test_dispatch_legacy_arn_compat_dispatches_for_any_model() {
+        let result = resolve_dispatch_target(
+            OPUS_CRI,                  // cri_bedrock_model
+            "claude-opus-4-7",         // original_model — NOT what the legacy ARN targets
+            None,                      // aip_override  — no new-table row
+            false,                     // has_any_aip_overrides — new table is empty
+            Some(LEGACY_ARN),          // legacy_inference_profile_arn  (a Sonnet AIP)
+        );
+
+        assert_eq!(
+            result, LEGACY_ARN,
+            "Legacy force-substitution must apply to ALL models when the new table is \
+             empty — the legacy ARN is used even for Opus, because migration has not run"
+        );
+    }
+
+    // ── Test 6: new table empty + legacy column null → pure CRI ───────────────
+    //
+    // Endpoint has no new-table rows AND no legacy column.
+    // Request for claude-sonnet-4-5; CRI form = SONNET_CRI.
+    // Expected: dispatch target == SONNET_CRI (pure CRI path, no override).
+    #[test]
+    fn test_dispatch_pure_cri_no_overrides_no_legacy() {
+        let result = resolve_dispatch_target(
+            SONNET_CRI,                // cri_bedrock_model
+            "claude-sonnet-4-5",       // original_model
+            None,                      // aip_override  — no new-table row
+            false,                     // has_any_aip_overrides — new table is empty
+            None,                      // legacy_inference_profile_arn — column is NULL
+        );
+
+        assert_eq!(
+            result, SONNET_CRI,
+            "When both new table and legacy column are absent, dispatch target must \
+             be the CRI form unchanged — pure CRI path"
+        );
+    }
+
+    // ── Test 7: new table row beats legacy column (precedence) ────────────────
+    //
+    // Endpoint has BOTH a new-table row for Sonnet AND the legacy column set.
+    // Request for claude-sonnet-4-5.
+    // Expected: dispatch target == SONNET_AIP_ARN (new table wins; legacy ignored).
+    #[test]
+    fn test_dispatch_aip_override_takes_precedence_over_legacy_column() {
+        let result = resolve_dispatch_target(
+            SONNET_CRI,                // cri_bedrock_model
+            "claude-sonnet-4-5",       // original_model
+            Some(SONNET_AIP_ARN),      // aip_override  — new-table row present
+            true,                      // has_any_aip_overrides
+            Some(LEGACY_ARN),          // legacy_inference_profile_arn — also set
+        );
+
+        assert_eq!(
+            result, SONNET_AIP_ARN,
+            "New-table AIP override must take precedence over the legacy column when \
+             both are present for the same model"
+        );
+    }
+
+    // ── Snapshot: lock all four precedence cases at once ─────────────────────
+    //
+    // Encodes the full matrix as a single assertion-set so any future refactor
+    // that alters precedence semantics will fail this test loudly.
+    #[test]
+    fn test_dispatch_precedence_snapshot() {
+        struct Case {
+            label: &'static str,
+            cri: &'static str,
+            model: &'static str,
+            aip_override: Option<&'static str>,
+            has_any: bool,
+            legacy: Option<&'static str>,
+            expected: &'static str,
+        }
+
+        let cases = [
+            Case {
+                label: "1. new-table match → AIP ARN",
+                cri: SONNET_CRI,
+                model: "claude-sonnet-4-5",
+                aip_override: Some(SONNET_AIP_ARN),
+                has_any: true,
+                legacy: None,
+                expected: SONNET_AIP_ARN,
+            },
+            Case {
+                label: "2. new-table rows exist, no row for model → CRI (no substitution)",
+                cri: HAIKU_CRI,
+                model: "claude-haiku-4-5",
+                aip_override: None,
+                has_any: true,
+                legacy: None,
+                expected: HAIKU_CRI,
+            },
+            Case {
+                label: "3. new table empty + legacy set → legacy force-substitute",
+                cri: SONNET_CRI,
+                model: "claude-sonnet-4-5",
+                aip_override: None,
+                has_any: false,
+                legacy: Some(LEGACY_ARN),
+                expected: LEGACY_ARN,
+            },
+            Case {
+                label: "4. new table empty + legacy null → pure CRI",
+                cri: SONNET_CRI,
+                model: "claude-sonnet-4-5",
+                aip_override: None,
+                has_any: false,
+                legacy: None,
+                expected: SONNET_CRI,
+            },
+        ];
+
+        for c in &cases {
+            let result = resolve_dispatch_target(
+                c.cri, c.model, c.aip_override, c.has_any, c.legacy,
+            );
+            assert_eq!(
+                result, c.expected,
+                "Precedence snapshot failed for case: {}",
+                c.label
+            );
+        }
     }
 }

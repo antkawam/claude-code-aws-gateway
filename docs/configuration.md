@@ -139,6 +139,7 @@ CCAG supports Claude Code's 1M-context model variants via the `[1m]` suffix conv
 |---|---|---|
 | `PRICING_REFRESH_INTERVAL` | `86400` | Seconds between automatic refreshes of model pricing from the AWS Price List API (default 86400 = 24 hours). |
 | `PRICING_REFRESH_ENABLED` | `true` | Set to `false` or `0` to disable the automatic pricing refresh background loop. Useful when AWS credentials lack Pricing API access or for air-gapped environments. |
+| `CAPABILITY_PROBE_AIP` | `true` | Set to `false` to skip seed-probe invocations against AIP-mapped profiles (saves AIP throttle quota); CRI-backed profiles are still probed. Can also be toggled at runtime via the `capability_probe_aip` key in `proxy_settings`. |
 
 ### Infrastructure Alarms
 

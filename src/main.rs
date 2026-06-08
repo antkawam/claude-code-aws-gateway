@@ -449,6 +449,8 @@ async fn main() -> anyhow::Result<()> {
     // Start Bedrock health poll loop (60s interval) — checks gateway default + all endpoints
     {
         let state_for_health = Arc::clone(&state);
+        // Capture CAPABILITY_PROBE_AIP env var once; read fresh DB setting each tick.
+        let capability_probe_aip_env: Option<String> = std::env::var("CAPABILITY_PROBE_AIP").ok();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
             let mut was_healthy = true;
@@ -501,110 +503,173 @@ async fn main() -> anyhow::Result<()> {
                 // Check all endpoint clients
                 let clients = state_for_health.endpoint_pool.get_all_clients().await;
                 for client in &clients {
-                    let ep_ok = if let Some(arn) = &client.config.inference_profile_arn {
-                        // For application inference profile endpoints, validate the specific ARN
-                        client
-                            .control_client
-                            .get_inference_profile()
-                            .inference_profile_identifier(arn)
-                            .send()
-                            .await
-                            .is_ok()
-                    } else {
-                        // For standard CRI endpoints, fetch the full profile list and cache it.
+                    // ── Step 1: CRI list (always fetched) ─────────────────────
+                    let prefix_dot = format!("{}.", client.config.routing_prefix);
+                    let cri_list_result: Result<Vec<String>, String> =
                         match client.control_client.list_inference_profiles().send().await {
-                            Ok(resp) => {
-                                let prefix_dot = format!("{}.", client.config.routing_prefix);
-                                let profile_ids: Vec<String> = resp
-                                    .inference_profile_summaries()
-                                    .iter()
-                                    .map(|p| p.inference_profile_id().to_string())
-                                    .filter(|id| id.starts_with(&prefix_dot))
-                                    .collect();
-                                // Snapshot profiles for seed probing before releasing the lock.
-                                let profiles_snapshot = profile_ids.clone();
-                                let mut models = client.available_models.write().await;
-                                *models = profile_ids;
-                                drop(models);
+                            Ok(resp) => Ok(resp
+                                .inference_profile_summaries()
+                                .iter()
+                                .map(|p| p.inference_profile_id().to_string())
+                                .filter(|id| id.starts_with(&prefix_dot))
+                                .collect()),
+                            Err(e) => Err(format!(
+                                "ListInferenceProfiles failed for {}: {e:?}",
+                                client.config.name
+                            )),
+                        };
 
-                                // ── 1M context seed probe step ──────────────────────────
-                                // For each (profile, beta) pair that is absent or expired,
-                                // fire a synthetic 1-token InvokeModel to learn whether
-                                // the beta is supported on this endpoint.
-                                // Probes are sequenced sequentially (no join_all) — the
-                                // total load is bounded by |profiles| × |SUFFIX_BETA_MAP|.
-                                let pairs = client.expired_seed_pairs(&profiles_snapshot).await;
-                                for (profile, beta) in &pairs {
-                                    // Build Bedrock request body directly — NOT via translate().
-                                    let probe_body = format!(
-                                        r#"{{"anthropic_version":"bedrock-2023-05-31","anthropic_beta":["{beta}"],"max_tokens":1,"messages":[{{"role":"user","content":"hi"}}]}}"#
-                                    );
-                                    let probe_result = client
-                                        .runtime_client
-                                        .invoke_model()
-                                        .model_id(profile)
-                                        .content_type("application/json")
-                                        .accept("application/json")
-                                        .body(aws_sdk_bedrockruntime::primitives::Blob::new(
-                                            probe_body.into_bytes(),
-                                        ))
-                                        .send()
-                                        .await;
-
-                                    let (success, is_validation_exception, error_message) =
-                                        match probe_result {
-                                            Ok(_) => (true, false, String::new()),
-                                            Err(ref sdk_err) => {
-                                                use aws_sdk_bedrockruntime::error::SdkError;
-                                                let err_str = format!("{sdk_err:?}");
-                                                let is_ve = matches!(
-                                                    sdk_err,
-                                                    SdkError::ServiceError(svc)
-                                                    if svc.err().is_validation_exception()
-                                                );
-                                                (false, is_ve, err_str)
-                                            }
-                                        };
-
-                                    let outcome = ccag::endpoint::classify_probe_outcome(
-                                        success,
-                                        is_validation_exception,
-                                        &error_message,
-                                        beta,
-                                    );
-
-                                    if !success
-                                        && matches!(
-                                            outcome,
-                                            ccag::endpoint::ProbeOutcome::Inconclusive
-                                        )
-                                    {
-                                        tracing::warn!(
-                                            profile = %profile,
-                                            beta = %beta,
-                                            err = %error_message,
-                                            "1m_probe failed to invoke (inconclusive)"
-                                        );
-                                    }
-
-                                    tracing::info!(
-                                        profile = %profile,
-                                        beta = %beta,
-                                        outcome = ?outcome,
-                                        "1m_probe outcome"
-                                    );
-
-                                    ccag::endpoint::apply_probe_outcome(
-                                        client, profile, beta, outcome,
-                                    )
-                                    .await;
-                                }
-
-                                true
-                            }
-                            Err(_) => false,
+                    // ── Step 2: get_foundation_model closure ───────────────────
+                    // Calls GetInferenceProfile and returns the raw foundation-model ARN.
+                    let control_client = client.control_client.clone();
+                    let get_foundation_model = |arn: String| {
+                        let control = control_client.clone();
+                        async move {
+                            let resp = control
+                                .get_inference_profile()
+                                .inference_profile_identifier(&arn)
+                                .send()
+                                .await
+                                .map_err(|e| {
+                                    format!("GetInferenceProfile failed for {arn}: {e:?}")
+                                })?;
+                            resp.models()
+                                .iter()
+                                .next()
+                                .and_then(|m| m.model_arn())
+                                .map(|s| s.to_string())
+                                .ok_or_else(|| {
+                                    format!("GetInferenceProfile returned no model ARN for {arn}")
+                                })
                         }
                     };
+
+                    // ── Step 3: compute unified health state ───────────────────
+                    let ccag::endpoint::HealthState {
+                        healthy: ep_ok,
+                        available_models: new_available_models,
+                        aip_derived_profile_ids: new_aip_derived,
+                    } = ccag::endpoint::compute_health_state(
+                        cri_list_result,
+                        &client.aip_overrides,
+                        get_foundation_model,
+                        &client.config.routing_prefix,
+                        client.config.inference_profile_arn.as_deref(),
+                    )
+                    .await;
+
+                    // ── Step 4: update available_models on success ─────────────
+                    // Only overwrite when healthy — keep last good list on failure.
+                    let profiles_snapshot: Vec<String>;
+                    let aip_derived_profile_ids: Vec<String>;
+                    if ep_ok && !new_available_models.is_empty() {
+                        profiles_snapshot = new_available_models.clone();
+                        aip_derived_profile_ids = new_aip_derived.clone();
+                        let mut models = client.available_models.write().await;
+                        *models = new_available_models;
+                        drop(models);
+                        let mut aip_derived = client.aip_derived_profile_ids.write().await;
+                        *aip_derived = new_aip_derived;
+                        drop(aip_derived);
+                    } else {
+                        // Read current list for seed-probe step (no change on failure).
+                        profiles_snapshot = client.available_models.read().await.clone();
+                        aip_derived_profile_ids =
+                            client.aip_derived_profile_ids.read().await.clone();
+                    }
+
+                    // ── Step 5: seed-probe loop ────────────────────────────────
+                    // Only run probes when the endpoint is currently healthy.
+                    if ep_ok {
+                        // Resolve the effective CAPABILITY_PROBE_AIP flag for this tick.
+                        // DB setting wins over env var; missing/malformed falls through to true.
+                        let probe_pool = state_for_health.db_pool.read().await.clone();
+                        let db_probe_setting =
+                            ccag::db::settings::get_setting(&probe_pool, "capability_probe_aip")
+                                .await
+                                .ok()
+                                .flatten();
+                        let effective_probe_aip = ccag::endpoint::effective_capability_probe_aip(
+                            db_probe_setting.as_deref(),
+                            capability_probe_aip_env.as_deref(),
+                        );
+
+                        // For each (profile, beta) pair that is absent or expired,
+                        // fire a synthetic 1-token InvokeModel to learn whether
+                        // the beta is supported on this endpoint.
+                        // Probes are sequenced sequentially (no join_all) — the
+                        // total load is bounded by |profiles| × |SUFFIX_BETA_MAP|.
+                        let pairs = client.expired_seed_pairs(&profiles_snapshot).await;
+                        for (profile, beta) in &pairs {
+                            // Skip AIP-derived profiles when the capability-probe
+                            // AIP flag is disabled.
+                            if !ccag::endpoint::should_probe_profile(
+                                profile,
+                                &aip_derived_profile_ids,
+                                effective_probe_aip,
+                            ) {
+                                continue;
+                            }
+                            // Build Bedrock request body directly — NOT via translate().
+                            let probe_body = format!(
+                                r#"{{"anthropic_version":"bedrock-2023-05-31","anthropic_beta":["{beta}"],"max_tokens":1,"messages":[{{"role":"user","content":"hi"}}]}}"#
+                            );
+                            let probe_result = client
+                                .runtime_client
+                                .invoke_model()
+                                .model_id(profile)
+                                .content_type("application/json")
+                                .accept("application/json")
+                                .body(aws_sdk_bedrockruntime::primitives::Blob::new(
+                                    probe_body.into_bytes(),
+                                ))
+                                .send()
+                                .await;
+
+                            let (success, is_validation_exception, error_message) =
+                                match probe_result {
+                                    Ok(_) => (true, false, String::new()),
+                                    Err(ref sdk_err) => {
+                                        use aws_sdk_bedrockruntime::error::SdkError;
+                                        let err_str = format!("{sdk_err:?}");
+                                        let is_ve = matches!(
+                                            sdk_err,
+                                            SdkError::ServiceError(svc)
+                                            if svc.err().is_validation_exception()
+                                        );
+                                        (false, is_ve, err_str)
+                                    }
+                                };
+
+                            let outcome = ccag::endpoint::classify_probe_outcome(
+                                success,
+                                is_validation_exception,
+                                &error_message,
+                                beta,
+                            );
+
+                            if !success
+                                && matches!(outcome, ccag::endpoint::ProbeOutcome::Inconclusive)
+                            {
+                                tracing::warn!(
+                                    profile = %profile,
+                                    beta = %beta,
+                                    err = %error_message,
+                                    "1m_probe failed to invoke (inconclusive)"
+                                );
+                            }
+
+                            tracing::info!(
+                                profile = %profile,
+                                beta = %beta,
+                                outcome = ?outcome,
+                                "1m_probe outcome"
+                            );
+
+                            ccag::endpoint::apply_probe_outcome(client, profile, beta, outcome)
+                                .await;
+                        }
+                    }
 
                     let now_secs = std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
