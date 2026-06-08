@@ -1,0 +1,17 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO model_mappings (anthropic_prefix, bedrock_suffix, anthropic_display, source, created_via)\n           VALUES ($1, $2, $3, 'discovered', $4)\n           ON CONFLICT (anthropic_prefix) DO UPDATE\n           SET bedrock_suffix = EXCLUDED.bedrock_suffix,\n               anthropic_display = EXCLUDED.anthropic_display,\n               source = 'discovered',\n               created_via = EXCLUDED.created_via",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text",
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "1e3008c7da2f612369dce943e143554b0abaa2ef10584590768a1f1482886b11"
+}

@@ -143,18 +143,27 @@ fn is_minor_version_bearing(s: &str) -> bool {
     )
 }
 
-/// Select the best matching inference profile ID using three ordered passes:
+/// Select the best matching inference profile ID using two deterministic passes:
 /// 1. Exact stem: profile_id ends with `.anthropic.{stripped}`.
 /// 2. Versioned stem: profile_id matches `\.anthropic\.{stripped}-v\d+(:\d+)?$`.
-/// 3. Fuzzy contains: first profile_id containing `stripped` (legacy behaviour).
 ///
-/// First match within the earliest non-empty pass wins.
+/// First match within the earliest non-empty pass wins. Returns just the id.
+/// Used in tests; production code uses `select_profile_id_with_via`.
+#[allow(dead_code)]
 fn select_profile_id<'a>(profile_ids: &'a [String], stripped: &str) -> Option<&'a str> {
+    select_profile_id_with_via(profile_ids, stripped).map(|(id, _)| id)
+}
+
+/// Like `select_profile_id` but also returns which pass matched (`"pass1"` or `"pass2"`).
+fn select_profile_id_with_via<'a>(
+    profile_ids: &'a [String],
+    stripped: &str,
+) -> Option<(&'a str, &'static str)> {
     // Pass 1: exact stem
     let exact = format!(".anthropic.{stripped}");
     for id in profile_ids {
         if id.ends_with(&exact) {
-            return Some(id.as_str());
+            return Some((id.as_str(), "pass1"));
         }
     }
     // Pass 2: versioned stem  (.anthropic.{stripped}-v<digits>(:<digits>)? at end)
@@ -164,14 +173,8 @@ fn select_profile_id<'a>(profile_ids: &'a [String], stripped: &str) -> Option<&'
     if let Ok(re) = regex::Regex::new(&pattern) {
         for id in profile_ids {
             if re.is_match(id) {
-                return Some(id.as_str());
+                return Some((id.as_str(), "pass2"));
             }
-        }
-    }
-    // Pass 3: fuzzy contains (legacy)
-    for id in profile_ids {
-        if id.contains(stripped) {
-            return Some(id.as_str());
         }
     }
     None
@@ -207,13 +210,14 @@ fn build_mapping_row(
     )
 }
 
-/// Discover a model by calling Bedrock ListInferenceProfiles and fuzzy-matching.
-/// Returns (anthropic_prefix, bedrock_suffix, anthropic_display, profile_prefix) if found.
+/// Discover a model by calling Bedrock ListInferenceProfiles and matching.
+/// Returns (anthropic_prefix, bedrock_suffix, anthropic_display, profile_prefix, via) if found.
+/// `via` is `"pass1"` or `"pass2"` indicating which selection pass matched.
 pub async fn discover_model(
     bedrock_client: &aws_sdk_bedrock::Client,
     anthropic_model: &str,
     _prefix: &str,
-) -> Option<(String, String, Option<String>, String)> {
+) -> Option<(String, String, Option<String>, String, &'static str)> {
     let stripped = strip_date_suffix(anthropic_model);
     tracing::info!(
         model = %anthropic_model,
@@ -254,9 +258,9 @@ pub async fn discover_model(
         .map(|p| p.inference_profile_id().to_string())
         .collect();
 
-    // Three-pass selection: exact stem -> versioned stem -> fuzzy contains
-    let chosen = match select_profile_id(&profile_ids, stripped) {
-        Some(id) => id,
+    // Two-pass selection: exact stem -> versioned stem
+    let (chosen, via) = match select_profile_id_with_via(&profile_ids, stripped) {
+        Some(t) => t,
         None => {
             tracing::warn!(
                 model = %anthropic_model,
@@ -275,6 +279,7 @@ pub async fn discover_model(
         anthropic_prefix = %anthropic_prefix,
         bedrock_suffix = %bedrock_suffix,
         profile_id = %chosen,
+        via = %via,
         "Discovered new model mapping"
     );
 
@@ -283,6 +288,7 @@ pub async fn discover_model(
         bedrock_suffix,
         anthropic_display,
         profile_prefix,
+        via,
     ))
 }
 
@@ -1039,24 +1045,26 @@ mod tests {
         );
     }
 
-    /// Fuzzy contains fallback (pass 3): when exact and versioned stem both miss.
-    /// This is the existing behavior — first profile whose id contains `stripped`.
+    // Tests below are within #[cfg(test)] mod tests.
+
+    /// AC4.1: Pass-3-only inputs return None after Pass 3 is removed.
+    ///
+    /// Both profiles contain the stripped form (`claude-opus-4-8`) as a substring, so the
+    /// legacy Pass 3 (fuzzy contains) would have matched. Neither satisfies Pass 1 (exact stem:
+    /// ends with `.anthropic.claude-opus-4-8`) nor Pass 2 (versioned stem: matches
+    /// `\.anthropic\.claude-opus-4-8-v\d+...`). With Pass 3 gone, the function must return None.
     #[test]
-    fn test_select_profile_fuzzy_contains_fallback() {
+    fn test_ac4_1_pass3_only_match_returns_none() {
         let profiles = vec![
             "global.foo.claude-opus-4-8-experimental".to_string(),
             "us.anthropic.claude-opus-4-8-custom".to_string(),
         ];
-        let stripped = "claude-opus-4-8";
-
-        // Neither profile ends with `.anthropic.claude-opus-4-8` (exact stem miss)
-        // Neither matches versioned-stem regex (pass 2 miss)
-        // Both contain `claude-opus-4-8` → pass 3 takes the FIRST one
-        let chosen = select_profile_id(&profiles, stripped);
-        assert_eq!(
-            chosen,
-            Some("global.foo.claude-opus-4-8-experimental"),
-            "Pass 3 (fuzzy contains) must return the first profile whose id contains stripped"
+        // Pass 1 miss: neither ends with `.anthropic.claude-opus-4-8`
+        // Pass 2 miss: neither matches `\.anthropic\.claude-opus-4-8-v\d+(:\d+)?$`
+        // Pass 3 (removed): would have returned `global.foo.claude-opus-4-8-experimental`
+        assert!(
+            super::select_profile_id(&profiles, "claude-opus-4-8").is_none(),
+            "AC4.1: inputs matching only fuzzy-contains (Pass 3) must return None once Pass 3 is removed"
         );
     }
 

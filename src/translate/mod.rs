@@ -1,4 +1,5 @@
 pub mod betas;
+pub mod canonicalize;
 pub mod model_seed;
 pub mod models;
 pub mod request;

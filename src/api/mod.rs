@@ -1,8 +1,11 @@
+pub mod accept;
 pub mod admin;
 pub mod cli_auth;
-mod handlers;
+pub mod handlers;
 #[cfg(feature = "mock-bedrock")]
 pub mod mock_bedrock;
+
+pub use handlers::build_model_unavailable_error;
 
 use std::sync::Arc;
 
