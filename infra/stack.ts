@@ -98,9 +98,12 @@ export class GatewayStack extends cdk.Stack {
       },
     });
 
-    // Bedrock access — need both foundation-model and inference-profile ARNs
-    // Foundation models: arn:aws:bedrock:*::foundation-model/anthropic.claude*
-    // Inference profiles: arn:aws:bedrock:*:ACCOUNT:inference-profile/*anthropic.claude*
+    // Bedrock access — need foundation-model, system inference-profile, and
+    // application-inference-profile ARNs. Application inference profiles (AIPs)
+    // are user-created profiles that wrap a system profile or foundation model
+    // and can be tagged for cost tracking. Per-model AIP overrides (v1.9.0)
+    // require InvokeModel against AIPs and GetInferenceProfile to resolve them
+    // at health-check time.
     taskDef.taskRole.addToPrincipalPolicy(
       new iam.PolicyStatement({
         actions: [
@@ -110,14 +113,19 @@ export class GatewayStack extends cdk.Stack {
         resources: [
           'arn:aws:bedrock:*::foundation-model/anthropic.claude*',
           `arn:aws:bedrock:*:${this.account}:inference-profile/*anthropic.claude*`,
+          `arn:aws:bedrock:*:${this.account}:application-inference-profile/*`,
         ],
       }),
     );
 
-    // ListInferenceProfiles requires wildcard resource (no resource-level permissions)
+    // ListInferenceProfiles + GetInferenceProfile require wildcard resource
+    // (Bedrock does not support resource-level permissions for these actions).
     taskDef.taskRole.addToPrincipalPolicy(
       new iam.PolicyStatement({
-        actions: ['bedrock:ListInferenceProfiles'],
+        actions: [
+          'bedrock:ListInferenceProfiles',
+          'bedrock:GetInferenceProfile',
+        ],
         resources: ['*'],
       }),
     );
