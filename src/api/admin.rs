@@ -4477,6 +4477,49 @@ pub async fn create_aip_override(
         None => return error_response(StatusCode::BAD_REQUEST, "model_id is required"),
     };
 
+    // Validate that model_id is canonical (a fixed-point of canonicalize_model_id)
+    // OR is a known alias in model_mappings (admin-pinned non-canonical key).
+    {
+        use crate::translate::canonicalize::canonicalize_model_id;
+        let canonical_opt = canonicalize_model_id(&model_id);
+
+        let is_fixed_point = canonical_opt.as_deref().is_some_and(|c| c == model_id);
+
+        if !is_fixed_point {
+            // Check if model_id is a known alias in model_mappings.
+            let is_alias: bool = sqlx::query_scalar::<_, bool>(
+                "SELECT EXISTS(SELECT 1 FROM model_mappings WHERE anthropic_prefix = $1)",
+            )
+            .bind(&model_id)
+            .fetch_one(pool)
+            .await
+            .unwrap_or(false);
+
+            if !is_alias {
+                let message = match canonical_opt.as_deref() {
+                    Some(canonical) => format!(
+                        "override key must be canonical; \
+                         current canonical form is `{canonical}`"
+                    ),
+                    None => "override key must be canonical or an existing mapping alias; \
+                             the supplied model_id could not be canonicalized"
+                        .to_string(),
+                };
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({
+                        "type": "error",
+                        "error": {
+                            "type": "invalid_request_error",
+                            "message": message
+                        }
+                    })),
+                )
+                    .into_response();
+            }
+        }
+    }
+
     // Validate AIP ARN
     let aip_arn = match body.aip_arn.as_deref() {
         Some(arn) if arn.starts_with("arn:aws:bedrock:") => arn.to_string(),
