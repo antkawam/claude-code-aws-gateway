@@ -710,12 +710,14 @@ pub async fn messages(
         .select_endpoint(&team_endpoints, user_identity_str, &routing_strategy)
         .await;
 
-    // Guard: if the pool is non-empty but select_endpoint returned None, the team's
-    // endpoints are all unhealthy or filtered — return a clear 400 instead of silently
-    // falling back to state.bedrock_client (which would use the wrong credentials/ARN).
-    // When the pool IS empty (fresh gateway, zero endpoints configured), preserve the
-    // existing bootstrap path so early adopters can still reach Bedrock directly.
-    if selected_endpoint.is_none() && !state.endpoint_pool.is_empty().await {
+    // Guard: if the request is team-scoped (team_endpoints non-empty) but select_endpoint
+    // returned None, the team's endpoints are all unhealthy — return a clear 400 instead
+    // of silently falling back to state.bedrock_client (wrong credentials/ARN).
+    // When team_endpoints is empty (no-team key, or fresh gateway with zero endpoints),
+    // preserve the existing bootstrap path so admin keys and early adopters still work.
+    // NOTE: checking team_endpoints (not pool.is_empty()) is intentional — a non-empty
+    // global pool must not block no-team requests that are legitimately on the bootstrap path.
+    if selected_endpoint.is_none() && !team_endpoints.is_empty() {
         return error_response(
             StatusCode::BAD_REQUEST,
             "invalid_request_error",
