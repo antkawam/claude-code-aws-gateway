@@ -786,8 +786,9 @@ pub async fn messages(
 
     bedrock_model = resolved;
 
-    // TODO: pass matched anthropic_prefix to RequestLogEntry so the flush worker
-    // can call touch_last_used (AC1.4 path). Deferred — see Task 4 skip notes.
+    // TODO(post-1.10.0): wire matched anthropic_prefix into RequestLogEntry so the flush worker
+    // can call touch_last_used. Deferred from Task 4 of unified-model-canonicalization spec
+    // — see `.claude/backlog/touch-last-used-spend-flush-integration.md`.
 
     if web_search_ctx.is_some() {
         tracing::info!(request_id = %request_id, "Web search tool detected, interception enabled");

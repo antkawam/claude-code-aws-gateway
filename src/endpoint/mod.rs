@@ -4233,33 +4233,16 @@ mod tests_aip_override_helpers {
 
 // ── AC5.7 — Startup normalization pass (tracing output capture) ───────────────
 //
-// This module tests the startup-time AIP override normalization scan via the
-// seam `EndpointPool::scan_non_canonical_aip_overrides(pool: &PgPool)` that
-// the Builder must expose.
+// These tests cover `EndpointPool::scan_non_canonical_aip_overrides`, a
+// startup diagnostic that scans all rows in `endpoint_aip_overrides` and logs
+// any whose `model_id` is not a canonical fixed-point (i.e.
+// `canonicalize_model_id(model_id) != Some(model_id)`).  Rows with a
+// canonical sibling on the same endpoint are logged at WARN; others at INFO.
+// The scan never modifies or deletes rows.
 //
-// # BUILDER CONTRACT (src/endpoint/mod.rs)
-//
-// The Builder must add a method:
-//
-//   impl EndpointPool {
-//       /// Scan all rows in `endpoint_aip_overrides`. For each row whose
-//       /// `model_id` is not a canonical fixed-point (i.e.
-//       /// `canonicalize_model_id(model_id) != Some(model_id.to_string())`):
-//       ///
-//       /// * If a row with the canonical `model_id` already exists for the same
-//       ///   `endpoint_id`, emit `tracing::warn!` with both rows' details.
-//       /// * Otherwise emit `tracing::info!` flagging the non-canonical key.
-//       ///
-//       /// Rows are NEVER modified or deleted by this scan.
-//       pub async fn scan_non_canonical_aip_overrides(pool: &sqlx::PgPool);
-//   }
-//
-// If the Builder chooses to integrate the scan into `load_endpoints_inner`
-// instead of a standalone method, this test module should be updated to call
-// the integration path (e.g. by inserting a row and calling
-// `load_endpoints_with_db`). The integration version of the test exists in
-// `tests/integration/canonicalize_admin_tests.rs` as AC5.7-integration and
-// is the fallback if this unit-level seam is not exposed.
+// The unit-level test module below is intentionally empty because the behavior
+// is covered end-to-end by `tests/integration/canonicalize_admin_tests.rs`
+// (AC5.7-integration), which runs against a real DB.
 #[cfg(test)]
 mod tests_aip_normalization_startup {
     // Intentionally empty until the Builder exposes

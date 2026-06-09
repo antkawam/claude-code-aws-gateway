@@ -1333,25 +1333,15 @@ mod tests_t4_suffix_strip {
 
 // ── Task 2: ARN-tail parser tests ────────────────────────────────────────────
 //
-// These tests cover the pure `parse_foundation_model_from_arn` helper that the
-// self-healing migration runner uses to extract a Bedrock foundation-model id
-// from an inference-profile ARN.
+// These tests cover `parse_foundation_model_from_arn`, a pure helper that
+// extracts the Bedrock foundation-model id from an inference-profile ARN.
+// The function finds the `foundation-model/` segment and returns the
+// everything after the `/` (e.g. `"anthropic.claude-sonnet-4-5-20250929-v1:0"`),
+// or `Err(String)` when the segment is absent or the tail is empty.
 //
-// BUILDER CONTRACT:
-//   Add `pub fn parse_foundation_model_from_arn(arn: &str) -> Result<&str, String>`
-//   to THIS file (src/translate/models.rs), adjacent to `bedrock_to_anthropic`.
-//
-//   The function must:
-//   1. Accept a full ARN string.
-//   2. Find the `foundation-model/` segment and return everything after the `/`.
-//   3. Return `Err(String)` when the segment is absent or the tail is empty.
-//
-//   The returned `&str` slice is the *Bedrock* model id as found in the ARN tail
-//   (e.g. `"anthropic.claude-sonnet-4-5-20250929-v1:0"`).  The caller then passes
-//   this value to `bedrock_to_anthropic(tail, None)` to get the logical Anthropic
-//   model name.
-//
-// The tests MUST FAIL (unresolved name) until the builder adds the function.
+// The self-healing migration runner uses this to derive `anthropic_prefix`
+// from a legacy `inference_profile_arn` column value, then calls
+// `bedrock_to_anthropic(tail, None)` to get the logical Anthropic model name.
 
 #[cfg(test)]
 mod tests_task2_arn_parser {
@@ -1489,50 +1479,20 @@ mod tests_task2_arn_parser {
 
 // ── Task 2: Self-healing migration runner unit tests ─────────────────────────
 //
-// Tests for the `migrate_legacy_aip_endpoints` startup function.
+// Tests for `migrate_legacy_aip_endpoints` (implemented in
+// `src/migrations/aip_legacy.rs`).  This startup function scans endpoints
+// that carry a legacy `inference_profile_arn` value but have no AIP override
+// rows and auto-inserts overrides by calling `GetInferenceProfile` +
+// `parse_foundation_model_from_arn` + `bedrock_to_anthropic`.
 //
-// BUILDER CONTRACT:
-//   Extract (or add) this function — tentatively in a new file
-//   `src/migrations/aip_legacy.rs` — with a signature like:
+// The function accepts a `get_foundation_model` closure as a testable seam so
+// the pure-logic cases (skip-if-non-empty, idempotency, error-tolerance) can
+// be exercised without a real AWS call.  The tests below use this seam.
 //
-//   ```rust
-//   pub async fn migrate_legacy_aip_endpoints<F, Fut>(
-//       endpoints: &[EndpointMigrationCandidate],
-//       pool: &sqlx::PgPool,
-//       get_foundation_model: F,
-//   ) -> anyhow::Result<()>
-//   where
-//       F: Fn(&str) -> Fut + Send + Sync,
-//       Fut: std::future::Future<Output = Result<String, String>> + Send,
-//   {
-//   ```
-//
-//   `EndpointMigrationCandidate` holds `(endpoint_id: Uuid, legacy_arn: String)`.
-//   `get_foundation_model` is the testable seam: in production it calls
-//   `GetInferenceProfile` then `parse_foundation_model_from_arn` +
-//   `bedrock_to_anthropic`; in tests it's a closure.
-//
-//   Behaviour:
-//   - Skip endpoints whose `list_by_endpoint` returns non-empty.
-//   - For each remaining endpoint, call `get_foundation_model(legacy_arn)`.
-//     - On `Ok(model_id)` → insert `(endpoint_id, model_id, legacy_arn,
-//       set_by="auto-migration", reason="migrated from inference_profile_arn column")`.
-//     - On `Err(_)` → `tracing::warn!` the endpoint id, continue loop (no panic/abort).
-//   - Returns Ok(()) regardless of per-endpoint errors.
-//
-//   Wire into `src/main.rs` after `load_endpoints_with_db` and before the health
-//   loop starts.
-//
-// The tests below are integration-style against a real Postgres pool (they are
-// placed here in the lib module so they can be run with `cargo test --lib`
-// alongside unit tests, but they require `make test-integration` to have a DB).
-// The pure-logic cases (skip-if-non-empty, idempotency, error-tolerance) are
-// exercised via the injected closure so no real AWS call is needed.
-//
-// Import: the tests import `migrate_legacy_aip_endpoints` from wherever the
-// builder places it. If it lands in `src/migrations/aip_legacy.rs`, adjust the
-// `use` path below accordingly. The test module is kept here so it's compiled
-// even without the `integration` feature flag — it just requires the DB.
+// These tests are unit-style (no DB required) for the decision-logic paths,
+// and integration-style (requires `make test-integration`) for the DB paths.
+// The module is kept here so it is compiled even without the `integration`
+// feature flag.
 
 #[cfg(test)]
 mod tests_task2_migration_runner {

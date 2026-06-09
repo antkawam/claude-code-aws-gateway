@@ -4493,7 +4493,14 @@ pub async fn create_aip_override(
             .bind(&model_id)
             .fetch_one(pool)
             .await
-            .unwrap_or(false);
+            .unwrap_or_else(|e| {
+                tracing::warn!(
+                    model_id = %model_id,
+                    error = %e,
+                    "alias existence check failed; treating as non-alias"
+                );
+                false
+            });
 
             if !is_alias {
                 let message = match canonical_opt.as_deref() {
