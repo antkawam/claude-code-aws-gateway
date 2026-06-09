@@ -3970,7 +3970,7 @@ async function createMapping() {
   document.getElementById('am-prefix').value = '';
   document.getElementById('am-suffix').value = '';
   document.getElementById('am-display').value = '';
-  loadMappings();
+  await loadMappings();
 }
 
 async function deleteMapping(prefix) {
@@ -3978,7 +3978,7 @@ async function deleteMapping(prefix) {
   const res = await api('DELETE', `/admin/mappings/${encodeURIComponent(prefix)}`);
   if (res.error) { toast(res.error.message || 'Failed to delete mapping', 'error'); return; }
   toast('Mapping deleted', 'success');
-  loadMappings();
+  await loadMappings();
 }
 
 async function discoverMapping() {
@@ -4033,7 +4033,7 @@ async function insertDiscoveredMapping() {
   document.getElementById('dm-preview').style.display = 'none';
   document.getElementById('dm-insert-btn').style.display = 'none';
   _discoveredMapping = null;
-  loadMappings();
+  await loadMappings();
 }
 
 // ---- Keys ----
