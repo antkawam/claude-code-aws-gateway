@@ -2628,7 +2628,7 @@ input[type="date"].oa-filter-select { background-image: none; padding-right: 8px
         </div>
       </div>
       <div class="main-content">
-        <div id="mappings-reviewed-banner" style="display:none;margin-bottom:16px;padding:10px 14px;background:var(--green-subtle);border:1px solid var(--green);border-radius:var(--radius);display:none;align-items:center;gap:10px;font-size:13px;color:var(--green)">
+        <div id="mappings-reviewed-banner" style="display:none;margin-bottom:16px;padding:10px 14px;background:var(--green-subtle);border:1px solid var(--green);border-radius:var(--radius);align-items:center;gap:10px;font-size:13px;color:var(--green)">
           <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="flex-shrink:0"><polyline points="20 6 9 17 4 12"/></svg>
           All grandfathered rows reviewed
         </div>
@@ -2643,6 +2643,7 @@ input[type="date"].oa-filter-select { background-image: none; padding-right: 8px
               <option value="admin">admin</option>
             </select>
           </div>
+          <div style="overflow-x:auto">
           <table style="margin-top:8px">
             <thead>
               <tr>
@@ -2657,6 +2658,7 @@ input[type="date"].oa-filter-select { background-image: none; padding-right: 8px
             </thead>
             <tbody id="mappings-table"></tbody>
           </table>
+          </div>
           <div id="mappings-empty" class="empty-state" style="display:none">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg>
             <h4>No model mappings</h4>
@@ -2673,17 +2675,17 @@ input[type="date"].oa-filter-select { background-image: none; padding-right: 8px
     <div class="modal-header"><h3>Add Model Mapping</h3><button class="btn btn-ghost btn-sm" onclick="closeModal()">&times;</button></div>
     <div class="modal-body">
       <div class="form-group">
-        <label class="form-label">Anthropic Prefix <span style="color:var(--red)">*</span></label>
+        <label class="form-label" for="am-prefix">Anthropic Prefix <span style="color:var(--red)">*</span></label>
         <input class="form-input" id="am-prefix" placeholder="e.g. claude-sonnet-4-5">
         <div class="form-hint">Canonical model prefix as sent by the client (no version date)</div>
       </div>
       <div class="form-group">
-        <label class="form-label">Bedrock Suffix <span style="color:var(--red)">*</span></label>
+        <label class="form-label" for="am-suffix">Bedrock Suffix <span style="color:var(--red)">*</span></label>
         <input class="form-input" id="am-suffix" placeholder="e.g. anthropic.claude-sonnet-4-5-20251101-v1:0">
         <div class="form-hint">Full Bedrock model ID suffix (must start with anthropic.)</div>
       </div>
       <div class="form-group">
-        <label class="form-label">Display Name</label>
+        <label class="form-label" for="am-display">Display Name</label>
         <input class="form-input" id="am-display" placeholder="e.g. Claude Sonnet 4.5">
         <div class="form-hint">Optional human-readable name for the portal</div>
       </div>
@@ -2702,7 +2704,7 @@ input[type="date"].oa-filter-select { background-image: none; padding-right: 8px
     <div class="modal-header"><h3>Discover Mapping Preview</h3><button class="btn btn-ghost btn-sm" onclick="closeModal()">&times;</button></div>
     <div class="modal-body">
       <div class="form-group">
-        <label class="form-label">Model ID</label>
+        <label class="form-label" for="dm-model">Model ID</label>
         <input class="form-input" id="dm-model" placeholder="e.g. claude-sonnet-4-5-20251101">
         <div class="form-hint">Enter a model ID to resolve against Bedrock inference profiles</div>
       </div>
