@@ -773,14 +773,7 @@ pub async fn messages(
         Ok(target) => target,
         Err(e) => {
             let endpoint_name = selected_endpoint.as_ref().map(|ep| ep.config.name.as_str());
-            let endpoint_id = selected_endpoint.as_ref().map(|ep| ep.config.id);
-            tracing::warn!(
-                model = e.model_name(),
-                endpoint_name = ?endpoint_name,
-                endpoint_id = ?endpoint_id,
-                "no AIP override matched for canonical model on endpoint"
-            );
-            return build_no_override_for_canonical_error(e.model_name());
+            return build_no_override_for_canonical_error(e.model_name(), endpoint_name);
         }
     };
 
@@ -3002,16 +2995,21 @@ pub fn build_model_unavailable_error(model: &str) -> Response {
 }
 
 /// Build a 400 response for Case 2 hard-fail: the endpoint has AIP overrides
-/// configured but none match the requested model.  The user-facing message names
-/// only the model (avoiding internal endpoint config details); the full diagnostic
-/// including endpoint name/id is logged at WARN by the caller.
-pub fn build_no_override_for_canonical_error(model: &str) -> Response {
-    let message = format!(
-        "Model '{model}' is not configured for any endpoint your team can route to; \
-         the endpoint has AIP overrides configured but none match this model. \
-         Add an override row for this model or remove the existing overrides to \
-         allow CRI fallback."
-    );
+/// configured but none match the requested model.  Both the model name and the
+/// endpoint name are included so admins can identify the misconfiguration.
+pub fn build_no_override_for_canonical_error(model: &str, endpoint_name: Option<&str>) -> Response {
+    let message = match endpoint_name {
+        Some(ep) => format!(
+            "Model '{model}' is not available on endpoint '{ep}'; \
+             the endpoint has AIP overrides configured but none match this model. \
+             Add an override row for this model or remove the existing overrides to \
+             allow CRI fallback."
+        ),
+        None => format!(
+            "Model '{model}' has no AIP override configured on the selected endpoint; \
+             the endpoint has AIP overrides but none match this model."
+        ),
+    };
     error_response(StatusCode::BAD_REQUEST, "invalid_request_error", &message)
 }
 
