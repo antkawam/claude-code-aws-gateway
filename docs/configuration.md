@@ -255,20 +255,22 @@ Budget limits can be configured per team or globally through the admin portal or
 
 Custom Anthropic-to-Bedrock model ID mappings are configurable via the admin portal's "Model Mappings" tab and the `ccag mappings` CLI. By default, CCAG auto-detects Bedrock model IDs from the AWS region; admin-added rows act as pinned aliases when an arriving model ID needs literal pass-through.
 
-**Strict matching (1.10.0+).** Inbound model IDs are accepted iff they (a) match a row in `model_mappings` exactly, (b) have a canonical form (`canonicalize_model_id` — date-strip + auto-prepend `claude-` + trim) that matches an existing row or live Bedrock inference profile, or (c) resolve via two-pass discovery (exact stem, then versioned stem). Anything else returns 400 with a message pointing at `GET /v1/models`. The discovery path's third (fuzzy `contains`) pass is gone — admins use the alias mechanism for the long tail.
+**Strict matching (1.10.0+).** Inbound model IDs are accepted iff they (a) match a row in `model_mappings` exactly, (b) have a canonical form (`canonicalize_model_id` — date-strip + auto-prepend `claude-` + trim) that matches an existing row or live Bedrock inference profile, or (c) resolve via two-pass discovery (exact stem, then versioned stem). Anything else returns 400 with a message pointing at `GET /v1/models`. The legacy fuzzy-contains discovery pass is gone — admins use the alias mechanism for the long tail.
 
-**AIP override lookups** also canonicalize: a request for `claude-sonnet-4-6-20250514` finds the override keyed `claude-sonnet-4-6` automatically. Admins adding override rows must use the canonical form (or a pinned alias) — non-canonical override keys are rejected with a 400 naming the canonical form.
+**AIP override lookups** also canonicalize: a request for `claude-sonnet-4-6-20250514` finds the override keyed `claude-sonnet-4-6` automatically. Admins adding override rows must use the canonical form (or a pinned alias) — non-canonical override keys are rejected with a 400 naming the canonical form when one can be derived, otherwise rejected with a 400 explaining the input could not be canonicalized.
 
 **`ccag mappings` CLI:**
 
 ```bash
 ccag mappings list                                      # table; --json for JSON
-ccag mappings add <prefix> <bedrock_suffix> [--display TEXT]
-ccag mappings delete <prefix> [--yes]
+ccag mappings add <anthropic_prefix> <bedrock_suffix> [--display TEXT]
+ccag mappings delete <anthropic_prefix> [--yes]
 ccag mappings discover <model>                          # preview, does NOT persist
 ```
 
-The `created_via` column distinguishes how a row got there: `pass1`/`pass2` (auto-discovered), `admin` (admin-added alias), `unknown` (pre-1.10.0 row, grandfathered — surface in the portal for audit and pruning).
+The `created_via` column distinguishes how a row got there: `pass1`/`pass2` (auto-discovered), `admin` (admin-added alias), `unknown` (seed/baseline rows or pre-1.10.0 rows that pre-dated the column — surface in the portal so admins can audit before pruning).
+
+**See also:** [### Endpoints](#endpoints) for configuring AIP overrides per endpoint; `GET /v1/models` for the live list of models available to your team (use this to verify a mapping is visible before adding a manual alias).
 
 ### Endpoints
 
