@@ -1602,31 +1602,4 @@ mod tests_task2_migration_runner {
             "parse_foundation_model_from_arn must return Err for an AIP ARN (not a foundation-model ARN); migration runner must handle this without panicking"
         );
     }
-
-    // ── set_by / reason field values ──────────────────────────────────────────
-
-    /// The migration runner must write `set_by = "auto-migration"` and
-    /// `reason = "migrated from inference_profile_arn column"` exactly.
-    /// These string constants are checked here so the builder knows the
-    /// exact values the integration test will assert on.
-    #[test]
-    fn test_migration_metadata_constants() {
-        // The migration runner MUST use these exact constant strings when
-        // calling `db::endpoint_aip_overrides::insert`.
-        // Tested indirectly in the integration test; documented here as a
-        // compile-time-visible contract.
-        const EXPECTED_SET_BY: &str = "auto-migration";
-        const EXPECTED_REASON: &str = "migrated from inference_profile_arn column";
-
-        // No logic to test — this test documents the required constant values
-        // so the builder sees them alongside the ARN-parser tests.
-        assert!(!EXPECTED_SET_BY.is_empty());
-        assert!(!EXPECTED_REASON.is_empty());
-        // Verify the strings match the spec exactly:
-        assert_eq!(EXPECTED_SET_BY, "auto-migration");
-        assert_eq!(
-            EXPECTED_REASON,
-            "migrated from inference_profile_arn column"
-        );
-    }
-}
+} // end #[cfg(test)] mod tests_task2_arn_parser

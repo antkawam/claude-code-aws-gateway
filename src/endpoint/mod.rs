@@ -2105,10 +2105,7 @@ mod tests_slice3 {
     /// `enabled = false`, `select_endpoint` with `"sticky_user"` must NOT
     /// return that disabled endpoint. It should fall through to the first
     /// healthy+enabled team endpoint instead.
-    ///
-    /// NOTE: This test is expected to FAIL. The sticky_user path at line ~167
-    /// only checks `client.healthy` but not `client.config.enabled`. The
-    /// builder must add an `enabled` check there.
+    // #[cfg(test)] — Covers: select_endpoint sticky_user + enabled guard
     #[tokio::test]
     async fn test_sticky_user_disabled_affinity_falls_through() {
         let pool = EndpointPool::new();
