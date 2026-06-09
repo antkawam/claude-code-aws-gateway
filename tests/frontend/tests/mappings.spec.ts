@@ -20,7 +20,7 @@
  *   - Green "All grandfathered rows reviewed" banner appears after all 'unknown' rows deleted.
  */
 
-import { test, expect } from '@playwright/test';
+import { test, expect, Browser } from '@playwright/test';
 import { loginViaPortal, navigateTo, getSessionToken, BASE_URL } from '../helpers/gateway';
 
 // ---------------------------------------------------------------------------
@@ -63,13 +63,43 @@ async function deleteMapping(token: string, prefix: string): Promise<void> {
 
 test.describe('Model Mappings tab', () => {
   let token: string;
+  // Shared auth state: log in once per worker to avoid hitting the gateway's
+  // login rate limiter (10 req/60 s). All tests in this file reuse the same
+  // localStorage token snapshot — each test gets a fresh browser context
+  // initialised from this state so pages are isolated from each other.
+  let sharedStorageState: { cookies: any[]; origins: any[] };
 
-  test.beforeAll(async () => {
+  test.beforeAll(async ({ browser }: { browser: Browser }) => {
+    // Obtain API token (getSessionToken is already cached at the module level,
+    // so repeat calls within this worker are free).
     token = await getSessionToken();
+
+    // Log in once and capture the resulting localStorage state.
+    const ctx = await browser.newContext();
+    const page = await ctx.newPage();
+    await loginViaPortal(page);
+    sharedStorageState = await ctx.storageState();
+    await ctx.close();
   });
 
   test.beforeEach(async ({ page }) => {
-    await loginViaPortal(page);
+    // Restore the shared auth state into the page's origin so the portal init()
+    // finds the token in localStorage without making another login request.
+    // Navigate to the portal first to establish the origin, then bulk-inject
+    // all captured localStorage entries from the shared auth state.
+    await page.goto('/portal');
+    const origins = sharedStorageState?.origins ?? [];
+    for (const origin of origins) {
+      for (const entry of origin.localStorage ?? []) {
+        await page.evaluate(
+          ({ key, value }: { key: string; value: string }) => localStorage.setItem(key, value),
+          { key: entry.name, value: entry.value },
+        );
+      }
+    }
+    // Reload so init() picks up the token from localStorage.
+    await page.reload();
+    await page.waitForSelector('#app-shell', { state: 'visible', timeout: 10_000 });
     await navigateTo(page, 'mappings');
   });
 
