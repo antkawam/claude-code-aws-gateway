@@ -4908,6 +4908,12 @@ pub async fn discover_mapping(
         }
     };
 
+    if model.len() > 256 {
+        return mapping_validation_error(
+            "'model' field must not exceed 256 characters",
+        );
+    }
+
     tracing::info!(
         admin_sub = %admin_sub,
         action = "discover_mapping",
