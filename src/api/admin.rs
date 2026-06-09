@@ -4477,6 +4477,56 @@ pub async fn create_aip_override(
         None => return error_response(StatusCode::BAD_REQUEST, "model_id is required"),
     };
 
+    // Validate that model_id is canonical (a fixed-point of canonicalize_model_id)
+    // OR is a known alias in model_mappings (admin-pinned non-canonical key).
+    {
+        use crate::translate::canonicalize::canonicalize_model_id;
+        let canonical_opt = canonicalize_model_id(&model_id);
+
+        let is_fixed_point = canonical_opt.as_deref().is_some_and(|c| c == model_id);
+
+        if !is_fixed_point {
+            // Check if model_id is a known alias in model_mappings.
+            let is_alias: bool = sqlx::query_scalar::<_, bool>(
+                "SELECT EXISTS(SELECT 1 FROM model_mappings WHERE anthropic_prefix = $1)",
+            )
+            .bind(&model_id)
+            .fetch_one(pool)
+            .await
+            .unwrap_or_else(|e| {
+                tracing::warn!(
+                    model_id = %model_id,
+                    error = %e,
+                    "alias existence check failed; treating as non-alias"
+                );
+                false
+            });
+
+            if !is_alias {
+                let message = match canonical_opt.as_deref() {
+                    Some(canonical) => format!(
+                        "override key must be canonical; \
+                         current canonical form is `{canonical}`"
+                    ),
+                    None => "override key must be canonical or an existing mapping alias; \
+                             the supplied model_id could not be canonicalized"
+                        .to_string(),
+                };
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({
+                        "type": "error",
+                        "error": {
+                            "type": "invalid_request_error",
+                            "message": message
+                        }
+                    })),
+                )
+                    .into_response();
+            }
+        }
+    }
+
     // Validate AIP ARN
     let aip_arn = match body.aip_arn.as_deref() {
         Some(arn) if arn.starts_with("arn:aws:bedrock:") => arn.to_string(),
@@ -4583,5 +4633,332 @@ pub async fn delete_aip_override(
             Json(json!({ "deleted": true })).into_response()
         }
         Err(e) => admin_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    }
+}
+
+// ============================================================
+// Admin API — Model Mappings CRUD
+// ============================================================
+
+#[derive(Deserialize)]
+pub struct CreateMappingRequest {
+    pub anthropic_prefix: String,
+    pub bedrock_suffix: String,
+    pub anthropic_display: Option<String>,
+}
+
+#[derive(Deserialize)]
+pub struct UpdateMappingRequest {
+    pub bedrock_suffix: String,
+    pub anthropic_display: Option<String>,
+}
+
+#[derive(Deserialize)]
+pub struct DiscoverMappingRequest {
+    pub model: Option<String>,
+}
+
+/// Validate inputs for POST/PUT model mapping endpoints.
+/// Returns `Ok(())` or an error Response with 400.
+#[allow(clippy::result_large_err)]
+fn validate_mapping_input(
+    anthropic_prefix: &str,
+    bedrock_suffix: &str,
+    anthropic_display: Option<&str>,
+) -> Result<(), Response> {
+    // anthropic_prefix: non-empty, ≤64 chars, no leading/trailing whitespace
+    if anthropic_prefix.is_empty() {
+        return Err(mapping_validation_error(
+            "anthropic_prefix must not be empty",
+        ));
+    }
+    if anthropic_prefix.len() > 64 {
+        return Err(mapping_validation_error(
+            "anthropic_prefix must be at most 64 characters",
+        ));
+    }
+    if anthropic_prefix != anthropic_prefix.trim() {
+        return Err(mapping_validation_error(
+            "anthropic_prefix must not have leading or trailing whitespace",
+        ));
+    }
+
+    // bedrock_suffix: must start with "anthropic.", no embedded region prefix, ≤128 chars
+    if bedrock_suffix.is_empty() {
+        return Err(mapping_validation_error("bedrock_suffix must not be empty"));
+    }
+    if !bedrock_suffix.starts_with("anthropic.") {
+        return Err(mapping_validation_error(
+            "bedrock_suffix must start with 'anthropic.'",
+        ));
+    }
+    if bedrock_suffix.len() > 128 {
+        return Err(mapping_validation_error(
+            "bedrock_suffix must be at most 128 characters",
+        ));
+    }
+    // Reject embedded region prefix: after "anthropic." the next segment must not be a region
+    let after_prefix = &bedrock_suffix["anthropic.".len()..];
+    if after_prefix.starts_with("us.")
+        || after_prefix.starts_with("eu.")
+        || after_prefix.starts_with("ap.")
+        || after_prefix.starts_with("us-east-")
+        || after_prefix.starts_with("us-west-")
+        || after_prefix.starts_with("eu-west-")
+        || after_prefix.starts_with("ap-southeast-")
+        || after_prefix.starts_with("ap-northeast-")
+    {
+        return Err(mapping_validation_error(
+            "bedrock_suffix must not contain an embedded region prefix after 'anthropic.' (e.g. 'anthropic.us.claude-...' is not valid)",
+        ));
+    }
+
+    // anthropic_display (optional): no leading/trailing whitespace, ≤64 chars
+    if let Some(display) = anthropic_display {
+        if display.len() > 64 {
+            return Err(mapping_validation_error(
+                "anthropic_display must be at most 64 characters",
+            ));
+        }
+        if display != display.trim() {
+            return Err(mapping_validation_error(
+                "anthropic_display must not have leading or trailing whitespace",
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+fn mapping_validation_error(message: &str) -> Response {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(json!({
+            "type": "error",
+            "error": { "type": "invalid_request_error", "message": message }
+        })),
+    )
+        .into_response()
+}
+
+fn mapping_not_found_error(message: &str) -> Response {
+    (
+        StatusCode::NOT_FOUND,
+        Json(json!({
+            "type": "error",
+            "error": { "type": "not_found_error", "message": message }
+        })),
+    )
+        .into_response()
+}
+
+fn mapping_conflict_error(message: &str) -> Response {
+    (
+        StatusCode::CONFLICT,
+        Json(json!({
+            "type": "error",
+            "error": { "type": "conflict_error", "message": message }
+        })),
+    )
+        .into_response()
+}
+
+/// GET /admin/mappings — list all model mappings with full metadata.
+pub async fn list_mappings(State(state): State<Arc<GatewayState>>, headers: HeaderMap) -> Response {
+    if let Err(resp) = check_admin_auth(&headers, &state).await {
+        return resp;
+    }
+    let pool = state.db().await;
+    match db::model_mappings::get_all_mappings_full(&pool).await {
+        Ok(rows) => Json(json!({ "mappings": rows })).into_response(),
+        Err(e) => admin_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    }
+}
+
+/// POST /admin/mappings — create a new admin mapping.
+pub async fn create_mapping(
+    State(state): State<Arc<GatewayState>>,
+    headers: HeaderMap,
+    Json(body): Json<CreateMappingRequest>,
+) -> Response {
+    let admin_sub = match check_admin_auth_identity(&headers, &state).await {
+        Ok(sub) => sub,
+        Err(resp) => return resp,
+    };
+
+    if let Err(resp) = validate_mapping_input(
+        &body.anthropic_prefix,
+        &body.bedrock_suffix,
+        body.anthropic_display.as_deref(),
+    ) {
+        return resp;
+    }
+
+    let pool = state.db().await;
+    match db::model_mappings::insert_admin_mapping(
+        &pool,
+        &body.anthropic_prefix,
+        &body.bedrock_suffix,
+        body.anthropic_display.as_deref(),
+    )
+    .await
+    {
+        Ok(row) => {
+            tracing::info!(
+                admin_sub = %admin_sub,
+                action = "create_mapping",
+                anthropic_prefix = %row.anthropic_prefix,
+                "model_mapping_mutation"
+            );
+            (StatusCode::CREATED, Json(json!(row))).into_response()
+        }
+        Err(e) => {
+            // Check for unique constraint violation (conflict)
+            let msg = e.to_string();
+            if msg.contains("duplicate key") || msg.contains("unique") {
+                mapping_conflict_error(&format!(
+                    "A mapping for '{}' already exists. Use PUT to update it.",
+                    body.anthropic_prefix
+                ))
+            } else {
+                admin_error(StatusCode::INTERNAL_SERVER_ERROR, &msg)
+            }
+        }
+    }
+}
+
+/// PUT /admin/mappings/:prefix — overwrite an existing mapping.
+pub async fn update_mapping(
+    State(state): State<Arc<GatewayState>>,
+    headers: HeaderMap,
+    Path(prefix): Path<String>,
+    Json(body): Json<UpdateMappingRequest>,
+) -> Response {
+    let admin_sub = match check_admin_auth_identity(&headers, &state).await {
+        Ok(sub) => sub,
+        Err(resp) => return resp,
+    };
+
+    if let Err(resp) = validate_mapping_input(
+        &prefix,
+        &body.bedrock_suffix,
+        body.anthropic_display.as_deref(),
+    ) {
+        return resp;
+    }
+
+    let pool = state.db().await;
+    match db::model_mappings::update_admin_mapping(
+        &pool,
+        &prefix,
+        &body.bedrock_suffix,
+        body.anthropic_display.as_deref(),
+    )
+    .await
+    {
+        Ok(Some(row)) => {
+            tracing::info!(
+                admin_sub = %admin_sub,
+                action = "update_mapping",
+                anthropic_prefix = %row.anthropic_prefix,
+                "model_mapping_mutation"
+            );
+            Json(json!(row)).into_response()
+        }
+        Ok(None) => mapping_not_found_error(&format!("No mapping found for prefix '{prefix}'")),
+        Err(e) => admin_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    }
+}
+
+/// DELETE /admin/mappings/:prefix — delete a mapping.
+pub async fn delete_mapping(
+    State(state): State<Arc<GatewayState>>,
+    headers: HeaderMap,
+    Path(prefix): Path<String>,
+) -> Response {
+    let admin_sub = match check_admin_auth_identity(&headers, &state).await {
+        Ok(sub) => sub,
+        Err(resp) => return resp,
+    };
+
+    let pool = state.db().await;
+    match db::model_mappings::delete_mapping(&pool, &prefix).await {
+        Ok(true) => {
+            tracing::info!(
+                admin_sub = %admin_sub,
+                action = "delete_mapping",
+                anthropic_prefix = %prefix,
+                "model_mapping_mutation"
+            );
+            Json(json!({ "deleted": true })).into_response()
+        }
+        Ok(false) => mapping_not_found_error(&format!("No mapping found for prefix '{prefix}'")),
+        Err(e) => admin_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    }
+}
+
+/// POST /admin/mappings/discover — discover a model without persisting.
+pub async fn discover_mapping(
+    State(state): State<Arc<GatewayState>>,
+    headers: HeaderMap,
+    Json(body): Json<DiscoverMappingRequest>,
+) -> Response {
+    let admin_sub = match check_admin_auth_identity(&headers, &state).await {
+        Ok(sub) => sub,
+        Err(resp) => return resp,
+    };
+
+    let model = match body.model {
+        Some(m) if !m.is_empty() => m,
+        _ => {
+            return mapping_validation_error("'model' field is required and must not be empty");
+        }
+    };
+
+    if model.len() > 256 {
+        return mapping_validation_error("'model' field must not exceed 256 characters");
+    }
+
+    tracing::info!(
+        admin_sub = %admin_sub,
+        action = "discover_mapping",
+        model = %model,
+        "model_mapping_discover"
+    );
+
+    let client = state.bedrock_control_client.clone();
+    let prefix = state.config.bedrock_routing_prefix.clone();
+
+    let discovery_result = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        crate::translate::models::discover_model(&client, &model, &prefix),
+    )
+    .await;
+
+    match discovery_result {
+        Err(_elapsed) => (
+            StatusCode::GATEWAY_TIMEOUT,
+            Json(json!({
+                "type": "error",
+                "error": { "type": "upstream_error", "message": "Bedrock discovery timed out after 10s" }
+            })),
+        )
+            .into_response(),
+        Ok(None) => mapping_not_found_error(&format!(
+            "No inference profile found for model '{model}'"
+        )),
+        Ok(Some((
+            anthropic_prefix,
+            bedrock_suffix,
+            anthropic_display,
+            _profile_prefix,
+            would_be_created_via,
+        ))) => Json(json!({
+            "anthropic_prefix": anthropic_prefix,
+            "bedrock_suffix": bedrock_suffix,
+            "anthropic_display": anthropic_display,
+            "would_be_created_via": would_be_created_via,
+        }))
+        .into_response(),
     }
 }

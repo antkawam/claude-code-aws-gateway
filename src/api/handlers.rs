@@ -12,6 +12,7 @@ use futures::stream::StreamExt;
 use serde_json::{Value, json};
 use uuid::Uuid;
 
+use crate::api::accept::{ModelAcceptance, accept_model};
 use crate::auth::CachedKey;
 use crate::auth::oidc::OidcIdentity;
 use crate::db::spend::RequestLogEntry;
@@ -609,36 +610,88 @@ pub async fn messages(
         (Vec::new(), "sticky_user".to_string())
     };
 
+    // ── Model acceptance pipeline ──────────────────────────────────────────────
+    // Run accept_model BEFORE filter_by_model so every request is validated up
+    // front. Reject returns 400 immediately; Discovered persists the new row with
+    // the correct created_via value from the discovery pass. PinHit/CanonicalHit
+    // provide the bedrock_suffix used for endpoint filtering and model dispatch.
+    //
+    // The discovery control client is taken from the first team endpoint when one
+    // exists (it was registered against the same AWS account as the profiles we
+    // care about), or falls back to the gateway-level default client.
+    let discover_control_client = if let Some(first_ep) = team_endpoints.first() {
+        state
+            .endpoint_pool
+            .get_client(first_ep.id)
+            .await
+            .map(|ep_client| ep_client.control_client.clone())
+            .unwrap_or_else(|| state.bedrock_control_client.clone())
+    } else {
+        state.bedrock_control_client.clone()
+    };
+    let discover_routing_prefix = state.config.bedrock_routing_prefix.clone();
+
+    let acceptance = accept_model(&original_model, &state.model_cache, |canonical| {
+        let client = discover_control_client.clone();
+        let prefix = discover_routing_prefix.clone();
+        async move { models::discover_model(&client, &canonical, &prefix).await }
+    })
+    .await;
+
+    // Extract the accepted bedrock suffix, or reject immediately.
+    let accepted_suffix = match &acceptance {
+        ModelAcceptance::Reject => {
+            let source = match &auth_result {
+                AuthResult::VirtualKey(_) => "key",
+                AuthResult::Oidc(_) => "oidc",
+            };
+            tracing::warn!(
+                request_id = %request_id,
+                original_model = %original_model,
+                source = source,
+                "model_id_rejected"
+            );
+            return build_model_unavailable_error(&original_model);
+        }
+        ModelAcceptance::Discovered {
+            anthropic_prefix,
+            suffix,
+            via,
+            ..
+        } => {
+            // Persist the new mapping into the cache and DB.
+            state
+                .model_cache
+                .insert(models::CachedMapping {
+                    anthropic_prefix: anthropic_prefix.clone(),
+                    bedrock_suffix: suffix.clone(),
+                    anthropic_display: None,
+                })
+                .await;
+            if let Err(e) = crate::db::model_mappings::upsert_mapping(
+                &state.db().await,
+                anthropic_prefix,
+                suffix,
+                None,
+                via,
+            )
+            .await
+            {
+                tracing::warn!(%e, "Failed to persist discovered model mapping");
+            }
+            suffix.clone()
+        }
+        ModelAcceptance::PinHit { suffix, .. } => suffix.clone(),
+        ModelAcceptance::CanonicalHit { suffix, .. } => suffix.clone(),
+    };
+
     // Filter team endpoints by model availability (only when team has endpoints configured).
     // Uses suffix matching: pass just the suffix (e.g. "anthropic.claude-sonnet-4-6") so it
     // matches full profile IDs like "us.anthropic.claude-sonnet-4-6" stored in available_models.
     let team_endpoints = if !team_endpoints.is_empty() {
-        // Determine the Bedrock suffix for the requested model.
-        // Prefer the model cache (exact suffix); fall back to prefix-based translation
-        // and strip the region prefix so suffix matching works across regions.
-        let bedrock_suffix = if let Some(suffix) = state
-            .model_cache
-            .lookup_forward_with_fallback(&original_model)
-        {
-            suffix
-        } else {
-            // Use default routing prefix to resolve a full Bedrock model ID, then strip prefix.
-            let full = crate::translate::models::anthropic_to_bedrock(
-                &original_model,
-                &state.config.bedrock_routing_prefix,
-                Some(&state.model_cache),
-            );
-            // Strip the leading "<prefix>." component (e.g. "us.") to get the suffix.
-            if let Some(dot_pos) = full.find('.') {
-                full[dot_pos + 1..].to_string()
-            } else {
-                full
-            }
-        };
-
         let filtered = state
             .endpoint_pool
-            .filter_by_model(&team_endpoints, &bedrock_suffix)
+            .filter_by_model(&team_endpoints, &accepted_suffix)
             .await;
 
         if filtered.is_empty() {
@@ -657,6 +710,22 @@ pub async fn messages(
         .select_endpoint(&team_endpoints, user_identity_str, &routing_strategy)
         .await;
 
+    // Guard: if the request is team-scoped (team_endpoints non-empty) but select_endpoint
+    // returned None, the team's endpoints are all unhealthy — return a clear 400 instead
+    // of silently falling back to state.bedrock_client (wrong credentials/ARN).
+    // When team_endpoints is empty (no-team key, or fresh gateway with zero endpoints),
+    // preserve the existing bootstrap path so admin keys and early adopters still work.
+    // NOTE: checking team_endpoints (not pool.is_empty()) is intentional — a non-empty
+    // global pool must not block no-team requests that are legitimately on the bootstrap path.
+    if selected_endpoint.is_none() && !team_endpoints.is_empty() {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            "No routable endpoint is available for your team. \
+             All configured endpoints are currently unhealthy or unavailable.",
+        );
+    }
+
     // Determine routing prefix: use endpoint's if available, otherwise gateway default
     let routing_prefix = selected_endpoint
         .as_ref()
@@ -670,19 +739,27 @@ pub async fn messages(
         .flatten()
         .unwrap_or_else(|| "enabled".to_string());
 
-    let (mut bedrock_model, mut bedrock_body, web_search_ctx) = request::translate(
+    let (_translate_model, mut bedrock_body, web_search_ctx) = request::translate(
         body,
         &routing_prefix,
         Some(&state.model_cache),
         &websearch_mode,
     );
 
+    // Build bedrock_model from the accept_model-derived suffix and the selected
+    // endpoint's routing prefix. The translate call above still handles body
+    // transformation (sanitize cache_control, extract web-search, betas, etc.);
+    // we discard its model string and use the one from acceptance instead.
+    // This replaces both the old dotless-pass-through fallback and the
+    // post-translate discovery-on-miss block.
+    let mut bedrock_model = format!("{routing_prefix}.{accepted_suffix}");
+
     // Resolve the dispatch target using the four-case AIP precedence chain:
     //   1. New AIP override table has a row for this model → use that ARN.
-    //   2. New table has rows for other models but not this one → CRI unchanged (no substitution).
+    //   2. New table has rows for other models but not this one → hard-fail 400 (§Section 6).
     //   3. New table empty + legacy column set → force-substitute legacy ARN (compat).
     //   4. New table empty + legacy column null → pure CRI unchanged.
-    let resolved = resolve_dispatch_target(
+    let resolved = match resolve_dispatch_target(
         &bedrock_model,
         &original_model,
         selected_endpoint
@@ -694,46 +771,19 @@ pub async fn messages(
         selected_endpoint
             .as_ref()
             .and_then(|ep| ep.config.inference_profile_arn.as_deref()),
-    );
+    ) {
+        Ok(target) => target,
+        Err(e) => {
+            let endpoint_name = selected_endpoint.as_ref().map(|ep| ep.config.name.as_str());
+            return build_no_override_for_canonical_error(e.model_name(), endpoint_name);
+        }
+    };
 
-    // If we substituted (AIP override or legacy ARN), bedrock_model is now an ARN — skip discovery.
-    // If we didn't substitute (cases 2 and 4), bedrock_model is the CRI form — discovery-on-miss
-    // may still need to run.
-    let substituted = resolved != bedrock_model;
     bedrock_model = resolved;
 
-    if !substituted {
-        // Discovery-on-miss: if the model wasn't resolved (no dot = no prefix match),
-        // try discovering it via ListInferenceProfiles.
-        let control_client = selected_endpoint
-            .as_ref()
-            .map(|ep| &ep.control_client)
-            .unwrap_or(&state.bedrock_control_client);
-
-        if !bedrock_model.contains('.')
-            && let Some((prefix, suffix, display, profile_prefix)) =
-                models::discover_model(control_client, &bedrock_model, &routing_prefix).await
-        {
-            bedrock_model = format!("{}.{}", profile_prefix, &suffix);
-            let mapping = models::CachedMapping {
-                anthropic_prefix: prefix.clone(),
-                bedrock_suffix: suffix.clone(),
-                anthropic_display: display.clone(),
-            };
-            state.model_cache.insert(mapping).await;
-            // Persist to DB
-            if let Err(e) = crate::db::model_mappings::upsert_mapping(
-                &state.db().await,
-                &prefix,
-                &suffix,
-                display.as_deref(),
-            )
-            .await
-            {
-                tracing::warn!(%e, "Failed to persist discovered model mapping");
-            }
-        }
-    }
+    // TODO(post-1.10.0): wire matched anthropic_prefix into RequestLogEntry so the flush worker
+    // can call touch_last_used. Deferred from Task 4 of unified-model-canonicalization spec
+    // — see `.claude/backlog/touch-last-used-spend-flush-integration.md`.
 
     if web_search_ctx.is_some() {
         tracing::info!(request_id = %request_id, "Web search tool detected, interception enabled");
@@ -2935,14 +2985,34 @@ async fn resolve_global_search_provider(state: &GatewayState) -> websearch::Sear
 
 /// Build a 400 response indicating the requested model is not available on any
 /// of the team's configured endpoints.
-pub(crate) fn build_model_unavailable_error(model: &str) -> Response {
+pub fn build_model_unavailable_error(model: &str) -> Response {
     error_response(
         StatusCode::BAD_REQUEST,
         "invalid_request_error",
         &format!(
-            "Model '{model}' is not available on any of your team's configured endpoints. Contact your gateway administrator."
+            "Model '{model}' is not available on any of your team's configured endpoints; \
+             see GET /v1/models for the list of supported models."
         ),
     )
+}
+
+/// Build a 400 response for Case 2 hard-fail: the endpoint has AIP overrides
+/// configured but none match the requested model.  Both the model name and the
+/// endpoint name are included so admins can identify the misconfiguration.
+pub fn build_no_override_for_canonical_error(model: &str, endpoint_name: Option<&str>) -> Response {
+    let message = match endpoint_name {
+        Some(ep) => format!(
+            "Model '{model}' is not available on endpoint '{ep}'; \
+             the endpoint has AIP overrides configured but none match this model. \
+             Add an override row for this model or remove the existing overrides to \
+             allow CRI fallback."
+        ),
+        None => format!(
+            "Model '{model}' has no AIP override configured on the selected endpoint; \
+             the endpoint has AIP overrides but none match this model."
+        ),
+    };
+    error_response(StatusCode::BAD_REQUEST, "invalid_request_error", &message)
 }
 
 fn error_response(status: StatusCode, error_type: &str, message: &str) -> Response {
@@ -4518,55 +4588,90 @@ mod tests_t5_suffix_variants {
     }
 }
 
+/// Error type for `resolve_dispatch_target` when Case 2 fires.
+///
+/// Returned when an endpoint has AIP overrides configured for other models
+/// but no override row for the requested model.  The caller should map this
+/// to a 400 `invalid_request_error` naming the model and the endpoint.
+#[derive(Debug)]
+pub struct ModelUnavailableError {
+    model: String,
+}
+
+impl ModelUnavailableError {
+    /// The model name that was requested but had no AIP override configured.
+    pub fn model_name(&self) -> &str {
+        &self.model
+    }
+}
+
 /// Resolve the final Bedrock model ID / ARN to use for dispatching a request.
 ///
 /// Implements the four-case precedence chain from §Slice 2:
-/// 1. New AIP override table has a row for this model → use that ARN (per-model routing).
-/// 2. New table has rows for other models but not this one → fall through to CRI unchanged
-///    (no silent substitution — let discovery-on-miss handle unknown models).
-/// 3. New table empty + legacy column set → force-substitute the legacy ARN (compat net).
-/// 4. New table empty + legacy column null → pure CRI, return unchanged.
+/// 1. New AIP override table has a row for this model → Ok(ARN) — per-model routing.
+/// 2. New table has rows for other models but not this one → Err — hard-fail (§Section 6).
+/// 3. New table empty + legacy column set → Ok(legacy ARN) — compat net.
+/// 4. New table empty + legacy column null → Ok(CRI) — pure CRI unchanged.
+///
+/// Case 2 previously returned `cri_bedrock_model` unchanged.  It now returns
+/// `Err(ModelUnavailableError)` so the caller can surface a clear 400.
 pub fn resolve_dispatch_target(
     cri_bedrock_model: &str,
-    _original_model: &str,
+    original_model: &str,
     aip_override: Option<&str>,
     has_any_aip_overrides: bool,
     legacy_inference_profile_arn: Option<&str>,
-) -> String {
+) -> Result<String, ModelUnavailableError> {
     if let Some(arn) = aip_override {
         // Case 1: new table has a row for this model.
-        return arn.to_string();
+        return Ok(arn.to_string());
     }
     if has_any_aip_overrides {
-        // Case 2: new table has rows but not for this model — use CRI unchanged.
-        return cri_bedrock_model.to_string();
+        // Case 2: new table has rows but not for this model — hard-fail.
+        // The endpoint has intentionally scoped AIP overrides; a model that
+        // isn't covered is a misconfiguration, not a silent CRI fallback.
+        return Err(ModelUnavailableError {
+            model: original_model.to_string(),
+        });
     }
     if let Some(legacy_arn) = legacy_inference_profile_arn {
         // Case 3: new table empty, legacy column set — safety-net compat.
-        return legacy_arn.to_string();
+        return Ok(legacy_arn.to_string());
     }
     // Case 4: pure CRI, no overrides at all.
-    cri_bedrock_model.to_string()
+    Ok(cri_bedrock_model.to_string())
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Task 4 (Slice 2B) — Contract tests for the request-path dispatch-precedence chain
+// Task 4 (Slice 2B) + Task 6 (Section 6) — Contract tests for the
+// request-path dispatch-precedence chain.
 //
-// These tests call `resolve_dispatch_target`, a pure helper that DOES NOT EXIST
-// yet. They are intentionally written to fail to compile until the builder adds
-// the function.  DO NOT add the function here — that is the builder's job.
+// TASK 6 MIGRATION NOTE:
+//   `resolve_dispatch_target` return type changed from `String` to
+//   `Result<String, ModelUnavailableError>` (Section 6 of the spec).
+//   Case 2 (has_any_aip_overrides=true, aip_override=None) previously
+//   silently fell through to CRI.  It now returns `Err(...)`.
+//   All Ok cases below use `.unwrap()`; Case 2 asserts `.is_err()`.
+//
+// BUILDER CONTRACT (Task 6):
+//   `resolve_dispatch_target` must return `Result<String, ModelUnavailableError>`.
+//   `ModelUnavailableError` must be `pub` and accessible as
+//   `ccag::api::handlers::ModelUnavailableError` (or re-exported from a
+//   visible path).  It must expose the model name via a `.model_name()`
+//   method or a `pub model: String` field so that the handler can include
+//   it in the 400 error message.
 //
 // Spec reference: §Slice 2 "Request path changes", lines 154-193
-// Tasks file:     Task 4, lines 98-122
+//                 §Section 6 "Hard-fail Case 2", lines 279-308
+// Tasks file:     Task 4 lines 98-122, Task 6 lines (see spec §6)
 //
 // Precedence table being tested:
-//   1. New table has a row for the requested model → dispatch AIP ARN (per-model).
-//   2. New table has rows for other models, but not this one → fall through to CRI
-//      (no silent substitution).
-//   3. New table empty + legacy column set → force-substitute legacy ARN (compat).
-//   4. New table empty + legacy column null → pure CRI, unchanged.
+//   1. New table has a row for the requested model → Ok(AIP ARN).
+//   2. New table has rows for other models, but not this one → Err(_)  [CHANGED in Task 6].
+//   3. New table empty + legacy column set → Ok(legacy ARN).
+//   4. New table empty + legacy column null → Ok(CRI).
 //
-// The four arguments map exactly onto the information the caller gathers from
+// The five arguments map exactly onto the information the caller gathers from
 // `EndpointClient` before calling the helper:
 //   - `cri_bedrock_model`              — what request::translate produced
 //   - `original_model`                 — the user-supplied model name (e.g. "claude-sonnet-4-5")
@@ -4575,11 +4680,14 @@ pub fn resolve_dispatch_target(
 //   - `legacy_inference_profile_arn`   — ep.config.inference_profile_arn.as_deref()
 // ─────────────────────────────────────────────────────────────────────────────
 #[rustfmt::skip]
+#[allow(unused_imports)] // ModelUnavailableError import is the builder contract marker
 #[cfg(test)]
 mod tests_dispatch_precedence {
-    // Import the function that the builder must provide.
-    // This import is what causes the intentional compile failure.
+    // Import the function and error type that the builder must provide.
+    // These imports cause intentional compile failures until the builder
+    // changes the return type to Result<String, ModelUnavailableError>.
     use super::resolve_dispatch_target;
+    use super::ModelUnavailableError; // BUILDER CONTRACT: must be pub in this module
 
     // ── Helpers ───────────────────────────────────────────────────────────────
 
@@ -4600,11 +4708,11 @@ mod tests_dispatch_precedence {
     const LEGACY_ARN: &str =
         "arn:aws:bedrock:us-east-1:123456789012:application-inference-profile/sonnet-legacy";
 
-    // ── Test 1: new table has the requested model → dispatch AIP ARN ──────────
+    // ── Test 1: new table has the requested model → Ok(AIP ARN) ──────────────
     //
     // Endpoint has one override row: claude-sonnet-4-5 → SONNET_AIP_ARN.
     // Request is for claude-sonnet-4-5.
-    // Expected: dispatch target == SONNET_AIP_ARN.
+    // Expected: Ok(SONNET_AIP_ARN).
     #[test]
     fn test_dispatch_aip_override_for_model_uses_override_arn() {
         let result = resolve_dispatch_target(
@@ -4616,17 +4724,17 @@ mod tests_dispatch_precedence {
         );
 
         assert_eq!(
-            result, SONNET_AIP_ARN,
+            result.unwrap(), SONNET_AIP_ARN,
             "When new table has a row for the requested model, dispatch target must \
              be the AIP ARN from the override row, not the CRI form"
         );
     }
 
-    // ── Test 2: new table has Sonnet+Opus; request for Opus → Opus ARN ────────
+    // ── Test 2: new table has Sonnet+Opus; request for Opus → Ok(Opus ARN) ───
     //
     // Endpoint has two override rows. Request is for claude-opus-4-7.
     // aip_override_for("claude-opus-4-7") returns OPUS_AIP_ARN.
-    // Expected: dispatch target == OPUS_AIP_ARN (not SONNET_AIP_ARN, not CRI).
+    // Expected: Ok(OPUS_AIP_ARN) (not SONNET_AIP_ARN, not CRI).
     #[test]
     fn test_dispatch_aip_override_for_different_model_dispatches_correct_arn() {
         let result = resolve_dispatch_target(
@@ -4638,19 +4746,30 @@ mod tests_dispatch_precedence {
         );
 
         assert_eq!(
-            result, OPUS_AIP_ARN,
+            result.unwrap(), OPUS_AIP_ARN,
             "When new table has rows for multiple models, each model must dispatch its \
              own AIP ARN; an Opus request must not use the Sonnet ARN or fall to CRI"
         );
     }
 
-    // ── Test 3: new table has rows but not for this model → CRI, no sub ───────
+    // ── Test 3 (AC6.1): new table has rows but NOT for this model → Err ───────
     //
     // Endpoint has Sonnet+Opus overrides.  Request is for claude-haiku-4-5.
     // aip_override_for("claude-haiku-4-5") returns None; has_any_aip_overrides → true.
-    // Expected: dispatch target == HAIKU_CRI (fall through to CRI, no substitution).
+    //
+    // CHANGED in Task 6: previously fell through to CRI unchanged.
+    // Now returns Err so the handler returns 400 "model not available on endpoint".
+    //
+    // AC6.1: returns Err(_) — not Ok, not a panic.
+    // AC6.1: the error carries the model name "claude-haiku-4-5" so the handler
+    //        can surface it in the 400 message.
+    //
+    // BUILDER CONTRACT: ModelUnavailableError must expose `.model_name()` returning
+    //   a &str (or &String) equal to the `_original_model` argument.  The variant
+    //   should be named `NoOverrideForCanonicalModel` or similar — exact name is
+    //   the builder's choice, but the contract test calls `.model_name()`.
     #[test]
-    fn test_dispatch_no_override_with_other_overrides_falls_through_to_cri() {
+    fn test_dispatch_no_override_with_other_overrides_returns_error() {
         let result = resolve_dispatch_target(
             HAIKU_CRI,                 // cri_bedrock_model
             "claude-haiku-4-5",        // original_model
@@ -4659,18 +4778,28 @@ mod tests_dispatch_precedence {
             None,                      // legacy_inference_profile_arn
         );
 
+        assert!(
+            result.is_err(),
+            "Case 2: when new table has rows for other models but not for the requested \
+             model, resolve_dispatch_target must return Err (hard-fail, not silent CRI fallback)"
+        );
+
+        // Verify the error carries the model name so the handler can surface it.
+        // BUILDER CONTRACT: ModelUnavailableError::model_name() -> &str
+        let err = result.unwrap_err();
         assert_eq!(
-            result, HAIKU_CRI,
-            "When new table has rows for other models but not for the requested model, \
-             the dispatch target must be the CRI form unchanged — no silent substitution"
+            err.model_name(),
+            "claude-haiku-4-5",
+            "The ModelUnavailableError must carry the original model name \
+             so the 400 message can name the model"
         );
     }
 
-    // ── Test 4: new table empty + legacy column set → force-substitute ────────
+    // ── Test 4 (AC6.2): new table empty + legacy column set → Ok(legacy ARN) ─
     //
     // Endpoint has NO new-table rows (auto-migration hasn't run or failed).
     // Legacy column = LEGACY_ARN.  Request is for claude-sonnet-4-5.
-    // Expected: dispatch target == LEGACY_ARN (safety net — today's behaviour).
+    // Expected: Ok(LEGACY_ARN) (safety net — compat path preserved).
     #[test]
     fn test_dispatch_legacy_arn_compat_when_new_table_empty() {
         let result = resolve_dispatch_target(
@@ -4682,9 +4811,9 @@ mod tests_dispatch_precedence {
         );
 
         assert_eq!(
-            result, LEGACY_ARN,
+            result.unwrap(), LEGACY_ARN,
             "When new table is empty and legacy column is set, dispatch target must be \
-             the legacy ARN (safety-net compat path)"
+             Ok(legacy ARN) (safety-net compat path preserved)"
         );
     }
 
@@ -4692,7 +4821,7 @@ mod tests_dispatch_precedence {
     //
     // Same endpoint as Test 4 (new table empty, legacy column = LEGACY_ARN).
     // Request is for claude-opus-4-7 — a DIFFERENT model than the ARN represents.
-    // Expected: dispatch target STILL == LEGACY_ARN.
+    // Expected: Ok(LEGACY_ARN) still.
     //
     // This documents today's semantics: when only the legacy column is set, ALL
     // traffic on the endpoint is force-substituted through that single ARN,
@@ -4709,17 +4838,17 @@ mod tests_dispatch_precedence {
         );
 
         assert_eq!(
-            result, LEGACY_ARN,
+            result.unwrap(), LEGACY_ARN,
             "Legacy force-substitution must apply to ALL models when the new table is \
              empty — the legacy ARN is used even for Opus, because migration has not run"
         );
     }
 
-    // ── Test 6: new table empty + legacy column null → pure CRI ───────────────
+    // ── Test 6 (AC6.2): new table empty + legacy column null → Ok(CRI) ───────
     //
     // Endpoint has no new-table rows AND no legacy column.
     // Request for claude-sonnet-4-5; CRI form = SONNET_CRI.
-    // Expected: dispatch target == SONNET_CRI (pure CRI path, no override).
+    // Expected: Ok(SONNET_CRI) — pure CRI path preserved (Case 4).
     #[test]
     fn test_dispatch_pure_cri_no_overrides_no_legacy() {
         let result = resolve_dispatch_target(
@@ -4731,9 +4860,9 @@ mod tests_dispatch_precedence {
         );
 
         assert_eq!(
-            result, SONNET_CRI,
+            result.unwrap(), SONNET_CRI,
             "When both new table and legacy column are absent, dispatch target must \
-             be the CRI form unchanged — pure CRI path"
+             be Ok(CRI) — pure CRI path unchanged (Case 4 preserved)"
         );
     }
 
@@ -4741,7 +4870,7 @@ mod tests_dispatch_precedence {
     //
     // Endpoint has BOTH a new-table row for Sonnet AND the legacy column set.
     // Request for claude-sonnet-4-5.
-    // Expected: dispatch target == SONNET_AIP_ARN (new table wins; legacy ignored).
+    // Expected: Ok(SONNET_AIP_ARN) (new table wins; legacy ignored).
     #[test]
     fn test_dispatch_aip_override_takes_precedence_over_legacy_column() {
         let result = resolve_dispatch_target(
@@ -4753,9 +4882,33 @@ mod tests_dispatch_precedence {
         );
 
         assert_eq!(
-            result, SONNET_AIP_ARN,
+            result.unwrap(), SONNET_AIP_ARN,
             "New-table AIP override must take precedence over the legacy column when \
              both are present for the same model"
+        );
+    }
+
+    // ── Test 8 (AC6.1 extended): Case 2 with legacy column ALSO set ──────────
+    //
+    // Even when the legacy column is set, if has_any_aip_overrides=true and
+    // aip_override=None, Case 2 (hard-fail) takes precedence over Case 3 (legacy).
+    // This prevents the legacy compat net from silently absorbing models that the
+    // admin intended to gate behind AIP overrides.
+    #[test]
+    fn test_dispatch_case2_hardfail_takes_precedence_over_legacy_column() {
+        let result = resolve_dispatch_target(
+            HAIKU_CRI,                 // cri_bedrock_model
+            "claude-haiku-4-5",        // original_model
+            None,                      // aip_override  — no row for haiku
+            true,                      // has_any_aip_overrides — Sonnet/Opus ARE configured
+            Some(LEGACY_ARN),          // legacy_inference_profile_arn — also set
+        );
+
+        assert!(
+            result.is_err(),
+            "Case 2 hard-fail must take precedence over the legacy column: when \
+             has_any_aip_overrides=true and aip_override=None, return Err regardless \
+             of whether the legacy column is set"
         );
     }
 
@@ -4763,9 +4916,12 @@ mod tests_dispatch_precedence {
     //
     // Encodes the full matrix as a single assertion-set so any future refactor
     // that alters precedence semantics will fail this test loudly.
+    //
+    // Cases 1, 3, 4 expect Ok(arn); Case 2 expects Err.
     #[test]
     fn test_dispatch_precedence_snapshot() {
-        struct Case {
+        // Ok-cases: (label, cri, model, aip_override, has_any, legacy, expected_ok)
+        struct OkCase {
             label: &'static str,
             cri: &'static str,
             model: &'static str,
@@ -4775,9 +4931,9 @@ mod tests_dispatch_precedence {
             expected: &'static str,
         }
 
-        let cases = [
-            Case {
-                label: "1. new-table match → AIP ARN",
+        let ok_cases = [
+            OkCase {
+                label: "1. new-table match → Ok(AIP ARN)",
                 cri: SONNET_CRI,
                 model: "claude-sonnet-4-5",
                 aip_override: Some(SONNET_AIP_ARN),
@@ -4785,17 +4941,8 @@ mod tests_dispatch_precedence {
                 legacy: None,
                 expected: SONNET_AIP_ARN,
             },
-            Case {
-                label: "2. new-table rows exist, no row for model → CRI (no substitution)",
-                cri: HAIKU_CRI,
-                model: "claude-haiku-4-5",
-                aip_override: None,
-                has_any: true,
-                legacy: None,
-                expected: HAIKU_CRI,
-            },
-            Case {
-                label: "3. new table empty + legacy set → legacy force-substitute",
+            OkCase {
+                label: "3. new table empty + legacy set → Ok(legacy force-substitute)",
                 cri: SONNET_CRI,
                 model: "claude-sonnet-4-5",
                 aip_override: None,
@@ -4803,8 +4950,8 @@ mod tests_dispatch_precedence {
                 legacy: Some(LEGACY_ARN),
                 expected: LEGACY_ARN,
             },
-            Case {
-                label: "4. new table empty + legacy null → pure CRI",
+            OkCase {
+                label: "4. new table empty + legacy null → Ok(CRI)",
                 cri: SONNET_CRI,
                 model: "claude-sonnet-4-5",
                 aip_override: None,
@@ -4814,15 +4961,29 @@ mod tests_dispatch_precedence {
             },
         ];
 
-        for c in &cases {
+        for c in &ok_cases {
             let result = resolve_dispatch_target(
                 c.cri, c.model, c.aip_override, c.has_any, c.legacy,
             );
             assert_eq!(
-                result, c.expected,
+                result.unwrap(), c.expected,
                 "Precedence snapshot failed for case: {}",
                 c.label
             );
         }
+
+        // Case 2: new-table rows exist, no row for THIS model → Err (hard-fail).
+        let case2_result = resolve_dispatch_target(
+            HAIKU_CRI,
+            "claude-haiku-4-5",
+            None,   // no row for haiku
+            true,   // other models DO have overrides
+            None,
+        );
+        assert!(
+            case2_result.is_err(),
+            "Precedence snapshot case 2: new-table rows exist but not for the requested \
+             model must return Err (hard-fail, not CRI fallback)"
+        );
     }
 }

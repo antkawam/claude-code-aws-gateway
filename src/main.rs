@@ -335,6 +335,10 @@ async fn main() -> anyhow::Result<()> {
             Ok(count) => tracing::info!(count, "Boot: replayed beta overrides"),
             Err(e) => tracing::warn!(%e, "Boot: failed to replay beta overrides"),
         }
+
+        // Startup-time normalization scan: log any non-canonical AIP override keys.
+        // Non-blocking — just emits tracing::info!/warn! for admin attention.
+        ccag::endpoint::EndpointPool::scan_non_canonical_aip_overrides(&pool).await;
     }
 
     // Start cache version polling loop (5s interval)

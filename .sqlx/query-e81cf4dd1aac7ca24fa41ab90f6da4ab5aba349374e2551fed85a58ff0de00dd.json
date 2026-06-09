@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE model_mappings SET last_used_at = now() WHERE anthropic_prefix = $1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "e81cf4dd1aac7ca24fa41ab90f6da4ab5aba349374e2551fed85a58ff0de00dd"
+}

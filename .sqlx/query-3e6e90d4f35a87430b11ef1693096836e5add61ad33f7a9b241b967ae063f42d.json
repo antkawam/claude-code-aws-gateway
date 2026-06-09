@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO model_mappings (anthropic_prefix, bedrock_suffix, anthropic_display, source, created_via)\n               VALUES ($1, $2, $3, 'seed', 'unknown')\n               ON CONFLICT (anthropic_prefix) DO NOTHING",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "3e6e90d4f35a87430b11ef1693096836e5add61ad33f7a9b241b967ae063f42d"
+}

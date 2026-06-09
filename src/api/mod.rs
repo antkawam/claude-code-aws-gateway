@@ -1,8 +1,11 @@
+pub mod accept;
 pub mod admin;
 pub mod cli_auth;
-mod handlers;
+pub mod handlers;
 #[cfg(feature = "mock-bedrock")]
 pub mod mock_bedrock;
+
+pub use handlers::build_model_unavailable_error;
 
 use std::sync::Arc;
 
@@ -162,6 +165,16 @@ pub fn router(state: Arc<GatewayState>) -> Router {
         .route(
             "/admin/beta-overrides/{endpoint_id}/{profile_id}/{beta_name}",
             delete(admin::delete_beta_override),
+        )
+        // Admin API — Model Mappings CRUD
+        .route(
+            "/admin/mappings",
+            get(admin::list_mappings).post(admin::create_mapping),
+        )
+        .route("/admin/mappings/discover", post(admin::discover_mapping))
+        .route(
+            "/admin/mappings/{prefix}",
+            put(admin::update_mapping).delete(admin::delete_mapping),
         )
         // Admin API — Bedrock
         .route("/admin/bedrock/validate", post(admin::validate_bedrock))

@@ -53,18 +53,34 @@ impl ModelCache {
     /// Forward lookup: anthropic model ID -> bedrock suffix.
     /// Uses exact-match lookup against the cache. No prefix matching.
     /// Uses `try_read()` to avoid blocking; returns None on contention.
+    /// For use in sync contexts (e.g. `anthropic_to_bedrock`) that have a
+    /// hardcoded fallback on miss. Use `lookup_forward_blocking` in async
+    /// contexts where a spurious None would be fatal.
     pub fn lookup_forward(&self, anthropic_model: &str) -> Option<String> {
         let guard = self.inner.try_read().ok()?;
         guard.get(anthropic_model).map(|m| m.bedrock_suffix.clone())
     }
 
+    /// Async forward lookup: blocks until the read lock is available.
+    /// Unlike `lookup_forward`, this never returns `None` due to lock contention.
+    /// Use this in async hot paths (e.g. `accept_model`) where a spurious cache
+    /// miss causes visible failures.
+    pub async fn lookup_forward_blocking(&self, anthropic_model: &str) -> Option<String> {
+        let guard = self.inner.read().await;
+        guard.get(anthropic_model).map(|m| m.bedrock_suffix.clone())
+    }
+
     /// Forward lookup with a read-time date-suffix fallback.
+    ///
     /// 1. Exact match on `model`.
     /// 2. On miss, if `model` carries a date suffix, retry once against the
     ///    date-stripped form — but ONLY when the stripped form is
     ///    minor-version-bearing (ends with two numeric dash-segments, e.g.
     ///    `claude-opus-4-8`), never a bare major (`claude-opus-4`). This guard
     ///    prevents recreating the greedy-prefix bug Slice 1 eliminated.
+    ///
+    /// Uses `try_read()`. Use `lookup_forward_with_fallback_blocking` in async
+    /// contexts where a spurious None would be fatal.
     pub fn lookup_forward_with_fallback(&self, model: &str) -> Option<String> {
         if let Some(hit) = self.lookup_forward(model) {
             return Some(hit);
@@ -76,13 +92,55 @@ impl ModelCache {
         None
     }
 
+    /// Async forward lookup with date-suffix fallback.
+    /// Like `lookup_forward_with_fallback` but uses blocking reads — never
+    /// returns `None` due to write-lock contention.
+    pub async fn lookup_forward_with_fallback_blocking(&self, model: &str) -> Option<String> {
+        if let Some(hit) = self.lookup_forward_blocking(model).await {
+            return Some(hit);
+        }
+        let stripped = strip_date_suffix(model);
+        if stripped != model && is_minor_version_bearing(stripped) {
+            return self.lookup_forward_blocking(stripped).await;
+        }
+        None
+    }
+
     /// Reverse lookup: bedrock model ID -> anthropic display name.
     /// First tries an exact-match fast path against known bedrock_suffix values,
     /// then falls back to the existing `contains` scan (for rows where the suffix
     /// doesn't appear verbatim in the profile ID).
     /// Uses `try_read()` to avoid blocking; returns None on contention.
+    /// Use `lookup_reverse_blocking` in async hot paths.
     pub fn lookup_reverse(&self, bedrock_model: &str) -> Option<String> {
         let guard = self.inner.try_read().ok()?;
+
+        // Fast path: exact match against bedrock_suffix values (zero-allocation)
+        for m in guard.values() {
+            let suffix = &m.bedrock_suffix;
+            let dotted_match = bedrock_model.len() > suffix.len()
+                && bedrock_model.ends_with(suffix.as_str())
+                && bedrock_model.as_bytes()[bedrock_model.len() - suffix.len() - 1] == b'.';
+            if bedrock_model == suffix.as_str() || dotted_match {
+                return m.anthropic_display.clone();
+            }
+        }
+
+        // Fallback: contains scan (existing behaviour)
+        for m in guard.values() {
+            if bedrock_model.contains(&m.bedrock_suffix)
+                || bedrock_model.contains(&m.anthropic_prefix)
+            {
+                return m.anthropic_display.clone();
+            }
+        }
+        None
+    }
+
+    /// Async reverse lookup: blocks until the read lock is available.
+    /// Unlike `lookup_reverse`, this never returns `None` due to lock contention.
+    pub async fn lookup_reverse_blocking(&self, bedrock_model: &str) -> Option<String> {
+        let guard = self.inner.read().await;
 
         // Fast path: exact match against bedrock_suffix values (zero-allocation)
         for m in guard.values() {
@@ -143,18 +201,27 @@ fn is_minor_version_bearing(s: &str) -> bool {
     )
 }
 
-/// Select the best matching inference profile ID using three ordered passes:
+/// Select the best matching inference profile ID using two deterministic passes:
 /// 1. Exact stem: profile_id ends with `.anthropic.{stripped}`.
 /// 2. Versioned stem: profile_id matches `\.anthropic\.{stripped}-v\d+(:\d+)?$`.
-/// 3. Fuzzy contains: first profile_id containing `stripped` (legacy behaviour).
 ///
-/// First match within the earliest non-empty pass wins.
+/// First match within the earliest non-empty pass wins. Returns just the id.
+/// Used in tests; production code uses `select_profile_id_with_via`.
+#[allow(dead_code)]
 fn select_profile_id<'a>(profile_ids: &'a [String], stripped: &str) -> Option<&'a str> {
+    select_profile_id_with_via(profile_ids, stripped).map(|(id, _)| id)
+}
+
+/// Like `select_profile_id` but also returns which pass matched (`"pass1"` or `"pass2"`).
+fn select_profile_id_with_via<'a>(
+    profile_ids: &'a [String],
+    stripped: &str,
+) -> Option<(&'a str, &'static str)> {
     // Pass 1: exact stem
     let exact = format!(".anthropic.{stripped}");
     for id in profile_ids {
         if id.ends_with(&exact) {
-            return Some(id.as_str());
+            return Some((id.as_str(), "pass1"));
         }
     }
     // Pass 2: versioned stem  (.anthropic.{stripped}-v<digits>(:<digits>)? at end)
@@ -164,14 +231,8 @@ fn select_profile_id<'a>(profile_ids: &'a [String], stripped: &str) -> Option<&'
     if let Ok(re) = regex::Regex::new(&pattern) {
         for id in profile_ids {
             if re.is_match(id) {
-                return Some(id.as_str());
+                return Some((id.as_str(), "pass2"));
             }
-        }
-    }
-    // Pass 3: fuzzy contains (legacy)
-    for id in profile_ids {
-        if id.contains(stripped) {
-            return Some(id.as_str());
         }
     }
     None
@@ -207,13 +268,14 @@ fn build_mapping_row(
     )
 }
 
-/// Discover a model by calling Bedrock ListInferenceProfiles and fuzzy-matching.
-/// Returns (anthropic_prefix, bedrock_suffix, anthropic_display, profile_prefix) if found.
+/// Discover a model by calling Bedrock ListInferenceProfiles and matching.
+/// Returns (anthropic_prefix, bedrock_suffix, anthropic_display, profile_prefix, via) if found.
+/// `via` is `"pass1"` or `"pass2"` indicating which selection pass matched.
 pub async fn discover_model(
     bedrock_client: &aws_sdk_bedrock::Client,
     anthropic_model: &str,
     _prefix: &str,
-) -> Option<(String, String, Option<String>, String)> {
+) -> Option<(String, String, Option<String>, String, &'static str)> {
     let stripped = strip_date_suffix(anthropic_model);
     tracing::info!(
         model = %anthropic_model,
@@ -254,9 +316,9 @@ pub async fn discover_model(
         .map(|p| p.inference_profile_id().to_string())
         .collect();
 
-    // Three-pass selection: exact stem -> versioned stem -> fuzzy contains
-    let chosen = match select_profile_id(&profile_ids, stripped) {
-        Some(id) => id,
+    // Two-pass selection: exact stem -> versioned stem
+    let (chosen, via) = match select_profile_id_with_via(&profile_ids, stripped) {
+        Some(t) => t,
         None => {
             tracing::warn!(
                 model = %anthropic_model,
@@ -275,6 +337,7 @@ pub async fn discover_model(
         anthropic_prefix = %anthropic_prefix,
         bedrock_suffix = %bedrock_suffix,
         profile_id = %chosen,
+        via = %via,
         "Discovered new model mapping"
     );
 
@@ -283,6 +346,7 @@ pub async fn discover_model(
         bedrock_suffix,
         anthropic_display,
         profile_prefix,
+        via,
     ))
 }
 
@@ -1039,24 +1103,26 @@ mod tests {
         );
     }
 
-    /// Fuzzy contains fallback (pass 3): when exact and versioned stem both miss.
-    /// This is the existing behavior — first profile whose id contains `stripped`.
+    // Tests below are within #[cfg(test)] mod tests.
+
+    /// AC4.1: Pass-3-only inputs return None after Pass 3 is removed.
+    ///
+    /// Both profiles contain the stripped form (`claude-opus-4-8`) as a substring, so the
+    /// legacy Pass 3 (fuzzy contains) would have matched. Neither satisfies Pass 1 (exact stem:
+    /// ends with `.anthropic.claude-opus-4-8`) nor Pass 2 (versioned stem: matches
+    /// `\.anthropic\.claude-opus-4-8-v\d+...`). With Pass 3 gone, the function must return None.
     #[test]
-    fn test_select_profile_fuzzy_contains_fallback() {
+    fn test_ac4_1_pass3_only_match_returns_none() {
         let profiles = vec![
             "global.foo.claude-opus-4-8-experimental".to_string(),
             "us.anthropic.claude-opus-4-8-custom".to_string(),
         ];
-        let stripped = "claude-opus-4-8";
-
-        // Neither profile ends with `.anthropic.claude-opus-4-8` (exact stem miss)
-        // Neither matches versioned-stem regex (pass 2 miss)
-        // Both contain `claude-opus-4-8` → pass 3 takes the FIRST one
-        let chosen = select_profile_id(&profiles, stripped);
-        assert_eq!(
-            chosen,
-            Some("global.foo.claude-opus-4-8-experimental"),
-            "Pass 3 (fuzzy contains) must return the first profile whose id contains stripped"
+        // Pass 1 miss: neither ends with `.anthropic.claude-opus-4-8`
+        // Pass 2 miss: neither matches `\.anthropic\.claude-opus-4-8-v\d+(:\d+)?$`
+        // Pass 3 (removed): would have returned `global.foo.claude-opus-4-8-experimental`
+        assert!(
+            super::select_profile_id(&profiles, "claude-opus-4-8").is_none(),
+            "AC4.1: inputs matching only fuzzy-contains (Pass 3) must return None once Pass 3 is removed"
         );
     }
 
@@ -1325,25 +1391,15 @@ mod tests_t4_suffix_strip {
 
 // ── Task 2: ARN-tail parser tests ────────────────────────────────────────────
 //
-// These tests cover the pure `parse_foundation_model_from_arn` helper that the
-// self-healing migration runner uses to extract a Bedrock foundation-model id
-// from an inference-profile ARN.
+// These tests cover `parse_foundation_model_from_arn`, a pure helper that
+// extracts the Bedrock foundation-model id from an inference-profile ARN.
+// The function finds the `foundation-model/` segment and returns the
+// everything after the `/` (e.g. `"anthropic.claude-sonnet-4-5-20250929-v1:0"`),
+// or `Err(String)` when the segment is absent or the tail is empty.
 //
-// BUILDER CONTRACT:
-//   Add `pub fn parse_foundation_model_from_arn(arn: &str) -> Result<&str, String>`
-//   to THIS file (src/translate/models.rs), adjacent to `bedrock_to_anthropic`.
-//
-//   The function must:
-//   1. Accept a full ARN string.
-//   2. Find the `foundation-model/` segment and return everything after the `/`.
-//   3. Return `Err(String)` when the segment is absent or the tail is empty.
-//
-//   The returned `&str` slice is the *Bedrock* model id as found in the ARN tail
-//   (e.g. `"anthropic.claude-sonnet-4-5-20250929-v1:0"`).  The caller then passes
-//   this value to `bedrock_to_anthropic(tail, None)` to get the logical Anthropic
-//   model name.
-//
-// The tests MUST FAIL (unresolved name) until the builder adds the function.
+// The self-healing migration runner uses this to derive `anthropic_prefix`
+// from a legacy `inference_profile_arn` column value, then calls
+// `bedrock_to_anthropic(tail, None)` to get the logical Anthropic model name.
 
 #[cfg(test)]
 mod tests_task2_arn_parser {
@@ -1481,50 +1537,20 @@ mod tests_task2_arn_parser {
 
 // ── Task 2: Self-healing migration runner unit tests ─────────────────────────
 //
-// Tests for the `migrate_legacy_aip_endpoints` startup function.
+// Tests for `migrate_legacy_aip_endpoints` (implemented in
+// `src/migrations/aip_legacy.rs`).  This startup function scans endpoints
+// that carry a legacy `inference_profile_arn` value but have no AIP override
+// rows and auto-inserts overrides by calling `GetInferenceProfile` +
+// `parse_foundation_model_from_arn` + `bedrock_to_anthropic`.
 //
-// BUILDER CONTRACT:
-//   Extract (or add) this function — tentatively in a new file
-//   `src/migrations/aip_legacy.rs` — with a signature like:
+// The function accepts a `get_foundation_model` closure as a testable seam so
+// the pure-logic cases (skip-if-non-empty, idempotency, error-tolerance) can
+// be exercised without a real AWS call.  The tests below use this seam.
 //
-//   ```rust
-//   pub async fn migrate_legacy_aip_endpoints<F, Fut>(
-//       endpoints: &[EndpointMigrationCandidate],
-//       pool: &sqlx::PgPool,
-//       get_foundation_model: F,
-//   ) -> anyhow::Result<()>
-//   where
-//       F: Fn(&str) -> Fut + Send + Sync,
-//       Fut: std::future::Future<Output = Result<String, String>> + Send,
-//   {
-//   ```
-//
-//   `EndpointMigrationCandidate` holds `(endpoint_id: Uuid, legacy_arn: String)`.
-//   `get_foundation_model` is the testable seam: in production it calls
-//   `GetInferenceProfile` then `parse_foundation_model_from_arn` +
-//   `bedrock_to_anthropic`; in tests it's a closure.
-//
-//   Behaviour:
-//   - Skip endpoints whose `list_by_endpoint` returns non-empty.
-//   - For each remaining endpoint, call `get_foundation_model(legacy_arn)`.
-//     - On `Ok(model_id)` → insert `(endpoint_id, model_id, legacy_arn,
-//       set_by="auto-migration", reason="migrated from inference_profile_arn column")`.
-//     - On `Err(_)` → `tracing::warn!` the endpoint id, continue loop (no panic/abort).
-//   - Returns Ok(()) regardless of per-endpoint errors.
-//
-//   Wire into `src/main.rs` after `load_endpoints_with_db` and before the health
-//   loop starts.
-//
-// The tests below are integration-style against a real Postgres pool (they are
-// placed here in the lib module so they can be run with `cargo test --lib`
-// alongside unit tests, but they require `make test-integration` to have a DB).
-// The pure-logic cases (skip-if-non-empty, idempotency, error-tolerance) are
-// exercised via the injected closure so no real AWS call is needed.
-//
-// Import: the tests import `migrate_legacy_aip_endpoints` from wherever the
-// builder places it. If it lands in `src/migrations/aip_legacy.rs`, adjust the
-// `use` path below accordingly. The test module is kept here so it's compiled
-// even without the `integration` feature flag — it just requires the DB.
+// These tests are unit-style (no DB required) for the decision-logic paths,
+// and integration-style (requires `make test-integration`) for the DB paths.
+// The module is kept here so it is compiled even without the `integration`
+// feature flag.
 
 #[cfg(test)]
 mod tests_task2_migration_runner {
@@ -1594,31 +1620,4 @@ mod tests_task2_migration_runner {
             "parse_foundation_model_from_arn must return Err for an AIP ARN (not a foundation-model ARN); migration runner must handle this without panicking"
         );
     }
-
-    // ── set_by / reason field values ──────────────────────────────────────────
-
-    /// The migration runner must write `set_by = "auto-migration"` and
-    /// `reason = "migrated from inference_profile_arn column"` exactly.
-    /// These string constants are checked here so the builder knows the
-    /// exact values the integration test will assert on.
-    #[test]
-    fn test_migration_metadata_constants() {
-        // The migration runner MUST use these exact constant strings when
-        // calling `db::endpoint_aip_overrides::insert`.
-        // Tested indirectly in the integration test; documented here as a
-        // compile-time-visible contract.
-        const EXPECTED_SET_BY: &str = "auto-migration";
-        const EXPECTED_REASON: &str = "migrated from inference_profile_arn column";
-
-        // No logic to test — this test documents the required constant values
-        // so the builder sees them alongside the ARN-parser tests.
-        assert!(!EXPECTED_SET_BY.is_empty());
-        assert!(!EXPECTED_REASON.is_empty());
-        // Verify the strings match the spec exactly:
-        assert_eq!(EXPECTED_SET_BY, "auto-migration");
-        assert_eq!(
-            EXPECTED_REASON,
-            "migrated from inference_profile_arn column"
-        );
-    }
-}
+} // end #[cfg(test)] mod tests_task2_arn_parser
