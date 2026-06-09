@@ -497,6 +497,26 @@ pub async fn messages(
         Err(resp) => return resp,
     };
 
+    // Hoisted OIDC user lookup: a single get_user_by_email call drives both
+    // the inactive-user gate and the team_id resolution below. For virtual
+    // keys this stays None and the lookup is skipped entirely.
+    let oidc_user = match &auth_result {
+        AuthResult::Oidc(id) => {
+            crate::db::users::get_user_by_email(&state.db().await, id.user_id())
+                .await
+                .ok()
+                .flatten()
+        }
+        AuthResult::VirtualKey(_) => None,
+    };
+
+    // Inactive-user gate: an OIDC user whose row is `active=false` is rejected
+    // BEFORE budget/rate-limit/endpoint resolution. Mirrors the portal-side
+    // check in `resolve_oidc_role`.
+    if let Some(resp) = crate::api::oidc_resolution::oidc_inactive_response(oidc_user.as_ref()) {
+        return resp;
+    }
+
     // Extract identity for spend tracking
     let identity = match &auth_result {
         AuthResult::VirtualKey(k) => AuthIdentity {
@@ -504,18 +524,11 @@ pub async fn messages(
             user_identity: k.user_email.clone().or_else(|| k.name.clone()),
             user_id: k.user_id,
         },
-        AuthResult::Oidc(id) => {
-            let user_id = crate::db::users::get_user_by_email(&state.db().await, id.user_id())
-                .await
-                .ok()
-                .flatten()
-                .map(|u| u.id);
-            AuthIdentity {
-                key_id: None,
-                user_identity: Some(id.user_id().to_string()),
-                user_id,
-            }
-        }
+        AuthResult::Oidc(id) => AuthIdentity {
+            key_id: None,
+            user_identity: Some(id.user_id().to_string()),
+            user_id: oidc_user.as_ref().map(|u| u.id),
+        },
     };
 
     // Resolve budget identity: OIDC email, or virtual key's assigned user email
@@ -590,7 +603,9 @@ pub async fn messages(
     // Resolve endpoint for this request
     let team_id = match &auth_result {
         AuthResult::VirtualKey(k) => k.team_id,
-        AuthResult::Oidc(_) => None, // TODO: resolve team from user's DB record
+        AuthResult::Oidc(_) => {
+            crate::api::oidc_resolution::resolve_oidc_team_id(oidc_user.as_ref())
+        }
     };
     let (team_endpoints, routing_strategy) = if let Some(tid) = team_id {
         let pool = state.db().await;
