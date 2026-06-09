@@ -11,6 +11,7 @@ pub mod endpoint_aip_overrides_tests;
 pub mod endpoint_tests;
 pub mod model_seed_tests;
 pub mod notification_tests;
+pub mod oidc_team_resolution_tests;
 pub mod pricing_api_tests;
 pub mod pricing_csv_tests;
 pub mod pricing_tests;
