@@ -53,18 +53,34 @@ impl ModelCache {
     /// Forward lookup: anthropic model ID -> bedrock suffix.
     /// Uses exact-match lookup against the cache. No prefix matching.
     /// Uses `try_read()` to avoid blocking; returns None on contention.
+    /// For use in sync contexts (e.g. `anthropic_to_bedrock`) that have a
+    /// hardcoded fallback on miss. Use `lookup_forward_blocking` in async
+    /// contexts where a spurious None would be fatal.
     pub fn lookup_forward(&self, anthropic_model: &str) -> Option<String> {
         let guard = self.inner.try_read().ok()?;
         guard.get(anthropic_model).map(|m| m.bedrock_suffix.clone())
     }
 
+    /// Async forward lookup: blocks until the read lock is available.
+    /// Unlike `lookup_forward`, this never returns `None` due to lock contention.
+    /// Use this in async hot paths (e.g. `accept_model`) where a spurious cache
+    /// miss causes visible failures.
+    pub async fn lookup_forward_blocking(&self, anthropic_model: &str) -> Option<String> {
+        let guard = self.inner.read().await;
+        guard.get(anthropic_model).map(|m| m.bedrock_suffix.clone())
+    }
+
     /// Forward lookup with a read-time date-suffix fallback.
+    ///
     /// 1. Exact match on `model`.
     /// 2. On miss, if `model` carries a date suffix, retry once against the
     ///    date-stripped form — but ONLY when the stripped form is
     ///    minor-version-bearing (ends with two numeric dash-segments, e.g.
     ///    `claude-opus-4-8`), never a bare major (`claude-opus-4`). This guard
     ///    prevents recreating the greedy-prefix bug Slice 1 eliminated.
+    ///
+    /// Uses `try_read()`. Use `lookup_forward_with_fallback_blocking` in async
+    /// contexts where a spurious None would be fatal.
     pub fn lookup_forward_with_fallback(&self, model: &str) -> Option<String> {
         if let Some(hit) = self.lookup_forward(model) {
             return Some(hit);
@@ -76,13 +92,55 @@ impl ModelCache {
         None
     }
 
+    /// Async forward lookup with date-suffix fallback.
+    /// Like `lookup_forward_with_fallback` but uses blocking reads — never
+    /// returns `None` due to write-lock contention.
+    pub async fn lookup_forward_with_fallback_blocking(&self, model: &str) -> Option<String> {
+        if let Some(hit) = self.lookup_forward_blocking(model).await {
+            return Some(hit);
+        }
+        let stripped = strip_date_suffix(model);
+        if stripped != model && is_minor_version_bearing(stripped) {
+            return self.lookup_forward_blocking(stripped).await;
+        }
+        None
+    }
+
     /// Reverse lookup: bedrock model ID -> anthropic display name.
     /// First tries an exact-match fast path against known bedrock_suffix values,
     /// then falls back to the existing `contains` scan (for rows where the suffix
     /// doesn't appear verbatim in the profile ID).
     /// Uses `try_read()` to avoid blocking; returns None on contention.
+    /// Use `lookup_reverse_blocking` in async hot paths.
     pub fn lookup_reverse(&self, bedrock_model: &str) -> Option<String> {
         let guard = self.inner.try_read().ok()?;
+
+        // Fast path: exact match against bedrock_suffix values (zero-allocation)
+        for m in guard.values() {
+            let suffix = &m.bedrock_suffix;
+            let dotted_match = bedrock_model.len() > suffix.len()
+                && bedrock_model.ends_with(suffix.as_str())
+                && bedrock_model.as_bytes()[bedrock_model.len() - suffix.len() - 1] == b'.';
+            if bedrock_model == suffix.as_str() || dotted_match {
+                return m.anthropic_display.clone();
+            }
+        }
+
+        // Fallback: contains scan (existing behaviour)
+        for m in guard.values() {
+            if bedrock_model.contains(&m.bedrock_suffix)
+                || bedrock_model.contains(&m.anthropic_prefix)
+            {
+                return m.anthropic_display.clone();
+            }
+        }
+        None
+    }
+
+    /// Async reverse lookup: blocks until the read lock is available.
+    /// Unlike `lookup_reverse`, this never returns `None` due to lock contention.
+    pub async fn lookup_reverse_blocking(&self, bedrock_model: &str) -> Option<String> {
+        let guard = self.inner.read().await;
 
         // Fast path: exact match against bedrock_suffix values (zero-allocation)
         for m in guard.values() {

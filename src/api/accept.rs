@@ -31,8 +31,10 @@ pub enum ModelAcceptance {
 /// Three-tier model acceptance pipeline.
 ///
 /// Given a raw client-supplied model ID:
-/// 1. Try an exact cache lookup (`lookup_forward`). This catches explicit pin
-///    rows, including admin-added aliases for non-canonical keys.
+/// 1. Try an exact cache lookup (`lookup_forward_blocking`). This catches
+///    explicit pin rows, including admin-added aliases for non-canonical keys.
+///    Uses a blocking async read so a concurrent cache reload never causes a
+///    spurious miss that falls through to discovery.
 /// 2. Canonicalize via `canonicalize_model_id` (trim, strip date suffix,
 ///    auto-prepend `claude-`). If the canonical form differs from the raw
 ///    input, try the cache again with an exact lookup.
@@ -47,12 +49,13 @@ where
     F: FnOnce(String) -> Fut,
     Fut: std::future::Future<Output = Option<(String, String, Option<String>, String, &'static str)>>,
 {
-    // Tier 1: exact raw pin. Uses lookup_forward (no date-strip fallback) so
-    // that date-stripped matches are attributed to the canonicalize path in
-    // Tier 2 (CanonicalHit) rather than a raw pin (PinHit). Admin-added alias
-    // rows with non-canonical keys (e.g. "Sonnet 4.7") still fire here because
-    // the key is stored verbatim in the cache.
-    if let Some(suffix) = cache.lookup_forward(raw) {
+    // Tier 1: exact raw pin. Uses lookup_forward_blocking (async read, never
+    // returns None due to lock contention) so that date-stripped matches are
+    // attributed to the canonicalize path in Tier 2 (CanonicalHit) rather than
+    // a raw pin (PinHit). Admin-added alias rows with non-canonical keys
+    // (e.g. "Sonnet 4.7") still fire here because the key is stored verbatim
+    // in the cache.
+    if let Some(suffix) = cache.lookup_forward_blocking(raw).await {
         return ModelAcceptance::PinHit {
             suffix,
             anthropic_prefix: raw.to_string(),
@@ -68,7 +71,7 @@ where
         // Only re-check if the canonical form is actually different from the
         // raw input; otherwise we'd just repeat the miss from Tier 1.
         if c != raw
-            && let Some(suffix) = cache.lookup_forward(c)
+            && let Some(suffix) = cache.lookup_forward_blocking(c).await
         {
             return ModelAcceptance::CanonicalHit {
                 suffix,
