@@ -63,4 +63,29 @@ mod tests {
         assert_eq!(usage["cache_read_input_tokens"], 0);
         assert_eq!(normalized["model"], "claude-sonnet-4-6-20250514");
     }
+
+    /// Regression lock: `stop_reason: "refusal"` on a Bedrock HTTP-200 response
+    /// must pass through `normalize_response` unchanged. Fable 5 can return this
+    /// stop reason; the gateway must not rewrite or drop it.
+    #[test]
+    fn test_stop_reason_refusal_passthrough() {
+        let resp = json!({
+            "id": "msg_456",
+            "type": "message",
+            "role": "assistant",
+            "content": [],
+            "model": "global.anthropic.claude-fable-5",
+            "stop_reason": "refusal",
+            "usage": {
+                "input_tokens": 8,
+                "output_tokens": 0
+            }
+        });
+
+        let normalized = normalize_response(resp, "claude-fable-5", None);
+        assert_eq!(
+            normalized["stop_reason"], "refusal",
+            "stop_reason 'refusal' must survive normalize_response unchanged"
+        );
+    }
 }

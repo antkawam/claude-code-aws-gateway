@@ -101,4 +101,28 @@ mod tests {
             0
         );
     }
+
+    /// Regression lock: a `message_delta` SSE event with `delta.stop_reason: "refusal"`
+    /// must pass through `normalize_stream_event` with the field intact. Fable 5
+    /// can emit this stop reason over streaming; the gateway must not rewrite or drop it.
+    #[test]
+    fn test_stream_message_delta_refusal_stop_reason() {
+        let event = json!({
+            "type": "message_delta",
+            "delta": {
+                "type": "message_delta",
+                "stop_reason": "refusal",
+                "stop_sequence": null
+            },
+            "usage": {
+                "output_tokens": 0
+            }
+        });
+
+        let normalized = normalize_stream_event(event, "claude-fable-5", None);
+        assert_eq!(
+            normalized["delta"]["stop_reason"], "refusal",
+            "stop_reason 'refusal' in message_delta must survive normalize_stream_event unchanged"
+        );
+    }
 }
