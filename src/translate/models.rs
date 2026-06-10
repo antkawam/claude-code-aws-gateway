@@ -330,6 +330,7 @@ pub fn anthropic_to_bedrock(model: &str, prefix: &str, model_cache: Option<&Mode
 /// Hardcoded forward mapping (no-DB fallback).
 fn hardcoded_anthropic_to_bedrock(model: &str, prefix: &str) -> String {
     match model {
+        "claude-fable-5" => format!("{prefix}.anthropic.claude-fable-5"),
         "claude-opus-4-7" => format!("{prefix}.anthropic.claude-opus-4-7"),
         "claude-opus-4-6" | "claude-opus-4-6-20250605" => {
             format!("{prefix}.anthropic.claude-opus-4-6-v1")
@@ -401,6 +402,7 @@ pub fn bedrock_to_anthropic(model: &str, model_cache: Option<&ModelCache>) -> St
 /// Hardcoded reverse mapping (no-DB fallback).
 fn hardcoded_bedrock_to_anthropic(model: &str) -> String {
     match model {
+        s if s.contains("claude-fable-5") => "claude-fable-5".to_string(),
         s if s.contains("claude-opus-4-7") => "claude-opus-4-7".to_string(),
         s if s.contains("claude-opus-4-6") => "claude-opus-4-6-20250605".to_string(),
         s if s.contains("claude-sonnet-4-6") => "claude-sonnet-4-6-20250514".to_string(),
@@ -1173,17 +1175,55 @@ mod tests {
             "profile_prefix fallback: entire string when no dot found"
         );
     }
+
+    // ── Fable 5 forward mapping ───────────────────────────────────────────────
+
+    /// `claude-fable-5` with the `global` prefix must map to
+    /// `global.anthropic.claude-fable-5`.
+    #[test]
+    fn test_model_mapping_fable_5_global() {
+        assert_eq!(
+            anthropic_to_bedrock("claude-fable-5", "global", None),
+            "global.anthropic.claude-fable-5"
+        );
+    }
+
+    /// Forward mapping for `claude-fable-5` with `us`, `au`, `apac`, `eu` prefixes.
+    #[test]
+    fn test_model_mapping_fable_5_all_prefixes() {
+        assert_eq!(
+            anthropic_to_bedrock("claude-fable-5", "us", None),
+            "us.anthropic.claude-fable-5"
+        );
+        assert_eq!(
+            anthropic_to_bedrock("claude-fable-5", "au", None),
+            "au.anthropic.claude-fable-5"
+        );
+        assert_eq!(
+            anthropic_to_bedrock("claude-fable-5", "apac", None),
+            "apac.anthropic.claude-fable-5"
+        );
+        assert_eq!(
+            anthropic_to_bedrock("claude-fable-5", "eu", None),
+            "eu.anthropic.claude-fable-5"
+        );
+    }
+
+    /// Reverse mapping: any prefixed Bedrock ID for fable-5 maps back to `"claude-fable-5"`.
+    #[test]
+    fn test_bedrock_to_anthropic_fable_5_all_prefixes() {
+        for prefix in &["us", "au", "apac", "eu", "global"] {
+            let bedrock_id = format!("{}.anthropic.claude-fable-5", prefix);
+            assert_eq!(
+                bedrock_to_anthropic(&bedrock_id, None),
+                "claude-fable-5",
+                "prefix '{}' must reverse-map to 'claude-fable-5'",
+                prefix
+            );
+        }
+    }
 }
 
-/// Task 4 — Generic `[\w+]` suffix stripping in `anthropic_to_bedrock`.
-///
-/// The function must strip a trailing `[\w+]` (regex `\[\w+\]$`) from the
-/// model ID before all other logic (dot-passthrough check, cache lookup,
-/// hardcoded match, discovery fallback).
-///
-/// The suffix is silently discarded — it is not used to inject betas.
-/// That remains the responsibility of the client (CC sends the beta header;
-/// the gateway forwards it via the Slice 3 mechanism).
 #[cfg(test)]
 mod tests_t4_suffix_strip {
     use super::*;
@@ -1475,6 +1515,42 @@ mod tests_task2_arn_parser {
         assert!(
             result.is_err(),
             "Truncated ARN (no '/' after resource type) must return Err; got {result:?}"
+        );
+    }
+
+    // ── Fable 5 ARN tests ─────────────────────────────────────────────────────
+
+    /// Well-formed foundation-model ARN (Fable 5) returns the tail.
+    /// Mirror of `test_parse_foundation_model_from_arn_haiku_4_5`.
+    #[test]
+    fn test_parse_foundation_model_from_arn_fable_5() {
+        let arn =
+            "arn:aws:bedrock:ap-southeast-2:123456789012:foundation-model/anthropic.claude-fable-5";
+        let result = parse_foundation_model_from_arn(arn);
+        assert!(
+            result.is_ok(),
+            "fable-5 ARN must parse successfully; got {result:?}"
+        );
+        assert_eq!(
+            result.unwrap(),
+            "anthropic.claude-fable-5",
+            "returned tail must be the foundation-model id exactly as it appears in the ARN"
+        );
+    }
+
+    /// Parse a Fable 5 ARN and map the tail through `bedrock_to_anthropic`.
+    /// Mirror of `test_arn_to_anthropic_model_haiku_4_5`.
+    #[test]
+    fn test_arn_to_anthropic_model_fable_5() {
+        let arn =
+            "arn:aws:bedrock:ap-southeast-2:123456789012:foundation-model/anthropic.claude-fable-5";
+        let tail = parse_foundation_model_from_arn(arn)
+            .expect("parse must succeed for this well-formed ARN");
+
+        let anthropic_name = bedrock_to_anthropic(tail, None);
+        assert_eq!(
+            anthropic_name, "claude-fable-5",
+            "tail of a Fable 5 ARN must map to 'claude-fable-5' via bedrock_to_anthropic"
         );
     }
 }
