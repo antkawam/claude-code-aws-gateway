@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1
 # Build stage — BuildKit cache mounts persist cargo registry + target across builds
-FROM rust:1-alpine@sha256:7f752ee8ea5deb9f4863d8c3f228a216a6466619882f09a44b9eda9617dc7770 AS builder
+FROM rust:1-alpine@sha256:606fd313a0f49743ee2a7bd49a0914bab7deedb12791f3a846a34a4711db7ed2 AS builder
 RUN apk add --no-cache musl-dev
 WORKDIR /app
 
