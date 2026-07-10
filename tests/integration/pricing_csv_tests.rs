@@ -14,6 +14,18 @@ use ccag::pricing::{normalize_service_name, parse_price_list_csv};
 // CSV header used by the AWS Bedrock Foundation Models price list (confirmed by live fetch).
 const CSV_HEADER: &str = r#""SKU","OfferTermCode","RateCode","TermType","PriceDescription","EffectiveDate","StartingRange","EndingRange","Unit","PricePerUnit","Currency","Location","Location Type","usageType","operation","Region Code","serviceName""#;
 
+// The metadata preamble AWS prepends to every price list file downloaded via
+// GetPriceListFileUrl. Five two-column rows, then the real 17-column header.
+// Reproduced verbatim (modulo the disclaimer text) from a live fetch of
+// arn:aws:pricing:::price-list/aws/AmazonBedrockFoundationModels/USD/.../us-east-1
+const CSV_PREAMBLE: &str = concat!(
+    "\"FormatVersion\",\"v1.0\"\n",
+    "\"Disclaimer\",\"This pricing list is for informational purposes only.\"\n",
+    "\"Publication Date\",\"2026-07-03T08:58:57Z\"\n",
+    "\"Version\",\"20260703085857\"\n",
+    "\"OfferCode\",\"AmazonBedrockFoundationModels\"\n",
+);
+
 // Build a minimal CSV string from header + rows.
 fn csv_with_rows(rows: &[&str]) -> String {
     let mut out = CSV_HEADER.to_string();
@@ -23,6 +35,12 @@ fn csv_with_rows(rows: &[&str]) -> String {
         out.push('\n');
     }
     out
+}
+
+// Same as `csv_with_rows`, but prefixed with AWS's metadata preamble — i.e.
+// byte-for-byte what `refresh_pricing` actually feeds the parser in production.
+fn csv_with_preamble_rows(rows: &[&str]) -> String {
+    format!("{CSV_PREAMBLE}{}", csv_with_rows(rows))
 }
 
 // Build a single quoted CSV row with the fields the parser cares about.
@@ -651,4 +669,95 @@ fn includes_non_anthropic_models_with_complete_global_dimensions() {
     result.sort_by(|a, b| a.model_prefix.cmp(&b.model_prefix));
     assert_eq!(result[0].model_prefix, "claude-haiku-4-5");
     assert_eq!(result[1].model_prefix, "llama-4-scout");
+}
+
+// -----------------------------------------------------------------------
+// Regression: the real price list file carries a metadata preamble
+// -----------------------------------------------------------------------
+
+/// A price list downloaded from `GetPriceListFileUrl` begins with five
+/// two-column metadata rows before the header. Feeding that to a
+/// `has_headers(true)` reader made the csv crate adopt `"FormatVersion","v1.0"`
+/// as a 2-field header, so every 17-field data row failed the equal-length
+/// check and was silently dropped — `refresh_pricing` logged
+/// `Parsed price list rows count=0` and reported "Nothing changed" forever.
+///
+/// Every other test in this file builds its fixture from `CSV_HEADER` directly,
+/// so none of them exercised the preamble. This one does.
+#[test]
+fn preamble_is_skipped_and_rows_are_parsed() {
+    let service = "Claude Opus 4.8 (Amazon Bedrock Edition)";
+    let csv = csv_with_preamble_rows(&[
+        &make_row(
+            "SKU-O48-INPUT",
+            "AWS Marketplace software usage|us-east-1|Input Tokens - Standard, Global",
+            "5.0000000000",
+            service,
+        ),
+        &make_row(
+            "SKU-O48-OUTPUT",
+            "AWS Marketplace software usage|us-east-1|Output Tokens - Standard, Global",
+            "25.0000000000",
+            service,
+        ),
+        &make_row(
+            "SKU-O48-CREAD",
+            "AWS Marketplace software usage|us-east-1|Cache Read Tokens - Standard, Global",
+            "0.5000000000",
+            service,
+        ),
+        &make_row(
+            "SKU-O48-CWRITE",
+            "AWS Marketplace software usage|us-east-1|Cache Write Tokens - Standard, Global",
+            "6.2500000000",
+            service,
+        ),
+    ]);
+
+    let result = parse_price_list_csv(&csv).expect("parse should succeed");
+
+    assert_eq!(
+        result.len(),
+        1,
+        "preamble must be skipped so the data rows parse; got {} rows",
+        result.len()
+    );
+    assert_pricing(&result[0], "claude-opus-4-8", 5.0, 25.0, 0.5, 6.25);
+}
+
+/// A CSV that already starts at the header row must keep working — the fix
+/// must not depend on a preamble being present.
+#[test]
+fn header_only_csv_still_parses_without_preamble() {
+    let service = "Claude Sonnet 5 (Amazon Bedrock Edition)";
+    let csv = csv_with_rows(&[
+        &make_row(
+            "SKU-S5-INPUT",
+            "AWS Marketplace software usage|us-east-1|Input Tokens - Standard, Global",
+            "2.0000000000",
+            service,
+        ),
+        &make_row(
+            "SKU-S5-OUTPUT",
+            "AWS Marketplace software usage|us-east-1|Output Tokens - Standard, Global",
+            "10.0000000000",
+            service,
+        ),
+        &make_row(
+            "SKU-S5-CREAD",
+            "AWS Marketplace software usage|us-east-1|Cache Read Tokens - Standard, Global",
+            "0.2000000000",
+            service,
+        ),
+        &make_row(
+            "SKU-S5-CWRITE",
+            "AWS Marketplace software usage|us-east-1|Cache Write Tokens - Standard, Global",
+            "2.5000000000",
+            service,
+        ),
+    ]);
+
+    let result = parse_price_list_csv(&csv).expect("parse should succeed");
+    assert_eq!(result.len(), 1, "header-only CSV must still parse");
+    assert_pricing(&result[0], "claude-sonnet-5", 2.0, 10.0, 0.2, 2.5);
 }
