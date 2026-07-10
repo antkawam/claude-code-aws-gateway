@@ -26,6 +26,37 @@ pub fn normalize_service_name(service_name: &str) -> String {
 // CSV parser
 // ---------------------------------------------------------------------------
 
+/// Drop the metadata preamble that AWS prepends to every price list CSV.
+///
+/// A price list file downloaded from `GetPriceListFileUrl` starts with five
+/// two-column metadata rows before the real 17-column header:
+///
+/// ```text
+/// "FormatVersion","v1.0"
+/// "Disclaimer","This pricing list is for informational purposes only..."
+/// "Publication Date","2026-07-03T08:58:57Z"
+/// "Version","20260703085857"
+/// "OfferCode","AmazonBedrockFoundationModels"
+/// "SKU","OfferTermCode",...          <-- header starts here
+/// ```
+///
+/// Handing the raw text to a `has_headers(true)` reader makes the csv crate
+/// treat `"FormatVersion","v1.0"` as a two-field header, after which *every*
+/// 17-field data row fails the equal-length check and is discarded. Returns
+/// the slice beginning at the header row, or the input unchanged when no
+/// header is found (the caller then parses zero rows, as before).
+fn strip_preamble(csv: &str) -> &str {
+    let mut offset = 0;
+    for line in csv.split_inclusive('\n') {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("\"SKU\"") || trimmed.starts_with("SKU,") {
+            return &csv[offset..];
+        }
+        offset += line.len();
+    }
+    csv
+}
+
 /// Intermediate accumulator while parsing rows for a single service/model.
 #[derive(Debug, Default)]
 struct ModelAccumulator {
@@ -71,6 +102,9 @@ fn classify_description(price_description: &str) -> Option<&'static str> {
 ///
 /// `source` is always `"price_list_api"` on every returned row.
 /// `aws_sku` is the SKU from the first `Input Tokens` row seen for the model.
+///
+/// Accepts both a raw price list file (with AWS's metadata preamble) and one
+/// that already begins at the header row — see [`strip_preamble`].
 pub fn parse_price_list_csv(csv: &str) -> Result<Vec<ModelPricing>> {
     // Column indices (0-based).  The test header is:
     // SKU | OfferTermCode | RateCode | TermType | PriceDescription |
@@ -84,7 +118,7 @@ pub fn parse_price_list_csv(csv: &str) -> Result<Vec<ModelPricing>> {
 
     let mut reader = csv::ReaderBuilder::new()
         .has_headers(true)
-        .from_reader(csv.as_bytes());
+        .from_reader(strip_preamble(csv).as_bytes());
 
     // Keyed by normalized model prefix.
     let mut accumulators: HashMap<String, ModelAccumulator> = HashMap::new();
