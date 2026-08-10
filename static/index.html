@@ -3282,9 +3282,14 @@ function doSsoLogin(loginUrl) {
 function checkSsoCallback() {
   const hash = window.location.hash;
   const search = window.location.search;
-  const tokenSource = hash.includes('id_token=') ? hash : search.includes('id_token=') ? search : '';
-  if (tokenSource) {
-    const token = tokenSource.split('id_token=')[1].split('&')[0];
+
+  // authorization_code + PKCE path: /auth/sso/callback already redeemed the code
+  // server-side and hands back CCAG's OWN session token — the external IDP's
+  // id_token never reaches the browser. Fragment (not query), same rationale as
+  // implicit's token-in-fragment: never sent in Referer, never server-logged.
+  const sessionTokenSource = hash.includes('session_token=') ? hash : '';
+  if (sessionTokenSource) {
+    const token = sessionTokenSource.split('session_token=')[1].split('&')[0];
     if (token) {
       apiKey = token;
       localStorage.setItem('proxyApiKey', apiKey);
@@ -3293,6 +3298,31 @@ function checkSsoCallback() {
       return true;
     }
   }
+
+  // Legacy implicit-flow path (IDPs explicitly configured for it): the external
+  // id_token itself is the bearer credential, re-validated by the backend on
+  // every request.
+  const idTokenSource = hash.includes('id_token=') ? hash : search.includes('id_token=') ? search : '';
+  if (idTokenSource) {
+    const token = idTokenSource.split('id_token=')[1].split('&')[0];
+    if (token) {
+      apiKey = token;
+      localStorage.setItem('proxyApiKey', apiKey);
+      window.history.replaceState({}, '', window.location.pathname);
+      loginWithToken();
+      return true;
+    }
+  }
+
+  if (search.includes('sso_error=1')) {
+    window.history.replaceState({}, '', window.location.pathname);
+    const el = document.getElementById('auth-error');
+    if (el) {
+      el.textContent = 'Sign-in failed. Please try again.';
+      el.style.display = 'block';
+    }
+  }
+
   return false;
 }
 

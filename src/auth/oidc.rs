@@ -25,6 +25,13 @@ pub struct IdpConfig {
     /// OIDC scopes to request during login redirect.
     /// None or empty = "openid" (safe default). Example: "openid email profile".
     pub scopes: Option<String>,
+    /// Which OAuth flow to use for CCAG's own portal/CLI sign-in redirects.
+    /// "authorization_code" (recommended, PKCE) or "implicit" (legacy, kept for
+    /// IDPs that don't support auth-code). "device_code" is stored but not
+    /// implemented for these paths. Defaults to "device_code" at the DB layer
+    /// (schema default); anything other than "authorization_code" falls back
+    /// to the existing implicit-flow behavior.
+    pub flow_type: String,
 }
 
 impl IdpConfig {
@@ -34,6 +41,10 @@ impl IdpConfig {
         let jwks_url = std::env::var("OIDC_JWKS_URL").ok();
         let user_claim = std::env::var("OIDC_USER_CLAIM").ok();
         let scopes = std::env::var("OIDC_SCOPES").ok();
+        // "authorization_code" (PKCE) is the secure default; set OIDC_FLOW_TYPE=implicit
+        // only for an IDP that genuinely can't do auth-code (rare, deprecated in OAuth 2.1).
+        let flow_type =
+            std::env::var("OIDC_FLOW_TYPE").unwrap_or_else(|_| "authorization_code".to_string());
 
         // Derive a friendly name from the issuer URL, or allow explicit override
         let name = std::env::var("OIDC_NAME").unwrap_or_else(|_| {
@@ -58,6 +69,7 @@ impl IdpConfig {
             allowed_domains: None,
             user_claim,
             scopes,
+            flow_type,
         })
     }
 
@@ -72,6 +84,7 @@ impl IdpConfig {
             allowed_domains: row.allowed_domains.clone(),
             user_claim: row.user_claim.clone(),
             scopes: row.scopes.clone(),
+            flow_type: row.flow_type.clone(),
         }
     }
 
@@ -81,6 +94,90 @@ impl IdpConfig {
             let base = self.issuer.trim_end_matches('/');
             format!("{base}/.well-known/openid-configuration")
         })
+    }
+}
+
+/// The two endpoints needed to run an authorization-code redirect + back-channel exchange.
+pub struct OidcEndpoints {
+    pub authorization_endpoint: String,
+    pub token_endpoint: String,
+}
+
+/// Fetch `authorization_endpoint` and `token_endpoint` from the IDP's OIDC discovery document.
+pub async fn discover_endpoints(
+    http_client: &reqwest::Client,
+    issuer: &str,
+) -> Option<OidcEndpoints> {
+    let discovery_url = format!(
+        "{}/.well-known/openid-configuration",
+        issuer.trim_end_matches('/')
+    );
+
+    let doc = match http_client.get(&discovery_url).send().await {
+        Ok(resp) => match resp.json::<serde_json::Value>().await {
+            Ok(doc) => doc,
+            Err(e) => {
+                tracing::error!(%issuer, %e, "Failed to parse OIDC discovery document");
+                return None;
+            }
+        },
+        Err(e) => {
+            tracing::error!(%issuer, %e, "Failed to fetch OIDC discovery document");
+            return None;
+        }
+    };
+
+    let authorization_endpoint = doc["authorization_endpoint"].as_str()?.to_string();
+    let token_endpoint = match doc["token_endpoint"].as_str() {
+        Some(ep) => ep.to_string(),
+        None => {
+            tracing::error!(%issuer, "No token_endpoint in OIDC discovery document");
+            return None;
+        }
+    };
+
+    Some(OidcEndpoints {
+        authorization_endpoint,
+        token_endpoint,
+    })
+}
+
+/// Redeem an authorization code (+ PKCE verifier) for the IDP's `id_token`.
+/// Back-channel, server-to-server — the code/verifier/token never touch browser JS.
+/// Public client (no `client_secret`): the same trust model our CLI/Desktop
+/// consumers of this Keycloak client already use.
+pub async fn exchange_code_for_id_token(
+    http_client: &reqwest::Client,
+    token_endpoint: &str,
+    code: &str,
+    redirect_uri: &str,
+    client_id: &str,
+    code_verifier: &str,
+) -> anyhow::Result<String> {
+    let params = [
+        ("grant_type", "authorization_code"),
+        ("code", code),
+        ("redirect_uri", redirect_uri),
+        ("client_id", client_id),
+        ("code_verifier", code_verifier),
+    ];
+
+    let resp = http_client
+        .post(token_endpoint)
+        .form(&params)
+        .send()
+        .await?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        anyhow::bail!("token endpoint returned {status}: {body}");
+    }
+
+    let body: serde_json::Value = resp.json().await?;
+    match body["id_token"].as_str() {
+        Some(t) => Ok(t.to_string()),
+        None => anyhow::bail!("token endpoint response had no id_token"),
     }
 }
 
@@ -509,6 +606,7 @@ mod tests {
             allowed_domains: None,
             user_claim: None,
             scopes: None,
+            flow_type: "authorization_code".to_string(),
         };
 
         validator.load_idps(vec![config]).await;
@@ -684,6 +782,7 @@ mod tests {
                 allowed_domains: None,
                 user_claim: None,
                 scopes: None,
+                flow_type: "authorization_code".to_string(),
             },
             IdpConfig {
                 name: "IDP-B".to_string(),
@@ -695,6 +794,7 @@ mod tests {
                 allowed_domains: None,
                 user_claim: None,
                 scopes: None,
+                flow_type: "authorization_code".to_string(),
             },
         ];
         validator.load_idps(configs).await;
@@ -768,6 +868,7 @@ mod tests {
             allowed_domains: None,
             user_claim: None,
             scopes: None,
+            flow_type: "authorization_code".to_string(),
         };
         validator.load_idps(vec![config]).await;
 
@@ -810,6 +911,7 @@ mod tests {
             allowed_domains: Some(vec!["@allowed.com".to_string()]),
             user_claim: None,
             scopes: None,
+            flow_type: "authorization_code".to_string(),
         };
         validator.load_idps(vec![config]).await;
         {
@@ -866,6 +968,7 @@ mod tests {
             allowed_domains: None,
             user_claim: None,
             scopes: None,
+            flow_type: "authorization_code".to_string(),
         };
         validator.load_idps(vec![config]).await;
         {
@@ -903,6 +1006,7 @@ mod tests {
             allowed_domains: None,
             user_claim: None,
             scopes: None,
+            flow_type: "authorization_code".to_string(),
         };
         validator.load_idps(vec![config.clone()]).await;
         {
@@ -934,6 +1038,7 @@ mod tests {
             allowed_domains: None,
             user_claim: None,
             scopes: None,
+            flow_type: "authorization_code".to_string(),
         };
         assert_eq!(
             config.effective_jwks_url(),
@@ -953,6 +1058,7 @@ mod tests {
             allowed_domains: None,
             user_claim: None,
             scopes: None,
+            flow_type: "authorization_code".to_string(),
         };
         assert_eq!(
             config.effective_jwks_url(),
@@ -1032,6 +1138,7 @@ mod tests {
             allowed_domains: None,
             user_claim: user_claim.map(String::from),
             scopes: scopes.map(String::from),
+            flow_type: "authorization_code".to_string(),
         }
     }
 
@@ -1160,5 +1267,117 @@ mod tests {
             "openid email profile",
             "Issuer substring matching must be case-insensitive"
         );
+    }
+
+    // ── authorization-code + PKCE: discovery and back-channel exchange ──
+
+    #[tokio::test]
+    async fn discover_endpoints_reads_both_urls() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/.well-known/openid-configuration"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "authorization_endpoint": "https://idp.example.com/authorize",
+                "token_endpoint": "https://idp.example.com/token",
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let client = reqwest::Client::new();
+        let endpoints = discover_endpoints(&client, &mock_server.uri())
+            .await
+            .unwrap();
+        assert_eq!(
+            endpoints.authorization_endpoint,
+            "https://idp.example.com/authorize"
+        );
+        assert_eq!(endpoints.token_endpoint, "https://idp.example.com/token");
+    }
+
+    #[tokio::test]
+    async fn discover_endpoints_none_when_token_endpoint_missing() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/.well-known/openid-configuration"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "authorization_endpoint": "https://idp.example.com/authorize",
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let client = reqwest::Client::new();
+        assert!(
+            discover_endpoints(&client, &mock_server.uri())
+                .await
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn exchange_code_for_id_token_posts_form_and_extracts_token() {
+        use wiremock::matchers::{body_string_contains, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/token"))
+            .and(body_string_contains("grant_type=authorization_code"))
+            .and(body_string_contains("code=abc123"))
+            .and(body_string_contains("code_verifier=the-verifier"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({ "id_token": "the.id.token" })),
+            )
+            .mount(&mock_server)
+            .await;
+
+        let client = reqwest::Client::new();
+        let token_endpoint = format!("{}/token", mock_server.uri());
+        let id_token = exchange_code_for_id_token(
+            &client,
+            &token_endpoint,
+            "abc123",
+            "https://ccag.example.com/auth/sso/callback",
+            "ccag",
+            "the-verifier",
+        )
+        .await
+        .unwrap();
+        assert_eq!(id_token, "the.id.token");
+    }
+
+    #[tokio::test]
+    async fn exchange_code_for_id_token_errors_on_non_success() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/token"))
+            .respond_with(
+                ResponseTemplate::new(400)
+                    .set_body_json(serde_json::json!({ "error": "invalid_grant" })),
+            )
+            .mount(&mock_server)
+            .await;
+
+        let client = reqwest::Client::new();
+        let token_endpoint = format!("{}/token", mock_server.uri());
+        let result = exchange_code_for_id_token(
+            &client,
+            &token_endpoint,
+            "expired-code",
+            "https://ccag.example.com/auth/sso/callback",
+            "ccag",
+            "verifier",
+        )
+        .await;
+        assert!(result.is_err());
     }
 }

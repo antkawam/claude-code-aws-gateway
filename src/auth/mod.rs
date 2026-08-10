@@ -1,4 +1,5 @@
 pub mod oidc;
+pub mod pkce;
 pub mod session;
 
 use std::collections::HashMap;
