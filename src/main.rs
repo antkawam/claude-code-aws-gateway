@@ -1001,7 +1001,7 @@ async fn seed_env_idp(pool: &sqlx::PgPool, env_idp: &auth::oidc::IdpConfig) {
         None,
         env_idp.audience.as_deref(),
         env_idp.jwks_url.as_deref(),
-        "implicit",
+        &env_idp.flow_type,
         env_idp.auto_provision,
         &env_idp.default_role,
         None,

@@ -87,12 +87,32 @@ curl -X POST https://ccag.example.com/admin/keys \
   -d '{"name": "alice-key", "user_id": "uuid", "team_id": "uuid"}'
 ```
 
+## Flow Types
+
+Each configured IDP has a `flow_type`, controlling how CCAG's own portal and CLI sign-in
+redirects work:
+
+| `flow_type` | Description |
+|---|---|
+| `authorization_code` (default, recommended) | PKCE-protected authorization-code flow. The IDP redirects back with a short-lived, single-use `code`; CCAG's server exchanges it for the identity token over a back-channel call the browser never sees, then issues its own session token. Removed from the spec entirely in OAuth 2.1 for good reason — see below. |
+| `implicit` (legacy) | The IDP puts the identity token directly in the callback URL fragment; the browser's JS reads it and uses it as the bearer credential. Kept only for IDPs that genuinely can't do authorization-code + PKCE. |
+
+**Use `authorization_code` unless you have a specific reason not to.** With implicit, the
+identity token travels in the URL — visible to browser history, any `Referer` header, and
+any extension with tab-reading access. With authorization-code + PKCE, only an
+unguessable, single-use, short-lived `code` ever touches the browser; the actual token
+exchange happens server-to-server. Set it per-IDP via the portal (Identity Providers →
+edit → Flow Type) or the admin API's `flow_type` field.
+
 ## Generic OIDC Setup
 
 CCAG supports any OpenID Connect provider that issues RS256-signed JWTs. The setup process is the same across providers:
 
 1. **Create an application** in your identity provider
-2. **Set the redirect URI** to `https://your-ccag-domain.com/portal` (for browser SSO)
+2. **Set the redirect URIs** — for the recommended `authorization_code` flow:
+   `https://your-ccag-domain.com/auth/sso/callback` (browser/portal SSO) and
+   `https://your-ccag-domain.com/auth/cli/callback` (CLI login, `apiKeyHelper`).
+   For legacy `implicit`, the portal redirect is `https://your-ccag-domain.com/portal` instead.
 3. **Note the issuer URL** (e.g., `https://dev-12345.okta.com`)
 4. **Note the audience/client ID** for token validation
 5. **Configure CCAG** with the issuer and audience (env vars or admin API)
@@ -118,6 +138,7 @@ curl -X POST https://ccag.example.com/admin/idps \
     "name": "Corporate SSO",
     "issuer_url": "https://your-idp.example.com",
     "audience": "your-client-id",
+    "flow_type": "authorization_code",
     "auto_provision": true,
     "default_role": "member",
     "allowed_domains": ["company.com"]
@@ -127,8 +148,9 @@ curl -X POST https://ccag.example.com/admin/idps \
 | IDP Field | Description |
 |---|---|
 | `name` | Display name shown on the portal login button |
-| `issuer_url` | OIDC issuer URL (must serve `/.well-known/openid-configuration`) |
-| `audience` | Expected `aud` claim in the JWT |
+| `issuer_url` | OIDC issuer URL (must serve `/.well-known/openid-configuration`, including a `token_endpoint` for `authorization_code`) |
+| `audience` | Expected `aud` claim in the JWT, and the OAuth `client_id` used in the redirect/exchange |
+| `flow_type` | `authorization_code` (default, recommended — see [Flow Types](#flow-types)) or `implicit` (legacy) |
 | `auto_provision` | Automatically create a user account on first login |
 | `default_role` | Role for auto-provisioned users (`member` or `admin`) |
 | `allowed_domains` | Restrict login to specific email domains (optional) |
@@ -141,8 +163,8 @@ curl -X POST https://ccag.example.com/admin/idps \
 2. Select **OIDC - OpenID Connect** and **Single-Page Application**
 3. Set the following:
    - **App integration name:** Claude Code Gateway
-   - **Grant type:** Implicit (Hybrid). Check "Allow ID Token".
-   - **Sign-in redirect URI:** `https://ccag.example.com/portal`
+   - **Grant type:** Authorization Code (default for new SPA apps)
+   - **Sign-in redirect URIs:** `https://ccag.example.com/auth/sso/callback` and `https://ccag.example.com/auth/cli/callback`
    - **Sign-out redirect URI:** `https://ccag.example.com/portal`
    - **Controlled access:** Assign to desired groups
 4. Note the **Client ID** and your **Okta domain** (e.g., `dev-12345.okta.com`)
@@ -159,8 +181,8 @@ OIDC_AUDIENCE=0oaXXXXXXXXXXXX  # Client ID from step 4
 2. Set the following:
    - **Name:** Claude Code Gateway
    - **Supported account types:** Accounts in this organizational directory only
-   - **Redirect URI:** Web, `https://ccag.example.com/portal`
-3. Go to **Authentication** and enable **ID tokens** under Implicit grant
+   - **Redirect URIs:** Web, `https://ccag.example.com/auth/sso/callback` and `https://ccag.example.com/auth/cli/callback`
+3. Under **Authentication**, leave Implicit grant unchecked — the app registration's default (authorization code) is what CCAG uses
 4. Go to **Token configuration > Add optional claim** and add `email` to the ID token
 5. Note the **Application (client) ID** and **Directory (tenant) ID**
 6. Configure CCAG:
@@ -177,7 +199,7 @@ OIDC_AUDIENCE={application-client-id}
 3. Set the following:
    - **Application type:** Web application
    - **Name:** Claude Code Gateway
-   - **Authorized redirect URIs:** `https://ccag.example.com/portal`
+   - **Authorized redirect URIs:** `https://ccag.example.com/auth/sso/callback` and `https://ccag.example.com/auth/cli/callback`
 4. Note the **Client ID**
 5. Configure CCAG:
 
@@ -191,7 +213,7 @@ OIDC_AUDIENCE={client-id}.apps.googleusercontent.com
 1. In the Auth0 Dashboard, go to **Applications > Create Application**
 2. Select **Single Page Web Applications**
 3. In the **Settings** tab:
-   - **Allowed Callback URLs:** `https://ccag.example.com/portal`
+   - **Allowed Callback URLs:** `https://ccag.example.com/auth/sso/callback,https://ccag.example.com/auth/cli/callback`
    - **Allowed Logout URLs:** `https://ccag.example.com/portal`
    - **Allowed Web Origins:** `https://ccag.example.com`
 4. Note the **Domain** and **Client ID**
@@ -209,7 +231,9 @@ OIDC_AUDIENCE={client-id}
 3. Set the following:
    - **Client type:** OpenID Connect
    - **Client ID:** ccag
-   - **Valid redirect URIs:** `https://ccag.example.com/portal`
+   - **Client authentication:** Off (public client — CCAG uses PKCE, no client secret)
+   - **Standard flow:** On (authorization code); Implicit flow: Off, unless you're intentionally using the legacy `implicit` `flow_type`
+   - **Valid redirect URIs:** `https://ccag.example.com/auth/sso/callback` and `https://ccag.example.com/auth/cli/callback`
    - **Web origins:** `https://ccag.example.com`
 4. Under **Client scopes**, ensure `openid`, `email`, and `profile` are included
 5. Configure CCAG:
@@ -226,10 +250,16 @@ For Claude Code CLI authentication without static API keys, CCAG supports browse
 ### How It Works
 
 1. Claude Code invokes `proxy-login.sh` when it needs credentials
-2. The script opens a browser to the CCAG login page
+2. The script opens a browser to `/auth/cli/login`, which redirects to the IDP
 3. The user authenticates via SSO
-4. The script receives a session token and returns it to Claude Code
-5. Claude Code uses the token for subsequent API calls
+4. For `authorization_code` IDPs (default): the IDP redirects back to `/auth/cli/callback`
+   with a one-time code; CCAG exchanges it for the identity token server-side (the
+   browser never sees it), validates it, and issues its own session token — all before
+   rendering a plain "you're done, close this tab" page. For legacy `implicit` IDPs:
+   the identity token lands in the callback page's URL fragment, and client-side JS
+   posts it to `/auth/cli/complete` for validation.
+5. The script polls `/auth/cli/poll` and receives the session token
+6. Claude Code uses the token for subsequent API calls
 
 The `proxy-login.sh` script is served by the gateway at `/auth/setup/token-script`. Download it with:
 
@@ -261,9 +291,13 @@ The CLI auth flow uses these gateway endpoints:
 | Endpoint | Method | Description |
 |---|---|---|
 | `/auth/cli/login` | GET | Initiates browser-based login, returns a session code |
-| `/auth/cli/callback` | GET | Browser redirect target after SSO |
-| `/auth/cli/complete` | POST | Completes the login flow |
+| `/auth/cli/callback` | GET | Browser redirect target after SSO. `authorization_code` IDPs: redeems the code server-side and completes the session directly. `implicit` IDPs: serves the legacy client-side extraction page. |
+| `/auth/cli/complete` | POST | Legacy `implicit`-flow path only — receives the token from the client-side callback page |
 | `/auth/cli/poll` | GET | CLI polls for the completed token |
+
+The portal's own SSO login uses the analogous `/auth/sso/callback` (GET) for `authorization_code`
+IDPs — same server-side exchange, but it redirects the browser straight back into the portal
+with CCAG's session token rather than requiring a poll.
 
 ## Team and User Management
 

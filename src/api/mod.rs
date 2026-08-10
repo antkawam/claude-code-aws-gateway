@@ -4,6 +4,7 @@ mod handlers;
 #[cfg(feature = "mock-bedrock")]
 pub mod mock_bedrock;
 pub mod oidc_resolution;
+pub mod sso_login;
 
 use std::sync::Arc;
 
@@ -224,6 +225,8 @@ pub fn router(state: Arc<GatewayState>) -> Router {
         .route("/auth/me", get(handlers::auth_me))
         .route("/auth/setup", get(auth_setup))
         .route("/auth/setup/token-script", get(auth_setup))
+        // Portal SSO login flow (authorization-code + PKCE)
+        .route("/auth/sso/callback", get(sso_login::sso_callback))
         // CLI browser login flow
         .route("/auth/cli/login", get(cli_auth::cli_login))
         .route("/auth/cli/callback", get(cli_auth::cli_callback))
@@ -365,9 +368,10 @@ async fn auth_providers(
 
     // Load IDPs from DB (env IDP was seeded at startup)
     if let Ok(db_idps) = crate::db::idp::get_enabled_idps(&state.db().await).await {
+        sso_login::cleanup_expired(&state.db().await).await;
         for row in &db_idps {
             let idp = crate::auth::oidc::IdpConfig::from_db_row(row);
-            if let Some(info) = build_provider_info(&state.http_client, &idp, host).await {
+            if let Some(info) = build_provider_info(&state, &idp, host).await {
                 providers.push(info);
             }
         }
@@ -379,38 +383,16 @@ async fn auth_providers(
     }))
 }
 
-/// Discover the OIDC authorization endpoint and build provider info for the portal.
+/// Discover the OIDC endpoints and build provider info (login_url) for the portal.
+/// `authorization_code` (recommended): PKCE, server-side exchange via /auth/sso/callback.
+/// `implicit`/other: legacy direct-to-portal redirect with the token in the URL fragment.
 async fn build_provider_info(
-    http_client: &reqwest::Client,
+    state: &GatewayState,
     idp: &crate::auth::oidc::IdpConfig,
     host: &str,
 ) -> Option<serde_json::Value> {
-    let discovery_url = format!(
-        "{}/.well-known/openid-configuration",
-        idp.issuer.trim_end_matches('/')
-    );
+    let endpoints = crate::auth::oidc::discover_endpoints(&state.http_client, &idp.issuer).await?;
 
-    let authorize_endpoint = match http_client.get(&discovery_url).send().await {
-        Ok(resp) => match resp.json::<serde_json::Value>().await {
-            Ok(doc) => match doc["authorization_endpoint"].as_str() {
-                Some(ep) => ep.to_string(),
-                None => {
-                    tracing::error!(idp = %idp.name, "No authorization_endpoint in OIDC discovery");
-                    return None;
-                }
-            },
-            Err(e) => {
-                tracing::error!(idp = %idp.name, %e, "Failed to parse OIDC discovery");
-                return None;
-            }
-        },
-        Err(e) => {
-            tracing::error!(idp = %idp.name, %e, "Failed to fetch OIDC discovery");
-            return None;
-        }
-    };
-
-    // Build implicit flow URL: redirect back to /portal where checkSsoCallback extracts id_token
     // Preserve port for local dev; use https unless localhost/127.0.0.1
     let base_host = host.split(':').next().unwrap_or(host);
     let scheme = if base_host == "localhost" || base_host == "127.0.0.1" {
@@ -418,11 +400,9 @@ async fn build_provider_info(
     } else {
         "https"
     };
-    let redirect_uri = format!("{scheme}://{host}/portal");
     let audience = idp.audience.as_deref().unwrap_or("");
-    let nonce = format!("{}", chrono::Utc::now().timestamp());
 
-    let separator = if authorize_endpoint.contains('?') {
+    let separator = if endpoints.authorization_endpoint.contains('?') {
         '&'
     } else {
         '?'
@@ -430,13 +410,47 @@ async fn build_provider_info(
 
     let scopes = crate::auth::oidc::resolve_oidc_scopes(idp);
     let encoded_scopes = scopes.replace(' ', "%20");
-    let login_url = format!(
-        "{authorize_endpoint}{separator}response_type=id_token&client_id={audience}&redirect_uri={redirect_uri}&nonce={nonce}&scope={encoded_scopes}"
-    );
+
+    let (login_url, flow_type) = if idp.flow_type == "authorization_code" {
+        let redirect_uri = format!("{scheme}://{host}/auth/sso/callback");
+        let pkce = crate::auth::pkce::generate();
+        let state_id = uuid::Uuid::new_v4().to_string();
+
+        if let Err(e) = sso_login::create_pending(
+            &state.db().await,
+            &state_id,
+            &pkce.verifier,
+            &endpoints.token_endpoint,
+            audience,
+            &redirect_uri,
+        )
+        .await
+        {
+            tracing::error!(idp = %idp.name, %e, "Failed to store pending SSO login");
+            return None;
+        }
+
+        let url = format!(
+            "{authz}{separator}response_type=code&client_id={audience}&redirect_uri={redirect_uri}&state={state_id}&scope={encoded_scopes}&code_challenge={challenge}&code_challenge_method=S256",
+            authz = endpoints.authorization_endpoint,
+            challenge = pkce.challenge,
+        );
+        (url, "authorization_code")
+    } else {
+        // Legacy implicit flow: redirect straight back to /portal, where
+        // checkSsoCallback() extracts id_token from the URL fragment.
+        let redirect_uri = format!("{scheme}://{host}/portal");
+        let nonce = format!("{}", chrono::Utc::now().timestamp());
+        let url = format!(
+            "{authz}{separator}response_type=id_token&client_id={audience}&redirect_uri={redirect_uri}&nonce={nonce}&scope={encoded_scopes}",
+            authz = endpoints.authorization_endpoint,
+        );
+        (url, "implicit")
+    };
 
     Some(serde_json::json!({
         "name": idp.name,
-        "flow_type": "implicit",
+        "flow_type": flow_type,
         "login_url": login_url,
     }))
 }
