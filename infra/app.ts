@@ -36,5 +36,7 @@ new GatewayStack(app, stackName, {
   imageTag: app.node.tryGetContext('imageTag') || undefined,
   imageDigest: app.node.tryGetContext('imageDigest') || undefined,
   rdsIamAuth: app.node.tryGetContext('rdsIamAuth') === 'true' || envConfig.rds_iam_auth === true,
-  allowedCidrs: envConfig.allowed_cidrs || undefined,
+  allowedCidrs: (envConfig.allowed_cidrs || [])
+    .filter((e: any) => typeof e === 'string' || !e.expires || new Date(e.expires) > new Date())
+    .map((e: any) => typeof e === 'string' ? e : e.cidr),
 });
