@@ -12,6 +12,7 @@ ignore = [
     { id = "RUSTSEC-2026-0221", reason = "event-listener !Send StackSlot unsoundness; transitive (story-22)" },
     { id = "RUSTSEC-2026-0097", reason = "rand 0.8.5 unsound with custom logger; needs rand 0.9 major bump (story-22)" },
     { id = "RUSTSEC-2026-0205", reason = "scc Array::insert double-free; transitive (story-22)" },
+    { id = "RUSTSEC-2026-0258", reason = "h2 0.3.27 empty DATA frames DoS (low severity) — 0.3.27 pinned by aws-smithy-http-client, no 0.3.x patch; the 0.4.x instance is updated to 0.4.16 which is fixed. Awaiting AWS SDK move off h2 0.3 (story-22)" },
 ]
 
 [licenses]
