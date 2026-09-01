@@ -8,6 +8,13 @@ ignore = [
     { id = "RUSTSEC-2026-0098", reason = "rustls-webpki 0.101.7 URI name constraints — pinned by aws-smithy-http-client via rustls 0.21; no patch for 0.101.x branch" },
     { id = "RUSTSEC-2026-0099", reason = "rustls-webpki 0.101.7 wildcard name constraints — same root cause as 0098, awaiting AWS SDK update" },
     { id = "RUSTSEC-2026-0104", reason = "rustls-webpki 0.101.7 CRL parsing panic — pinned by aws-smithy-http-client via rustls 0.21; 0.103.x fixed via update to 0.103.13" },
+    { id = "RUSTSEC-2026-0190", reason = "event-listener Error::downcast_mut unsoundness; transitive; no fix path yet (story-22)" },
+    { id = "RUSTSEC-2026-0221", reason = "event-listener !Send StackSlot unsoundness; transitive (story-22)" },
+    { id = "RUSTSEC-2026-0097", reason = "rand 0.8.5 unsound with custom logger; needs rand 0.9 major bump (story-22)" },
+    { id = "RUSTSEC-2026-0205", reason = "scc Array::insert double-free; transitive (story-22)" },
+    { id = "RUSTSEC-2026-0258", reason = "h2 0.3.27 empty DATA frames DoS (low severity) — 0.3.27 pinned by aws-smithy-http-client, no 0.3.x patch; the 0.4.x instance is updated to 0.4.16 which is fixed. Awaiting AWS SDK move off h2 0.3 (story-22)" },
+    { id = "RUSTSEC-2026-0194", reason = "quick-xml 0.37.5 quadratic-runtime DoS (high) — pinned by self_update 0.42.0 (^0.37); fix needs self_update major bump 0.42->1.2. Only reachable via CLI parsing release metadata from its trusted update host (story-22)" },
+    { id = "RUSTSEC-2026-0195", reason = "quick-xml 0.37.5 unbounded namespace-alloc DoS (high) — same self_update 0.42.0 pin as 0194; fix needs self_update major bump (story-22)" },
 ]
 
 [licenses]

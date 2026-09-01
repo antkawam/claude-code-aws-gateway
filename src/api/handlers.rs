@@ -729,7 +729,7 @@ pub async fn messages(
             && let Some((prefix, suffix, display, profile_prefix)) =
                 models::discover_model(control_client, &bedrock_model, &routing_prefix).await
         {
-            bedrock_model = format!("{}.{}", profile_prefix, &suffix);
+            bedrock_model = format!("{}.{}", profile_prefix, suffix);
             let mapping = models::CachedMapping {
                 anthropic_prefix: prefix.clone(),
                 bedrock_suffix: suffix.clone(),
@@ -1136,7 +1136,17 @@ fn extract_request_info(req: &request::AnthropicRequest) -> RequestInfo {
                             let error_snippet = block
                                 .get("content")
                                 .and_then(|c| c.as_str())
-                                .map(|s| if s.len() > 100 { &s[..100] } else { s })
+                                .map(|s| {
+                                    if s.len() > 100 {
+                                        let mut idx = 100;
+                                        while idx > 0 && !s.is_char_boundary(idx) {
+                                            idx -= 1;
+                                        }
+                                        &s[..idx]
+                                    } else {
+                                        s
+                                    }
+                                })
                                 .unwrap_or("unknown");
                             tool_errors.push(json!({
                                 "tool_use_id": tool_use_id,
@@ -4839,5 +4849,156 @@ mod tests_dispatch_precedence {
                 c.label
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod tests_extract_request_info_utf8 {
+    use super::*;
+    use serde_json::json;
+
+    /// Covers the `else { s }` branch (~handlers.rs:1146): when the tool_result
+    /// error content is well under 100 bytes it must be returned unchanged.
+    #[test]
+    fn test_tool_result_error_short_content_returned_unchanged() {
+        let content = "boom";
+        assert!(
+            content.len() <= 100,
+            "precondition: content must be short (<=100 bytes)"
+        );
+
+        let req = request::AnthropicRequest {
+            model: "claude-sonnet-4-5".to_string(),
+            max_tokens: None,
+            messages: vec![
+                // assistant message with tool_use so there is a valid tool_use_id
+                json!({
+                    "role": "assistant",
+                    "content": [{
+                        "type": "tool_use",
+                        "id": "toolu_002",
+                        "name": "bash",
+                        "input": {}
+                    }]
+                }),
+                // user message with short tool_result error (well under 100 bytes)
+                json!({
+                    "role": "user",
+                    "content": [{
+                        "type": "tool_result",
+                        "tool_use_id": "toolu_002",
+                        "is_error": true,
+                        "content": content
+                    }]
+                }),
+            ],
+            system: None,
+            stream: None,
+            thinking: None,
+            tools: None,
+            tool_choice: None,
+            metadata: None,
+            stop_sequences: None,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            mcp_servers: None,
+            anthropic_beta: vec![],
+        };
+
+        let info = extract_request_info(&req);
+
+        let errors = info.tool_errors.expect("tool_errors must be Some");
+        let snippet = errors[0]["error"]
+            .as_str()
+            .expect("error field must be a string");
+
+        assert_eq!(
+            snippet, content,
+            "short content must be returned unchanged, not truncated"
+        );
+    }
+
+    /// Regression test for the byte-slice panic in `extract_request_info`.
+    ///
+    /// Line ~1139: `&s[..100]` slices at byte index 100 without checking char
+    /// boundaries. When a multi-byte UTF-8 character (e.g. '╭', 3 bytes:
+    /// 0xe2 0x94 0xad) straddles byte 100, Rust panics:
+    ///   "byte index 100 is not a char boundary".
+    ///
+    /// This test is intentionally RED until the production code is fixed.
+    #[test]
+    fn test_tool_result_error_multibyte_char_at_byte_100_no_panic() {
+        // '╭' (U+256D) encodes as 3 bytes: 0xe2 0x94 0xad.
+        // 99 ASCII 'a' chars + '╭...' places the start of '╭' at byte index 99,
+        // so bytes 99/100/101 belong to that single character.
+        // `&s[..100]` then slices through the middle of '╭' → panic.
+        let content = "a".repeat(99) + "╭─ Error ─────────────────";
+        assert!(
+            content.len() > 100,
+            "precondition: content must exceed 100 bytes"
+        );
+        assert!(
+            !content.is_char_boundary(100),
+            "precondition: byte 100 must NOT be a char boundary"
+        );
+
+        let req = request::AnthropicRequest {
+            model: "claude-sonnet-4-5".to_string(),
+            max_tokens: None,
+            messages: vec![
+                // assistant message with tool_use so there is a valid tool_use_id
+                json!({
+                    "role": "assistant",
+                    "content": [{
+                        "type": "tool_use",
+                        "id": "toolu_001",
+                        "name": "bash",
+                        "input": {}
+                    }]
+                }),
+                // user message with tool_result error; content straddles byte 100
+                json!({
+                    "role": "user",
+                    "content": [{
+                        "type": "tool_result",
+                        "tool_use_id": "toolu_001",
+                        "is_error": true,
+                        "content": content
+                    }]
+                }),
+            ],
+            system: None,
+            stream: None,
+            thinking: None,
+            tools: None,
+            tool_choice: None,
+            metadata: None,
+            stop_sequences: None,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            mcp_servers: None,
+            anthropic_beta: vec![],
+        };
+
+        // Currently panics at &s[..100] because byte 100 is not a char boundary.
+        // After the fix this must complete without panicking.
+        let info = extract_request_info(&req);
+
+        let errors = info.tool_errors.expect("tool_errors must be Some");
+        let snippet = errors[0]["error"]
+            .as_str()
+            .expect("error field must be a string");
+
+        assert!(
+            snippet.len() <= 100,
+            "truncated snippet must be at most 100 bytes, got {}",
+            snippet.len()
+        );
+        assert!(
+            std::str::from_utf8(snippet.as_bytes()).is_ok(),
+            "truncated snippet must be valid UTF-8"
+        );
     }
 }
