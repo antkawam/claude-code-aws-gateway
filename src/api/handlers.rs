@@ -729,7 +729,7 @@ pub async fn messages(
             && let Some((prefix, suffix, display, profile_prefix)) =
                 models::discover_model(control_client, &bedrock_model, &routing_prefix).await
         {
-            bedrock_model = format!("{}.{}", profile_prefix, &suffix);
+            bedrock_model = format!("{}.{}", profile_prefix, suffix);
             let mapping = models::CachedMapping {
                 anthropic_prefix: prefix.clone(),
                 bedrock_suffix: suffix.clone(),
@@ -4856,6 +4856,68 @@ mod tests_dispatch_precedence {
 mod tests_extract_request_info_utf8 {
     use super::*;
     use serde_json::json;
+
+    /// Covers the `else { s }` branch (~handlers.rs:1146): when the tool_result
+    /// error content is well under 100 bytes it must be returned unchanged.
+    #[test]
+    fn test_tool_result_error_short_content_returned_unchanged() {
+        let content = "boom";
+        assert!(
+            content.len() <= 100,
+            "precondition: content must be short (<=100 bytes)"
+        );
+
+        let req = request::AnthropicRequest {
+            model: "claude-sonnet-4-5".to_string(),
+            max_tokens: None,
+            messages: vec![
+                // assistant message with tool_use so there is a valid tool_use_id
+                json!({
+                    "role": "assistant",
+                    "content": [{
+                        "type": "tool_use",
+                        "id": "toolu_002",
+                        "name": "bash",
+                        "input": {}
+                    }]
+                }),
+                // user message with short tool_result error (well under 100 bytes)
+                json!({
+                    "role": "user",
+                    "content": [{
+                        "type": "tool_result",
+                        "tool_use_id": "toolu_002",
+                        "is_error": true,
+                        "content": content
+                    }]
+                }),
+            ],
+            system: None,
+            stream: None,
+            thinking: None,
+            tools: None,
+            tool_choice: None,
+            metadata: None,
+            stop_sequences: None,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            mcp_servers: None,
+            anthropic_beta: vec![],
+        };
+
+        let info = extract_request_info(&req);
+
+        let errors = info.tool_errors.expect("tool_errors must be Some");
+        let snippet = errors[0]["error"]
+            .as_str()
+            .expect("error field must be a string");
+
+        assert_eq!(
+            snippet, content,
+            "short content must be returned unchanged, not truncated"
+        );
+    }
 
     /// Regression test for the byte-slice panic in `extract_request_info`.
     ///

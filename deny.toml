@@ -8,6 +8,10 @@ ignore = [
     { id = "RUSTSEC-2026-0098", reason = "rustls-webpki 0.101.7 URI name constraints — pinned by aws-smithy-http-client via rustls 0.21; no patch for 0.101.x branch" },
     { id = "RUSTSEC-2026-0099", reason = "rustls-webpki 0.101.7 wildcard name constraints — same root cause as 0098, awaiting AWS SDK update" },
     { id = "RUSTSEC-2026-0104", reason = "rustls-webpki 0.101.7 CRL parsing panic — pinned by aws-smithy-http-client via rustls 0.21; 0.103.x fixed via update to 0.103.13" },
+    { id = "RUSTSEC-2026-0190", reason = "event-listener Error::downcast_mut unsoundness; transitive; no fix path yet (story-22)" },
+    { id = "RUSTSEC-2026-0221", reason = "event-listener !Send StackSlot unsoundness; transitive (story-22)" },
+    { id = "RUSTSEC-2026-0097", reason = "rand 0.8.5 unsound with custom logger; needs rand 0.9 major bump (story-22)" },
+    { id = "RUSTSEC-2026-0205", reason = "scc Array::insert double-free; transitive (story-22)" },
 ]
 
 [licenses]
