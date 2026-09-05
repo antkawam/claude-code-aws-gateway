@@ -266,6 +266,8 @@ pub fn router(state: Arc<GatewayState>) -> Router {
         // Portal & Metrics
         .route("/portal", get(portal))
         .route("/metrics", get(prometheus_metrics))
+        // mcpgov overlay: MCP/tool governance admin API + portal asset.
+        .merge(crate::mcpgov::admin::routes())
         .with_state(state)
         .layer(
             CorsLayer::new()

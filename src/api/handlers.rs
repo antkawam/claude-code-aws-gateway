@@ -485,7 +485,7 @@ pub async fn resolve_oidc_role(
 pub async fn messages(
     State(state): State<Arc<GatewayState>>,
     headers: HeaderMap,
-    Json(body): Json<request::AnthropicRequest>,
+    Json(mut body): Json<request::AnthropicRequest>,
 ) -> Response {
     let start = Instant::now();
     let request_id = format!("req_{}", uuid::Uuid::new_v4().simple());
@@ -684,6 +684,42 @@ pub async fn messages(
         .ok()
         .flatten()
         .unwrap_or_else(|| "enabled".to_string());
+
+    // ── mcpgov overlay: apply MCP/tool governance policy ──────────────────────
+    // Runs here because this is the last point where the request still owns its
+    // Anthropic-shaped `tools` array, and identity (`identity`, `team_id`) is already
+    // resolved. In observe/warn mode this only records; in enforce mode it strips
+    // denied tool definitions so the model never sees them. It never fails a request.
+    let mcpgov_ctx = crate::mcpgov::RequestContext {
+        user_identity: identity.user_identity.clone(),
+        team_id,
+        key_id: identity.key_id,
+        request_id: Some(request_id.clone()),
+    };
+    let mcpgov_outcome = crate::mcpgov::enforce(
+        &mut body.tools,
+        &mut body.tool_choice,
+        &mut body.messages,
+        &mcpgov_ctx,
+    )
+    .await;
+    if !mcpgov_outcome.is_noop() {
+        tracing::info!(
+            request_id = %request_id,
+            removed = mcpgov_outcome.removed.len(),
+            flagged = mcpgov_outcome.flagged.len(),
+            tool_choice_reset = mcpgov_outcome.tool_choice_reset,
+            history_tool_uses = mcpgov_outcome.history.tool_uses,
+            history_tool_results = mcpgov_outcome.history.tool_results,
+            "mcpgov: tool policy applied"
+        );
+    }
+    // Request-side filtering reduces the model's appetite for a denied tool but cannot
+    // guarantee it will not ask anyway, so the response is policed too. `None` when
+    // policy is not enforcing or nothing is deniable, which is the common case.
+    let mcpgov_guard =
+        crate::mcpgov::response::guard_for(&mcpgov_ctx, &mcpgov_outcome.removed).await;
+    // ──────────────────────────────────────────────────────────────────────────
 
     let (mut bedrock_model, mut bedrock_body, web_search_ctx) = request::translate(
         body,
@@ -906,6 +942,7 @@ pub async fn messages(
             endpoint_id,
             &websearch_mode,
             beta_retry_ctx,
+            mcpgov_guard.clone(),
         )
         .await
     } else if is_streaming {
@@ -921,6 +958,7 @@ pub async fn messages(
             start,
             endpoint_id,
             beta_retry_ctx,
+            mcpgov_guard.clone(),
         )
         .await
     } else {
@@ -936,6 +974,7 @@ pub async fn messages(
             start,
             endpoint_id,
             beta_retry_ctx,
+            mcpgov_guard.clone(),
         )
         .await
     };
@@ -984,6 +1023,7 @@ pub async fn messages(
                         start,
                         fb_endpoint_id,
                         None, // no beta retry on failover — already retried on primary
+                        mcpgov_guard.clone(),
                     )
                     .await
                 } else {
@@ -999,6 +1039,7 @@ pub async fn messages(
                         start,
                         fb_endpoint_id,
                         None, // no beta retry on failover — already retried on primary
+                        mcpgov_guard.clone(),
                     )
                     .await
                 };
@@ -1280,6 +1321,27 @@ fn extract_response_metadata(resp: &Value) -> (i32, i32, i32, i32, Option<String
     (input, output, cache_read, cache_write, stop_reason)
 }
 
+/// Refuse any denied tool calls in a finished response.
+///
+/// A no-op when the guard is `None`, which is the common case: policy has to be enforcing
+/// and something has to be deniable before a guard is built at all.
+fn mcpgov_refuse(
+    guard: &mut Option<crate::mcpgov::response::ResponseGuard>,
+    resp: &mut Value,
+    request_id: &str,
+) {
+    let Some(g) = guard.as_mut() else { return };
+    g.rewrite_non_streaming(resp);
+    if g.acted() {
+        let names: Vec<&str> = g.blocked().iter().map(|d| d.tool_name.as_str()).collect();
+        tracing::info!(
+            request_id = %request_id,
+            tools = ?names,
+            "mcpgov: refused tool calls in response"
+        );
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn handle_non_streaming(
     state: &GatewayState,
@@ -1293,7 +1355,12 @@ async fn handle_non_streaming(
     start: Instant,
     endpoint_id: Option<Uuid>,
     beta_ctx: Option<BetaRetryContext>,
+    mut mcpgov_guard: Option<crate::mcpgov::response::ResponseGuard>,
 ) -> Response {
+    // `request_id` is moved into the spend log before the response is assembled, so
+    // keep a copy for the refusal pass that runs after it.
+    let request_id_for_mcpgov = request_id.clone();
+
     let result = runtime_client
         .invoke_model()
         .model_id(bedrock_model)
@@ -1398,10 +1465,15 @@ async fn handle_non_streaming(
                                             endpoint_id,
                                         })
                                         .await;
-                                    let normalized = response::normalize_response(
+                                    let mut normalized = response::normalize_response(
                                         resp,
                                         original_model,
                                         Some(&state.model_cache),
+                                    );
+                                    mcpgov_refuse(
+                                        &mut mcpgov_guard,
+                                        &mut normalized,
+                                        &request_id_for_mcpgov,
                                     );
                                     Json(normalized).into_response()
                                 }
@@ -1485,11 +1557,12 @@ async fn handle_non_streaming(
                         })
                         .await;
 
-                    let normalized = response::normalize_response(
+                    let mut normalized = response::normalize_response(
                         resp,
                         original_model,
                         Some(&state.model_cache),
                     );
+                    mcpgov_refuse(&mut mcpgov_guard, &mut normalized, &request_id_for_mcpgov);
                     Json(normalized).into_response()
                 }
                 Err(e) => {
@@ -1568,6 +1641,7 @@ async fn handle_streaming(
     start: Instant,
     endpoint_id: Option<Uuid>,
     beta_ctx: Option<BetaRetryContext>,
+    mut mcpgov_guard: Option<crate::mcpgov::response::ResponseGuard>,
 ) -> Response {
     let result = runtime_client
         .invoke_model_with_response_stream()
@@ -1704,14 +1778,39 @@ async fn handle_streaming(
                                                     _ => {}
                                                 }
 
-                                                let normalized = streaming::normalize_stream_event(
+                                                let mut normalized = streaming::normalize_stream_event(
                                                     event_json,
                                                     &original_model,
                                                     Some(&model_cache),
                                                 );
 
+                                                // Refuse denied tool calls on the way out. A
+                                                // refused block is rewritten into text, its
+                                                // argument deltas are dropped, and the turn
+                                                // ends instead of asking the client to run
+                                                // something it is not allowed to run.
+                                                let mut follow_up = None;
+                                                if let Some(g) = mcpgov_guard.as_mut() {
+                                                    match g.on_stream_event(&mut normalized) {
+                                                        crate::mcpgov::response::StreamAction::Drop => continue,
+                                                        crate::mcpgov::response::StreamAction::ForwardThen(extra) => {
+                                                            follow_up = Some(extra);
+                                                        }
+                                                        crate::mcpgov::response::StreamAction::Forward => {}
+                                                    }
+                                                }
+
                                                 let sse_text = streaming::format_sse_event(&event_type, &normalized);
                                                 yield Ok::<_, std::convert::Infallible>(sse_text);
+
+                                                if let Some(extra) = follow_up {
+                                                    let extra_type = extra
+                                                        .get("type")
+                                                        .and_then(|t| t.as_str())
+                                                        .unwrap_or("content_block_delta")
+                                                        .to_string();
+                                                    yield Ok(streaming::format_sse_event(&extra_type, &extra));
+                                                }
                                             }
                                             Err(e) => {
                                                 tracing::warn!(%e, "Failed to parse stream chunk as JSON");
@@ -1845,7 +1944,12 @@ async fn handle_with_web_search(
     endpoint_id: Option<Uuid>,
     websearch_mode: &str,
     beta_retry_ctx: Option<BetaRetryContext>,
+    mut mcpgov_guard: Option<crate::mcpgov::response::ResponseGuard>,
 ) -> Response {
+    // `request_id` is moved into the spend log before the response is assembled, so keep
+    // a copy for the refusal pass that runs after it.
+    let request_id_for_mcpgov = request_id.clone();
+
     // Resolve search provider: "global" mode uses admin-configured global provider,
     // otherwise fall back to per-user provider (which defaults to DuckDuckGo).
     let search_provider = if websearch_mode == "global" {
@@ -2158,7 +2262,7 @@ async fn handle_with_web_search(
         .record(RequestLogEntry {
             key_id: identity.key_id,
             user_identity: identity.user_identity,
-            request_id,
+            request_id: request_id_for_mcpgov.clone(),
             model: original_model.to_string(),
             streaming: is_streaming,
             duration_ms: start.elapsed().as_millis() as i32,
@@ -2199,6 +2303,15 @@ async fn handle_with_web_search(
             "cache_read_input_tokens": total_cache_read,
         }
     });
+
+    // This path builds its own response, so it needs its own refusal pass. It runs
+    // non-streaming internally even for streaming clients, so one call covers both.
+    let mut final_response = final_response;
+    mcpgov_refuse(
+        &mut mcpgov_guard,
+        &mut final_response,
+        &request_id_for_mcpgov,
+    );
 
     if is_streaming {
         // Synthesize SSE events from the non-streaming response
