@@ -8,6 +8,7 @@ pub mod config;
 pub mod db;
 pub mod detection;
 pub mod endpoint;
+pub mod mcpgov;
 pub mod migrations;
 pub mod pricing;
 pub mod proxy;
