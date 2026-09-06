@@ -78,8 +78,15 @@ impl ModelCache {
 
     /// Reverse lookup: bedrock model ID -> anthropic display name.
     /// First tries an exact-match fast path against known bedrock_suffix values,
-    /// then falls back to the existing `contains` scan (for rows where the suffix
+    /// then falls back to a boundary-aware stem scan (for rows where the suffix
     /// doesn't appear verbatim in the profile ID).
+    ///
+    /// NULL-display fallback: when a matched row has `anthropic_display = None`
+    /// (as written by auto-discovery via `build_mapping_row`), the row's
+    /// `anthropic_prefix` is returned instead of `None`. This prevents the
+    /// greedy-prefix bug class where a NULL-display row returns `None` early,
+    /// forcing the fallback scan to pick up the wrong parent-model row.
+    ///
     /// Uses `try_read()` to avoid blocking; returns None on contention.
     pub fn lookup_reverse(&self, bedrock_model: &str) -> Option<String> {
         let guard = self.inner.try_read().ok()?;
@@ -91,16 +98,30 @@ impl ModelCache {
                 && bedrock_model.ends_with(suffix.as_str())
                 && bedrock_model.as_bytes()[bedrock_model.len() - suffix.len() - 1] == b'.';
             if bedrock_model == suffix.as_str() || dotted_match {
-                return m.anthropic_display.clone();
+                // NULL-display fallback: prefer display; on None fall back to prefix.
+                // Never return None from a matched row — that would abort the scan
+                // and let the greedy contains fallback win incorrectly.
+                return Some(
+                    m.anthropic_display
+                        .clone()
+                        .unwrap_or_else(|| m.anthropic_prefix.clone()),
+                );
             }
         }
 
-        // Fallback: contains scan (existing behaviour)
+        // Fallback: boundary-aware stem scan. Uses `bedrock_stem_matches` instead
+        // of bare `contains` to avoid the greedy-prefix bug (e.g. the `claude-fable-5`
+        // stem must not match `claude-fable-5-1` profile IDs). Cross-reference
+        // `bedrock_stem_matches` for the full boundary rule.
         for m in guard.values() {
-            if bedrock_model.contains(&m.bedrock_suffix)
-                || bedrock_model.contains(&m.anthropic_prefix)
+            if bedrock_stem_matches(bedrock_model, &m.bedrock_suffix)
+                || bedrock_stem_matches(bedrock_model, &m.anthropic_prefix)
             {
-                return m.anthropic_display.clone();
+                return Some(
+                    m.anthropic_display
+                        .clone()
+                        .unwrap_or_else(|| m.anthropic_prefix.clone()),
+                );
             }
         }
         None
@@ -141,6 +162,48 @@ fn is_minor_version_bearing(s: &str) -> bool {
             if !a.is_empty() && a.bytes().all(|c| c.is_ascii_digit())
             && !b.is_empty() && b.bytes().all(|c| c.is_ascii_digit())
     )
+}
+
+/// Return true when `haystack` contains `stem` AND the characters immediately
+/// following the matched stem do NOT indicate a distinct minor version.
+///
+/// **Boundary rule** (guards the greedy-prefix bug class; mirrors the discipline
+/// of `is_minor_version_bearing` on the forward path):
+/// - `-<1–3 digits>` after the stem → different model, **do not match**
+///   (e.g. `claude-fable-5` stem must not match `…claude-fable-5-1`).
+/// - End-of-string, `:`, `-v<digit(s)>`, or `-<8 digits>` (date) after the
+///   stem → same model, **match**.
+/// - Any other continuation → match (conservative default).
+///
+/// Cross-reference `is_minor_version_bearing` for the symmetric guard on the
+/// forward lookup path (`lookup_forward_with_fallback`).
+fn bedrock_stem_matches(haystack: &str, stem: &str) -> bool {
+    let Some(pos) = haystack.find(stem) else {
+        return false;
+    };
+    let after = &haystack[pos + stem.len()..];
+    if after.is_empty() || after.starts_with(':') {
+        return true;
+    }
+    if let Some(rest) = after.strip_prefix('-') {
+        // -v<digits>: version suffix — same model
+        if rest.starts_with('v') && rest.len() > 1 && rest.as_bytes()[1].is_ascii_digit() {
+            return true;
+        }
+        let digit_count = rest.bytes().take_while(|b| b.is_ascii_digit()).count();
+        // 8-digit date suffix — same model
+        if digit_count == 8 {
+            return true;
+        }
+        // 1–3 digit minor version — different model
+        if (1..=3).contains(&digit_count) {
+            return false;
+        }
+        // No leading digits or other length — match (conservative default)
+        return true;
+    }
+    // Other continuation (not '-' or ':') — match
+    true
 }
 
 /// Select the best matching inference profile ID using three ordered passes:
@@ -330,6 +393,7 @@ pub fn anthropic_to_bedrock(model: &str, prefix: &str, model_cache: Option<&Mode
 /// Hardcoded forward mapping (no-DB fallback).
 fn hardcoded_anthropic_to_bedrock(model: &str, prefix: &str) -> String {
     match model {
+        "claude-fable-5-1" => format!("{prefix}.anthropic.claude-fable-5-1"),
         "claude-fable-5" => format!("{prefix}.anthropic.claude-fable-5"),
         "claude-opus-4-7" => format!("{prefix}.anthropic.claude-opus-4-7"),
         "claude-opus-4-6" | "claude-opus-4-6-20250605" => {
@@ -400,16 +464,30 @@ pub fn bedrock_to_anthropic(model: &str, model_cache: Option<&ModelCache>) -> St
 }
 
 /// Hardcoded reverse mapping (no-DB fallback).
+///
+/// Uses `bedrock_stem_matches` for all arms so that a minor-version profile
+/// (e.g. `claude-fable-5-1`) is never collapsed into a parent-model arm
+/// (e.g. `claude-fable-5`). Arms for known minor versions must appear before
+/// their parent arms so the more-specific match wins.
 fn hardcoded_bedrock_to_anthropic(model: &str) -> String {
     match model {
-        s if s.contains("claude-fable-5") => "claude-fable-5".to_string(),
-        s if s.contains("claude-opus-4-7") => "claude-opus-4-7".to_string(),
-        s if s.contains("claude-opus-4-6") => "claude-opus-4-6-20250605".to_string(),
-        s if s.contains("claude-sonnet-4-6") => "claude-sonnet-4-6-20250514".to_string(),
-        s if s.contains("claude-opus-4-5") => "claude-opus-4-5-20251101".to_string(),
-        s if s.contains("claude-sonnet-4-5") => "claude-sonnet-4-5-20250929".to_string(),
-        s if s.contains("claude-sonnet-4-2025") => "claude-sonnet-4-20250514".to_string(),
-        s if s.contains("claude-haiku-4-5") => "claude-haiku-4-5-20251001".to_string(),
+        // Minor versions before their parent (more-specific first)
+        s if bedrock_stem_matches(s, "claude-fable-5-1") => "claude-fable-5-1".to_string(),
+        // Parent models
+        s if bedrock_stem_matches(s, "claude-fable-5") => "claude-fable-5".to_string(),
+        s if bedrock_stem_matches(s, "claude-opus-4-7") => "claude-opus-4-7".to_string(),
+        s if bedrock_stem_matches(s, "claude-opus-4-6") => "claude-opus-4-6-20250605".to_string(),
+        s if bedrock_stem_matches(s, "claude-sonnet-4-6") => {
+            "claude-sonnet-4-6-20250514".to_string()
+        }
+        s if bedrock_stem_matches(s, "claude-opus-4-5") => "claude-opus-4-5-20251101".to_string(),
+        s if bedrock_stem_matches(s, "claude-sonnet-4-5") => {
+            "claude-sonnet-4-5-20250929".to_string()
+        }
+        s if bedrock_stem_matches(s, "claude-sonnet-4-2025") => {
+            "claude-sonnet-4-20250514".to_string()
+        }
+        s if bedrock_stem_matches(s, "claude-haiku-4-5") => "claude-haiku-4-5-20251001".to_string(),
         other => other.to_string(),
     }
 }
@@ -1695,6 +1773,343 @@ mod tests_task2_migration_runner {
         assert_eq!(
             EXPECTED_REASON,
             "migrated from inference_profile_arn column"
+        );
+    }
+}
+
+// ── Reverse-map minor-version fix tests ──────────────────────────────────────
+//
+// These tests define the contract for three related bugs that cause
+// `global.anthropic.claude-fable-5-1` to vanish from `/v1/models`:
+//
+//   Bug A: `hardcoded_bedrock_to_anthropic` — greedy `contains("claude-fable-5")`
+//           collapses `claude-fable-5-1` into `claude-fable-5`.
+//   Bug B: `hardcoded_anthropic_to_bedrock` — no arm for `claude-fable-5-1`,
+//           so forward mapping returns the bare id dotless instead of
+//           `{prefix}.anthropic.claude-fable-5-1`.
+//   Bug C: `ModelCache::lookup_reverse` — returns `m.anthropic_display.clone()`
+//           which is `None` for auto-discovered rows; scan aborts instead of
+//           falling back to `anthropic_prefix`.
+//
+// Tests are labelled [FAIL] (must fail before the fix) or [PASS-REGRESSION]
+// (must pass both before and after the fix).
+#[cfg(test)]
+mod tests_reverse_map_minor_version {
+    use super::*;
+
+    // ── Section A: hardcoded reverse mapping — minor-version collapse ──────────
+
+    /// [FAIL] Bug A: `global.anthropic.claude-fable-5-1` must reverse-map to
+    /// `"claude-fable-5-1"`, not `"claude-fable-5"`.
+    ///
+    /// Currently `hardcoded_bedrock_to_anthropic` uses `s.contains("claude-fable-5")`
+    /// which greedily matches `claude-fable-5-1` and returns the parent id.
+    /// The fix must be boundary-aware: a `-<1-3 digit>` suffix after the stem means
+    /// a distinct minor version, not a continuation of the parent.
+    #[test]
+    fn test_reverse_fable_5_1_not_collapsed_to_fable_5() {
+        for prefix in &["us", "au", "apac", "eu", "global"] {
+            let bedrock_id = format!("{}.anthropic.claude-fable-5-1", prefix);
+            let result = bedrock_to_anthropic(&bedrock_id, None);
+            assert_eq!(
+                result, "claude-fable-5-1",
+                "prefix '{}': '{}' must reverse-map to 'claude-fable-5-1', \
+                 not 'claude-fable-5' (greedy-contains bug)",
+                prefix, bedrock_id
+            );
+        }
+    }
+
+    /// [FAIL] Bug A (hypothetical future minor): `us.anthropic.claude-opus-4-7-1`
+    /// must NOT collapse into `"claude-opus-4-7"`.
+    ///
+    /// The rule: a `-<1-3 digit>` continuation after the stem is a different model.
+    /// Returning the id unchanged (passthrough) is acceptable; returning the parent
+    /// id is not.
+    #[test]
+    fn test_reverse_future_minor_not_collapsed() {
+        let result = bedrock_to_anthropic("us.anthropic.claude-opus-4-7-1", None);
+        assert_ne!(
+            result, "claude-opus-4-7",
+            "'us.anthropic.claude-opus-4-7-1' must NOT collapse to 'claude-opus-4-7'; \
+             returning the id unchanged is acceptable, returning the parent is not"
+        );
+    }
+
+    /// [PASS-REGRESSION] `{prefix}.anthropic.claude-fable-5` must still reverse-map
+    /// to `"claude-fable-5"` after the fix.
+    #[test]
+    fn test_reverse_fable_5_still_maps_correctly() {
+        for prefix in &["us", "au", "apac", "eu", "global"] {
+            let bedrock_id = format!("{}.anthropic.claude-fable-5", prefix);
+            assert_eq!(
+                bedrock_to_anthropic(&bedrock_id, None),
+                "claude-fable-5",
+                "prefix '{}': regression — 'claude-fable-5' must still reverse-map correctly",
+                prefix
+            );
+        }
+    }
+
+    /// [PASS-REGRESSION] All existing canonical reverse mappings survive the fix.
+    ///
+    /// The distinguishing rule encoded in these assertions:
+    ///   - `-v<n>` and `-<8-digit>` continuations belong to the same model, keep matching.
+    ///   - `:0` suffix is also same-model.
+    ///   - `-<1-3 digit>` continuation is a DIFFERENT model, must NOT match.
+    #[test]
+    fn test_reverse_canonical_mappings_regression() {
+        // Bare stem forms
+        assert_eq!(
+            bedrock_to_anthropic("us.anthropic.claude-opus-4-7", None),
+            "claude-opus-4-7",
+            "regression: claude-opus-4-7 bare stem"
+        );
+        // -v1 continuation: same model
+        assert_eq!(
+            bedrock_to_anthropic("us.anthropic.claude-opus-4-6-v1", None),
+            "claude-opus-4-6-20250605",
+            "regression: claude-opus-4-6-v1 must map to dated form"
+        );
+        // date suffix continuation: same model
+        assert_eq!(
+            bedrock_to_anthropic("us.anthropic.claude-sonnet-4-6", None),
+            "claude-sonnet-4-6-20250514",
+            "regression: claude-sonnet-4-6"
+        );
+        // -v1:0 continuation: same model
+        assert_eq!(
+            bedrock_to_anthropic("us.anthropic.claude-opus-4-5-20251101-v1:0", None),
+            "claude-opus-4-5-20251101",
+            "regression: claude-opus-4-5-20251101-v1:0"
+        );
+        assert_eq!(
+            bedrock_to_anthropic("us.anthropic.claude-sonnet-4-5-20250929-v1:0", None),
+            "claude-sonnet-4-5-20250929",
+            "regression: claude-sonnet-4-5-20250929-v1:0"
+        );
+        assert_eq!(
+            bedrock_to_anthropic("us.anthropic.claude-sonnet-4-20250514-v1:0", None),
+            "claude-sonnet-4-20250514",
+            "regression: claude-sonnet-4-20250514-v1:0"
+        );
+        assert_eq!(
+            bedrock_to_anthropic("us.anthropic.claude-haiku-4-5-20251001-v1:0", None),
+            "claude-haiku-4-5-20251001",
+            "regression: claude-haiku-4-5-20251001-v1:0"
+        );
+        // Unrelated id: passes through unchanged
+        let unrelated = "us.amazon.nova-2-lite-v1:0";
+        assert_eq!(
+            bedrock_to_anthropic(unrelated, None),
+            unrelated,
+            "regression: unrelated id must pass through unchanged"
+        );
+    }
+
+    // ── Section B: forward mapping — claude-fable-5-1 must map correctly ──────
+
+    /// [FAIL] Bug B: `anthropic_to_bedrock("claude-fable-5-1", prefix, None)` must
+    /// return `"{prefix}.anthropic.claude-fable-5-1"` for all standard prefixes.
+    ///
+    /// Currently there is no hardcoded arm for `claude-fable-5-1`; it falls to the
+    /// `other => other.to_string()` passthrough and returns `"claude-fable-5-1"` (dotless).
+    /// The fix must add a boundary-aware arm or generic minor-version logic.
+    #[test]
+    fn test_forward_fable_5_1_all_prefixes() {
+        for prefix in &["us", "au", "apac", "eu", "global"] {
+            let result = anthropic_to_bedrock("claude-fable-5-1", prefix, None);
+            assert_eq!(
+                result,
+                format!("{}.anthropic.claude-fable-5-1", prefix),
+                "forward: 'claude-fable-5-1' with prefix '{}' must yield '{}.anthropic.claude-fable-5-1' \
+                 (dotless passthrough is the current bug)",
+                prefix,
+                prefix
+            );
+        }
+    }
+
+    /// [PASS-REGRESSION] `claude-fable-5` forward mapping must still work after the fix.
+    #[test]
+    fn test_forward_fable_5_regression() {
+        for prefix in &["us", "au", "apac", "eu", "global"] {
+            assert_eq!(
+                anthropic_to_bedrock("claude-fable-5", prefix, None),
+                format!("{}.anthropic.claude-fable-5", prefix),
+                "regression: 'claude-fable-5' forward mapping with prefix '{}'",
+                prefix
+            );
+        }
+    }
+
+    /// [PASS-REGRESSION] `claude-fable-5-1[1m]` must strip the suffix and map
+    /// identically to the bare `claude-fable-5-1` id.
+    ///
+    /// This asserts the suffix-strip contract is applied before the model lookup,
+    /// so variant ids route to the same Bedrock profile as their bare counterpart.
+    #[test]
+    fn test_forward_fable_5_1_with_1m_suffix_same_as_bare() {
+        // Both should produce the same result (suffix stripped, then same lookup).
+        // After the fix both should return "us.anthropic.claude-fable-5-1".
+        // Before the fix both return "claude-fable-5-1" (dotless) — they match each
+        // other, so this is a pure regression guard.
+        let with_suffix = anthropic_to_bedrock("claude-fable-5-1[1m]", "us", None);
+        let bare = anthropic_to_bedrock("claude-fable-5-1", "us", None);
+        assert_eq!(
+            with_suffix, bare,
+            "regression: 'claude-fable-5-1[1m]' must strip suffix and produce the \
+             same Bedrock id as the bare 'claude-fable-5-1'"
+        );
+    }
+
+    // ── Section C: ModelCache::lookup_reverse — NULL-display fallback ──────────
+
+    /// [FAIL] Bug C: a cache row with `anthropic_display = None` (as set by
+    /// auto-discovery) must fall back to `anthropic_prefix` rather than returning
+    /// `None` and aborting the scan.
+    ///
+    /// This test populates the cache with the exact shape `discover_model` writes
+    /// (no display, bare prefix), then asserts `lookup_reverse` returns the prefix.
+    #[tokio::test]
+    async fn test_cache_reverse_null_display_falls_back_to_prefix() {
+        let cache = ModelCache::new();
+        // Auto-discovery inserts rows with anthropic_display = None.
+        cache
+            .insert(CachedMapping {
+                anthropic_prefix: "claude-fable-5-1".to_string(),
+                bedrock_suffix: "anthropic.claude-fable-5-1".to_string(),
+                anthropic_display: None, // exactly what build_mapping_row writes
+            })
+            .await;
+
+        let result = cache.lookup_reverse("global.anthropic.claude-fable-5-1");
+        assert_eq!(
+            result,
+            Some("claude-fable-5-1".to_string()),
+            "lookup_reverse must fall back to anthropic_prefix when display is NULL; \
+             got: {:?}",
+            result
+        );
+    }
+
+    /// [FAIL] Bug C (both rows, fable-5 also without display): `lookup_reverse`
+    /// for `claude-fable-5` must also return `Some("claude-fable-5")` even when
+    /// its row has `anthropic_display = None`.
+    #[tokio::test]
+    async fn test_cache_reverse_null_display_fable_5() {
+        let cache = ModelCache::new();
+        cache
+            .insert(CachedMapping {
+                anthropic_prefix: "claude-fable-5".to_string(),
+                bedrock_suffix: "anthropic.claude-fable-5".to_string(),
+                anthropic_display: None,
+            })
+            .await;
+
+        let result = cache.lookup_reverse("global.anthropic.claude-fable-5");
+        assert_eq!(
+            result,
+            Some("claude-fable-5".to_string()),
+            "lookup_reverse must fall back to anthropic_prefix for claude-fable-5 too; \
+             got: {:?}",
+            result
+        );
+    }
+
+    /// [FAIL] Bug C (both rows present, order-independent):
+    /// With both `claude-fable-5` and `claude-fable-5-1` rows in the cache (both
+    /// with `anthropic_display = None`), `lookup_reverse` must correctly resolve
+    /// each without collapsing.
+    ///
+    /// HashMap iteration order is non-deterministic, so each assertion must hold
+    /// regardless of which row is visited first in the scan.
+    #[tokio::test]
+    async fn test_cache_reverse_null_display_two_rows_no_collapse() {
+        let cache = ModelCache::new();
+        // Insert 5 first, then 5-1 (order should not matter)
+        cache
+            .insert(CachedMapping {
+                anthropic_prefix: "claude-fable-5".to_string(),
+                bedrock_suffix: "anthropic.claude-fable-5".to_string(),
+                anthropic_display: None,
+            })
+            .await;
+        cache
+            .insert(CachedMapping {
+                anthropic_prefix: "claude-fable-5-1".to_string(),
+                bedrock_suffix: "anthropic.claude-fable-5-1".to_string(),
+                anthropic_display: None,
+            })
+            .await;
+
+        assert_eq!(
+            cache.lookup_reverse("global.anthropic.claude-fable-5-1"),
+            Some("claude-fable-5-1".to_string()),
+            "lookup_reverse with both rows: 'global.anthropic.claude-fable-5-1' \
+             must resolve to 'claude-fable-5-1', not 'claude-fable-5' or None"
+        );
+        assert_eq!(
+            cache.lookup_reverse("global.anthropic.claude-fable-5"),
+            Some("claude-fable-5".to_string()),
+            "lookup_reverse with both rows: 'global.anthropic.claude-fable-5' \
+             must resolve to 'claude-fable-5'"
+        );
+    }
+
+    /// [FAIL] Bug C (reverse insertion order): same as above with 5-1 inserted first.
+    /// Confirms the result does not depend on insertion order.
+    #[tokio::test]
+    async fn test_cache_reverse_null_display_two_rows_reverse_order() {
+        let cache = ModelCache::new();
+        // Insert 5-1 first, then 5
+        cache
+            .insert(CachedMapping {
+                anthropic_prefix: "claude-fable-5-1".to_string(),
+                bedrock_suffix: "anthropic.claude-fable-5-1".to_string(),
+                anthropic_display: None,
+            })
+            .await;
+        cache
+            .insert(CachedMapping {
+                anthropic_prefix: "claude-fable-5".to_string(),
+                bedrock_suffix: "anthropic.claude-fable-5".to_string(),
+                anthropic_display: None,
+            })
+            .await;
+
+        assert_eq!(
+            cache.lookup_reverse("global.anthropic.claude-fable-5-1"),
+            Some("claude-fable-5-1".to_string()),
+            "lookup_reverse (reverse insertion order): 'global.anthropic.claude-fable-5-1' \
+             must resolve to 'claude-fable-5-1'"
+        );
+        assert_eq!(
+            cache.lookup_reverse("global.anthropic.claude-fable-5"),
+            Some("claude-fable-5".to_string()),
+            "lookup_reverse (reverse insertion order): 'global.anthropic.claude-fable-5' \
+             must resolve to 'claude-fable-5'"
+        );
+    }
+
+    /// [PASS-REGRESSION] A row WITH `anthropic_display = Some(...)` must still
+    /// return the display value, not fall back to the prefix.
+    #[tokio::test]
+    async fn test_cache_reverse_with_display_uses_display_value() {
+        let cache = ModelCache::new();
+        cache
+            .insert(CachedMapping {
+                anthropic_prefix: "claude-sonnet-4-6".to_string(),
+                bedrock_suffix: "anthropic.claude-sonnet-4-6".to_string(),
+                anthropic_display: Some("claude-sonnet-4-6-20250514".to_string()),
+            })
+            .await;
+
+        assert_eq!(
+            cache.lookup_reverse("us.anthropic.claude-sonnet-4-6"),
+            Some("claude-sonnet-4-6-20250514".to_string()),
+            "regression: a row with Some(display) must still return the display value, \
+             not the prefix"
         );
     }
 }
