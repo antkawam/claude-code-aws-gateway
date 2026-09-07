@@ -5296,3 +5296,151 @@ mod tests_reverse_map_display {
         );
     }
 }
+
+// ── Section E: end-to-end advertising with junk cache rows present ────────────
+//
+// These tests wire up the exact prod junk-row cache state into the full
+// `bedrock_to_anthropic` → `build_models_response_with_variants` pipeline and
+// assert that the advertised list reflects canonical ids derived from
+// `bedrock_suffix`, not the junk `anthropic_prefix` aliases.
+//
+// Complements `tests_canonical_id_derivation` (in src/translate/models.rs) which
+// covers the `ModelCache::lookup_reverse` unit contract in isolation.
+#[cfg(test)]
+mod tests_canonical_id_advertising {
+    use super::*;
+
+    /// [FAIL] With the prod junk cache rows, `bedrock_to_anthropic` must yield the
+    /// correct canonical ids rather than the junk `anthropic_prefix` aliases.
+    ///
+    /// Pre-fix: `"global.anthropic.claude-fable-5"` maps to `"fable-5"` or
+    /// `"claude-fable"` depending on HashMap iteration order.
+    /// Post-fix: both must derive `"claude-fable-5"` from the `bedrock_suffix`.
+    #[tokio::test]
+    async fn test_junk_cache_yields_canonical_ids() {
+        let cache = models::ModelCache::new();
+        cache
+            .insert(models::CachedMapping {
+                anthropic_prefix: "claude-fable".to_string(),
+                bedrock_suffix: "anthropic.claude-fable-5".to_string(),
+                anthropic_display: None,
+            })
+            .await;
+        cache
+            .insert(models::CachedMapping {
+                anthropic_prefix: "fable-5".to_string(),
+                bedrock_suffix: "anthropic.claude-fable-5".to_string(),
+                anthropic_display: None,
+            })
+            .await;
+        cache
+            .insert(models::CachedMapping {
+                anthropic_prefix: "claude-fable-5-1".to_string(),
+                bedrock_suffix: "anthropic.claude-fable-5-1".to_string(),
+                anthropic_display: None,
+            })
+            .await;
+
+        let id_5 = models::bedrock_to_anthropic("global.anthropic.claude-fable-5", Some(&cache));
+        assert_eq!(
+            id_5, "claude-fable-5",
+            "junk cache: bedrock_to_anthropic must return 'claude-fable-5', not a junk \
+             alias; got: {id_5}"
+        );
+
+        let id_5_1 =
+            models::bedrock_to_anthropic("global.anthropic.claude-fable-5-1", Some(&cache));
+        assert_eq!(
+            id_5_1, "claude-fable-5-1",
+            "junk cache: bedrock_to_anthropic must return 'claude-fable-5-1'; got: {id_5_1}"
+        );
+    }
+
+    /// [FAIL] End-to-end: prod junk cache state → `build_models_response_with_variants`
+    /// must advertise `"claude-fable-5"` (display "Claude Fable 5") and
+    /// `"claude-fable-5-1"` (display "Claude Fable 5.1"), and must NOT advertise
+    /// `"fable-5"` or `"claude-fable"`.
+    #[tokio::test]
+    async fn test_junk_cache_models_response_canonical() {
+        let cache = models::ModelCache::new();
+        cache
+            .insert(models::CachedMapping {
+                anthropic_prefix: "claude-fable".to_string(),
+                bedrock_suffix: "anthropic.claude-fable-5".to_string(),
+                anthropic_display: None,
+            })
+            .await;
+        cache
+            .insert(models::CachedMapping {
+                anthropic_prefix: "fable-5".to_string(),
+                bedrock_suffix: "anthropic.claude-fable-5".to_string(),
+                anthropic_display: None,
+            })
+            .await;
+        cache
+            .insert(models::CachedMapping {
+                anthropic_prefix: "claude-fable-5-1".to_string(),
+                bedrock_suffix: "anthropic.claude-fable-5-1".to_string(),
+                anthropic_display: None,
+            })
+            .await;
+
+        // Simulate the list_models pipeline: map raw Bedrock IDs to Anthropic ids.
+        let bedrock_ids = [
+            "global.anthropic.claude-fable-5".to_string(),
+            "global.anthropic.claude-fable-5-1".to_string(),
+        ];
+        let pairs: Vec<(String, String)> = bedrock_ids
+            .iter()
+            .map(|bedrock_id| {
+                let anthropic_id = models::bedrock_to_anthropic(bedrock_id, Some(&cache));
+                (anthropic_id, bedrock_id.clone())
+            })
+            .collect();
+
+        let suffix_map: &[(&str, &str, &str)] = &[];
+        let json = build_models_response_with_variants(&pairs, |_profile, _beta| None, suffix_map);
+        let data = json["data"]
+            .as_array()
+            .expect("response must have 'data' array");
+        let ids: Vec<&str> = data.iter().map(|m| m["id"].as_str().unwrap()).collect();
+
+        assert!(
+            ids.contains(&"claude-fable-5"),
+            "'claude-fable-5' must be advertised; got: {ids:?}"
+        );
+        assert!(
+            ids.contains(&"claude-fable-5-1"),
+            "'claude-fable-5-1' must be advertised; got: {ids:?}"
+        );
+        assert!(
+            !ids.contains(&"fable-5"),
+            "junk alias 'fable-5' must NOT be advertised; got: {ids:?}"
+        );
+        assert!(
+            !ids.contains(&"claude-fable"),
+            "junk alias 'claude-fable' must NOT be advertised; got: {ids:?}"
+        );
+
+        // Display names must match canonical rendering.
+        let fable5 = data
+            .iter()
+            .find(|m| m["id"].as_str() == Some("claude-fable-5"))
+            .expect("claude-fable-5 entry must exist");
+        assert_eq!(
+            fable5["display_name"].as_str(),
+            Some("Claude Fable 5"),
+            "'claude-fable-5' display_name must be 'Claude Fable 5'"
+        );
+
+        let fable51 = data
+            .iter()
+            .find(|m| m["id"].as_str() == Some("claude-fable-5-1"))
+            .expect("claude-fable-5-1 entry must exist");
+        assert_eq!(
+            fable51["display_name"].as_str(),
+            Some("Claude Fable 5.1"),
+            "'claude-fable-5-1' display_name must be 'Claude Fable 5.1'"
+        );
+    }
+}

@@ -82,10 +82,12 @@ impl ModelCache {
     /// doesn't appear verbatim in the profile ID).
     ///
     /// NULL-display fallback: when a matched row has `anthropic_display = None`
-    /// (as written by auto-discovery via `build_mapping_row`), the row's
-    /// `anthropic_prefix` is returned instead of `None`. This prevents the
-    /// greedy-prefix bug class where a NULL-display row returns `None` early,
-    /// forcing the fallback scan to pick up the wrong parent-model row.
+    /// (as written by auto-discovery via `build_mapping_row`), the canonical id is
+    /// derived from the row's `bedrock_suffix` via
+    /// `derive_canonical_from_bedrock_suffix`. Only if that derivation yields
+    /// nothing (empty result) is `anthropic_prefix` used. Using the suffix makes
+    /// the result deterministic: every alias row that shares a `bedrock_suffix`
+    /// derives the same id regardless of `HashMap` iteration order.
     ///
     /// Uses `try_read()` to avoid blocking; returns None on contention.
     pub fn lookup_reverse(&self, bedrock_model: &str) -> Option<String> {
@@ -98,14 +100,12 @@ impl ModelCache {
                 && bedrock_model.ends_with(suffix.as_str())
                 && bedrock_model.as_bytes()[bedrock_model.len() - suffix.len() - 1] == b'.';
             if bedrock_model == suffix.as_str() || dotted_match {
-                // NULL-display fallback: prefer display; on None fall back to prefix.
-                // Never return None from a matched row — that would abort the scan
-                // and let the greedy contains fallback win incorrectly.
-                return Some(
-                    m.anthropic_display
-                        .clone()
-                        .unwrap_or_else(|| m.anthropic_prefix.clone()),
-                );
+                // Prefer explicit display name; if None, derive canonical from suffix.
+                // Fall back to anthropic_prefix only when derivation yields nothing.
+                return Some(m.anthropic_display.clone().unwrap_or_else(|| {
+                    derive_canonical_from_bedrock_suffix(&m.bedrock_suffix)
+                        .unwrap_or_else(|| m.anthropic_prefix.clone())
+                }));
             }
         }
 
@@ -117,11 +117,10 @@ impl ModelCache {
             if bedrock_stem_matches(bedrock_model, &m.bedrock_suffix)
                 || bedrock_stem_matches(bedrock_model, &m.anthropic_prefix)
             {
-                return Some(
-                    m.anthropic_display
-                        .clone()
-                        .unwrap_or_else(|| m.anthropic_prefix.clone()),
-                );
+                return Some(m.anthropic_display.clone().unwrap_or_else(|| {
+                    derive_canonical_from_bedrock_suffix(&m.bedrock_suffix)
+                        .unwrap_or_else(|| m.anthropic_prefix.clone())
+                }));
             }
         }
         None
@@ -132,6 +131,67 @@ impl ModelCache {
         let mut guard = self.inner.write().await;
         guard.insert(mapping.anthropic_prefix.clone(), mapping);
     }
+}
+
+/// Derive a canonical Anthropic model id from a Bedrock suffix.
+///
+/// Why this exists: `anthropic_prefix` in `model_mappings` holds the *exact string
+/// a client once requested*, not a canonical id — because auto-discovery keys each
+/// row on the requested id (`build_mapping_row`). Typos (`fable-5`, `claude-fable`)
+/// and date-stamped ids (`claude-haiku-4-5-20251001`) all become permanent rows.
+/// Falling back to `anthropic_prefix` when `anthropic_display` is `NULL` therefore
+/// surfaces those junk aliases in `/v1/models` and in response `model` fields.
+///
+/// The bedrock_suffix is authoritative: it encodes the actual model identity
+/// (`anthropic.claude-fable-5`). Stripping the vendor segment and trailing version
+/// tag yields a stable canonical id regardless of which alias requested the model.
+///
+/// Algorithm:
+/// 1. If `suffix` contains `.`, take everything after the first `.`; otherwise use
+///    the whole suffix (no vendor segment to strip, e.g. bare `claude-fable-5`).
+/// 2. Strip any trailing `-v<digits>(:<digits>)?` version tag.
+/// 3. Return `None` if the result is empty; otherwise `Some(result)`.
+pub fn derive_canonical_from_bedrock_suffix(suffix: &str) -> Option<String> {
+    // Step 1: strip vendor segment (everything up to and including the first '.')
+    let after_vendor = match suffix.find('.') {
+        Some(i) => &suffix[i + 1..],
+        None => suffix,
+    };
+    if after_vendor.is_empty() {
+        return None;
+    }
+    // Step 2: strip trailing -v<digits>(:<digits>)?
+    let canonical = strip_bedrock_version_tag(after_vendor);
+    if canonical.is_empty() {
+        None
+    } else {
+        Some(canonical.to_string())
+    }
+}
+
+/// Strip a trailing `-v<digits>(:<digits>)?` version tag, e.g.
+/// `claude-opus-4-6-v1` → `claude-opus-4-6`,
+/// `claude-haiku-4-5-20251001-v1:0` → `claude-haiku-4-5-20251001`.
+fn strip_bedrock_version_tag(s: &str) -> &str {
+    // Walk backwards: optional `:<digits>`, then `-v<digits>`
+    let s = if let Some(colon_pos) = s.rfind(':') {
+        let after_colon = &s[colon_pos + 1..];
+        if !after_colon.is_empty() && after_colon.bytes().all(|b| b.is_ascii_digit()) {
+            &s[..colon_pos]
+        } else {
+            s
+        }
+    } else {
+        s
+    };
+    // Now strip -v<digits> at the end
+    if let Some(v_pos) = s.rfind("-v") {
+        let after_v = &s[v_pos + 2..];
+        if !after_v.is_empty() && after_v.bytes().all(|b| b.is_ascii_digit()) {
+            return &s[..v_pos];
+        }
+    }
+    s
 }
 
 /// Strip a YYYYMMDD date suffix from a model ID.
@@ -2110,6 +2170,490 @@ mod tests_reverse_map_minor_version {
             Some("claude-sonnet-4-6-20250514".to_string()),
             "regression: a row with Some(display) must still return the display value, \
              not the prefix"
+        );
+    }
+}
+
+// ── Canonical-id-from-bedrock-suffix fix tests ────────────────────────────────
+//
+// 1.9.6 introduced a NULL-display fallback in `lookup_reverse`: when
+// `anthropic_display = None`, it falls back to `anthropic_prefix`. This is wrong
+// because `anthropic_prefix` is the exact model string a client once requested —
+// auto-discovery inserts it as-is via `build_mapping_row`, so junk aliases like
+// `"fable-5"` or `"claude-fable"` become permanent rows.
+//
+// Observed prod state after the 1.9.6 deploy:
+//   anthropic_prefix | bedrock_suffix              | display_null
+//   -----------------+----------------------------+-------------
+//   claude-fable     | anthropic.claude-fable-5   | t
+//   fable-5          | anthropic.claude-fable-5   | t
+//   claude-fable-5-1 | anthropic.claude-fable-5-1 | t
+//
+// Two junk alias rows point at the same Bedrock profile. Which one surfaces in
+// `/v1/models` depends on `HashMap` iteration order → non-deterministic.
+//
+// The fix: when `anthropic_display = None`, derive the canonical id from
+// `bedrock_suffix` (strip leading vendor segment, strip trailing `-v<n>(:<n>)?`).
+// Fall back to `anthropic_prefix` only when derivation yields an empty string.
+#[cfg(test)]
+mod tests_canonical_id_derivation {
+    use super::*;
+
+    // ── Section A: canonical id is derived from bedrock_suffix, not anthropic_prefix ──
+
+    /// [FAIL] Both junk alias rows point at the same `bedrock_suffix`.
+    /// `lookup_reverse("global.anthropic.claude-fable-5")` must return
+    /// `"claude-fable-5"` (derived from suffix), NOT `"fable-5"` or `"claude-fable"`.
+    ///
+    /// Current behaviour: returns whichever junk `anthropic_prefix` the HashMap
+    /// iterates to first — non-deterministic, always wrong.
+    #[tokio::test]
+    async fn test_canonical_from_suffix_not_junk_prefix_global() {
+        let cache = ModelCache::new();
+        // Exact prod rows from the 1.9.6 regression
+        cache
+            .insert(CachedMapping {
+                anthropic_prefix: "claude-fable".to_string(),
+                bedrock_suffix: "anthropic.claude-fable-5".to_string(),
+                anthropic_display: None,
+            })
+            .await;
+        cache
+            .insert(CachedMapping {
+                anthropic_prefix: "fable-5".to_string(),
+                bedrock_suffix: "anthropic.claude-fable-5".to_string(),
+                anthropic_display: None,
+            })
+            .await;
+        cache
+            .insert(CachedMapping {
+                anthropic_prefix: "claude-fable-5-1".to_string(),
+                bedrock_suffix: "anthropic.claude-fable-5-1".to_string(),
+                anthropic_display: None,
+            })
+            .await;
+
+        let result = cache.lookup_reverse("global.anthropic.claude-fable-5");
+        assert_eq!(
+            result,
+            Some("claude-fable-5".to_string()),
+            "prod junk rows: must derive 'claude-fable-5' from bedrock_suffix, \
+             not return junk anthropic_prefix; got: {result:?}"
+        );
+    }
+
+    /// [FAIL] Same as above but with the `us.` regional prefix.
+    #[tokio::test]
+    async fn test_canonical_from_suffix_not_junk_prefix_us() {
+        let cache = ModelCache::new();
+        cache
+            .insert(CachedMapping {
+                anthropic_prefix: "claude-fable".to_string(),
+                bedrock_suffix: "anthropic.claude-fable-5".to_string(),
+                anthropic_display: None,
+            })
+            .await;
+        cache
+            .insert(CachedMapping {
+                anthropic_prefix: "fable-5".to_string(),
+                bedrock_suffix: "anthropic.claude-fable-5".to_string(),
+                anthropic_display: None,
+            })
+            .await;
+
+        let result = cache.lookup_reverse("us.anthropic.claude-fable-5");
+        assert_eq!(
+            result,
+            Some("claude-fable-5".to_string()),
+            "lookup_reverse('us.anthropic.claude-fable-5') must yield 'claude-fable-5'; \
+             got: {result:?}"
+        );
+    }
+
+    /// [PASS-REGRESSION] 1.9.6 fix guard: `claude-fable-5-1` row must still resolve
+    /// correctly. The `anthropic_prefix` for this row happens to equal the correct
+    /// canonical id, so both the old fallback and the new derivation return the same
+    /// value.
+    #[tokio::test]
+    async fn test_canonical_fable_5_1_regression_guard() {
+        let cache = ModelCache::new();
+        cache
+            .insert(CachedMapping {
+                anthropic_prefix: "claude-fable-5-1".to_string(),
+                bedrock_suffix: "anthropic.claude-fable-5-1".to_string(),
+                anthropic_display: None,
+            })
+            .await;
+
+        let result = cache.lookup_reverse("global.anthropic.claude-fable-5-1");
+        assert_eq!(
+            result,
+            Some("claude-fable-5-1".to_string()),
+            "1.9.6 regression guard: 'global.anthropic.claude-fable-5-1' must resolve to \
+             'claude-fable-5-1'; got: {result:?}"
+        );
+    }
+
+    // ── Section B: determinism regardless of insertion / iteration order ──────────
+
+    /// [FAIL] Insert junk rows in order (claude-fable first, then fable-5).
+    /// Result must be `"claude-fable-5"` regardless of which row HashMap visits first.
+    #[tokio::test]
+    async fn test_canonical_order_fable_then_fable5() {
+        let cache = ModelCache::new();
+        cache
+            .insert(CachedMapping {
+                anthropic_prefix: "claude-fable".to_string(),
+                bedrock_suffix: "anthropic.claude-fable-5".to_string(),
+                anthropic_display: None,
+            })
+            .await;
+        cache
+            .insert(CachedMapping {
+                anthropic_prefix: "fable-5".to_string(),
+                bedrock_suffix: "anthropic.claude-fable-5".to_string(),
+                anthropic_display: None,
+            })
+            .await;
+
+        let result = cache.lookup_reverse("global.anthropic.claude-fable-5");
+        assert_eq!(
+            result,
+            Some("claude-fable-5".to_string()),
+            "order (claude-fable then fable-5): must return 'claude-fable-5'; got: {result:?}"
+        );
+    }
+
+    /// [FAIL] Insert junk rows in reverse order (fable-5 first, then claude-fable).
+    /// Result must be the same `"claude-fable-5"`.
+    #[tokio::test]
+    async fn test_canonical_order_fable5_then_fable() {
+        let cache = ModelCache::new();
+        cache
+            .insert(CachedMapping {
+                anthropic_prefix: "fable-5".to_string(),
+                bedrock_suffix: "anthropic.claude-fable-5".to_string(),
+                anthropic_display: None,
+            })
+            .await;
+        cache
+            .insert(CachedMapping {
+                anthropic_prefix: "claude-fable".to_string(),
+                bedrock_suffix: "anthropic.claude-fable-5".to_string(),
+                anthropic_display: None,
+            })
+            .await;
+
+        let result = cache.lookup_reverse("global.anthropic.claude-fable-5");
+        assert_eq!(
+            result,
+            Some("claude-fable-5".to_string()),
+            "order (fable-5 then claude-fable): must return 'claude-fable-5'; got: {result:?}"
+        );
+    }
+
+    /// [FAIL] Rebuild 50 independent `ModelCache` instances (each gets a fresh
+    /// `HashMap::new()` with a new `RandomState`, so iteration order varies across
+    /// rebuilds) and assert every result is `"claude-fable-5"`.
+    ///
+    /// This is the nondeterminism stress test. The pre-fix code returns whichever
+    /// junk `anthropic_prefix` the HashMap happens to iterate to first, which can
+    /// change between process runs. After the fix, derivation from `bedrock_suffix`
+    /// yields the same deterministic canonical id regardless of iteration order.
+    #[tokio::test]
+    async fn test_canonical_stable_across_50_rebuilds() {
+        for i in 0..50u32 {
+            // New ModelCache = new HashMap with new RandomState (different iteration order).
+            let cache = ModelCache::new();
+            // Alternate insertion order to vary HashMap layout further.
+            if i % 2 == 0 {
+                cache
+                    .insert(CachedMapping {
+                        anthropic_prefix: "claude-fable".to_string(),
+                        bedrock_suffix: "anthropic.claude-fable-5".to_string(),
+                        anthropic_display: None,
+                    })
+                    .await;
+                cache
+                    .insert(CachedMapping {
+                        anthropic_prefix: "fable-5".to_string(),
+                        bedrock_suffix: "anthropic.claude-fable-5".to_string(),
+                        anthropic_display: None,
+                    })
+                    .await;
+            } else {
+                cache
+                    .insert(CachedMapping {
+                        anthropic_prefix: "fable-5".to_string(),
+                        bedrock_suffix: "anthropic.claude-fable-5".to_string(),
+                        anthropic_display: None,
+                    })
+                    .await;
+                cache
+                    .insert(CachedMapping {
+                        anthropic_prefix: "claude-fable".to_string(),
+                        bedrock_suffix: "anthropic.claude-fable-5".to_string(),
+                        anthropic_display: None,
+                    })
+                    .await;
+            }
+
+            let result = cache.lookup_reverse("global.anthropic.claude-fable-5");
+            assert_eq!(
+                result,
+                Some("claude-fable-5".to_string()),
+                "rebuild #{i}: expected 'claude-fable-5' but got {result:?} — \
+                 result must not depend on HashMap iteration order"
+            );
+        }
+    }
+
+    // ── Section C: derivation rules for bedrock_suffix ─────────────────────────
+    //
+    // Tests the suffix-to-canonical-id derivation through `lookup_reverse`.
+    // Each test uses a single synthetic row: `anthropic_prefix = "JUNK"` so the
+    // pre-fix code returns `Some("JUNK")`, and `anthropic_display = None`.
+    // Post-fix: `lookup_reverse` must return the id derived from `bedrock_suffix`.
+    //
+    // Derivation algorithm the builder must implement:
+    //   1. Find the first '.' in `bedrock_suffix`.
+    //      - If found: use everything after that dot.
+    //      - If not found: use the whole suffix (no vendor segment to strip).
+    //   2. Strip any trailing `-v<digits>(:<digits>)?` pattern.
+    //   3. If the result is empty: fall back to `anthropic_prefix`.
+
+    /// [FAIL] `anthropic.claude-fable-5` → `claude-fable-5`
+    /// (strip leading `anthropic.` vendor segment)
+    #[tokio::test]
+    async fn test_derive_anthropic_fable_5() {
+        let cache = ModelCache::new();
+        cache
+            .insert(CachedMapping {
+                anthropic_prefix: "JUNK".to_string(),
+                bedrock_suffix: "anthropic.claude-fable-5".to_string(),
+                anthropic_display: None,
+            })
+            .await;
+        assert_eq!(
+            cache.lookup_reverse("anthropic.claude-fable-5"),
+            Some("claude-fable-5".to_string()),
+            "suffix 'anthropic.claude-fable-5': strip vendor → 'claude-fable-5'; \
+             pre-fix returns 'JUNK'"
+        );
+    }
+
+    /// [FAIL] `anthropic.claude-fable-5-1` → `claude-fable-5-1`
+    /// (minor version segment is preserved, not stripped)
+    #[tokio::test]
+    async fn test_derive_anthropic_fable_5_1() {
+        let cache = ModelCache::new();
+        cache
+            .insert(CachedMapping {
+                anthropic_prefix: "JUNK".to_string(),
+                bedrock_suffix: "anthropic.claude-fable-5-1".to_string(),
+                anthropic_display: None,
+            })
+            .await;
+        assert_eq!(
+            cache.lookup_reverse("anthropic.claude-fable-5-1"),
+            Some("claude-fable-5-1".to_string()),
+            "suffix 'anthropic.claude-fable-5-1': strip vendor, keep minor version → \
+             'claude-fable-5-1'; pre-fix returns 'JUNK'"
+        );
+    }
+
+    /// [FAIL] `anthropic.claude-opus-4-7` → `claude-opus-4-7`
+    #[tokio::test]
+    async fn test_derive_anthropic_opus_4_7() {
+        let cache = ModelCache::new();
+        cache
+            .insert(CachedMapping {
+                anthropic_prefix: "JUNK".to_string(),
+                bedrock_suffix: "anthropic.claude-opus-4-7".to_string(),
+                anthropic_display: None,
+            })
+            .await;
+        assert_eq!(
+            cache.lookup_reverse("anthropic.claude-opus-4-7"),
+            Some("claude-opus-4-7".to_string()),
+            "suffix 'anthropic.claude-opus-4-7': strip vendor → 'claude-opus-4-7'; \
+             pre-fix returns 'JUNK'"
+        );
+    }
+
+    /// [FAIL] `anthropic.claude-opus-4-6-v1` → `claude-opus-4-6`
+    /// (strip vendor segment AND trailing `-v1` version suffix)
+    #[tokio::test]
+    async fn test_derive_anthropic_opus_4_6_v1() {
+        let cache = ModelCache::new();
+        cache
+            .insert(CachedMapping {
+                anthropic_prefix: "JUNK".to_string(),
+                bedrock_suffix: "anthropic.claude-opus-4-6-v1".to_string(),
+                anthropic_display: None,
+            })
+            .await;
+        assert_eq!(
+            cache.lookup_reverse("anthropic.claude-opus-4-6-v1"),
+            Some("claude-opus-4-6".to_string()),
+            "suffix 'anthropic.claude-opus-4-6-v1': strip vendor + '-v1' → 'claude-opus-4-6'; \
+             pre-fix returns 'JUNK'"
+        );
+    }
+
+    /// [FAIL] `anthropic.claude-haiku-4-5-20251001-v1:0` → `claude-haiku-4-5-20251001`
+    /// (strip vendor AND `-v1:0`; the 8-digit date is part of the canonical id)
+    #[tokio::test]
+    async fn test_derive_haiku_4_5_full_suffix() {
+        let cache = ModelCache::new();
+        cache
+            .insert(CachedMapping {
+                anthropic_prefix: "JUNK".to_string(),
+                bedrock_suffix: "anthropic.claude-haiku-4-5-20251001-v1:0".to_string(),
+                anthropic_display: None,
+            })
+            .await;
+        assert_eq!(
+            cache.lookup_reverse("anthropic.claude-haiku-4-5-20251001-v1:0"),
+            Some("claude-haiku-4-5-20251001".to_string()),
+            "suffix 'anthropic.claude-haiku-4-5-20251001-v1:0': strip vendor + '-v1:0' → \
+             'claude-haiku-4-5-20251001'; pre-fix returns 'JUNK'"
+        );
+    }
+
+    /// [FAIL] `anthropic.claude-sonnet-4-20250514-v1:0` → `claude-sonnet-4-20250514`
+    #[tokio::test]
+    async fn test_derive_sonnet_4_with_date_v1() {
+        let cache = ModelCache::new();
+        cache
+            .insert(CachedMapping {
+                anthropic_prefix: "JUNK".to_string(),
+                bedrock_suffix: "anthropic.claude-sonnet-4-20250514-v1:0".to_string(),
+                anthropic_display: None,
+            })
+            .await;
+        assert_eq!(
+            cache.lookup_reverse("anthropic.claude-sonnet-4-20250514-v1:0"),
+            Some("claude-sonnet-4-20250514".to_string()),
+            "suffix 'anthropic.claude-sonnet-4-20250514-v1:0': strip vendor + '-v1:0' → \
+             'claude-sonnet-4-20250514'; pre-fix returns 'JUNK'"
+        );
+    }
+
+    /// [FAIL] Non-Anthropic vendor: `amazon.nova-2-lite-v1:0` → `nova-2-lite`
+    ///
+    /// The same algorithm applies regardless of vendor: strip the segment before the
+    /// first dot (`amazon`), then strip the `-v1:0` version suffix → `nova-2-lite`.
+    /// Asserting `nova-2-lite` rather than preserving the version suffix ensures
+    /// CCAG doesn't advertise version-suffixed ids for non-Anthropic models.
+    #[tokio::test]
+    async fn test_derive_amazon_nova() {
+        let cache = ModelCache::new();
+        cache
+            .insert(CachedMapping {
+                anthropic_prefix: "JUNK".to_string(),
+                bedrock_suffix: "amazon.nova-2-lite-v1:0".to_string(),
+                anthropic_display: None,
+            })
+            .await;
+        assert_eq!(
+            cache.lookup_reverse("amazon.nova-2-lite-v1:0"),
+            Some("nova-2-lite".to_string()),
+            "Non-Anthropic suffix 'amazon.nova-2-lite-v1:0': strip 'amazon.' vendor + \
+             '-v1:0' version suffix → 'nova-2-lite'; pre-fix returns 'JUNK'"
+        );
+    }
+
+    /// [FAIL] Degenerate no-dot suffix `"claude-fable-5"` → `"claude-fable-5"`
+    ///
+    /// When `bedrock_suffix` contains no dot, there is no vendor segment to strip.
+    /// The whole suffix is used as-is (after stripping any version suffix, of which
+    /// there is none here). Pre-fix: returns `"JUNK"` (the `anthropic_prefix`).
+    #[tokio::test]
+    async fn test_derive_no_dot_passthrough() {
+        let cache = ModelCache::new();
+        cache
+            .insert(CachedMapping {
+                anthropic_prefix: "JUNK".to_string(),
+                bedrock_suffix: "claude-fable-5".to_string(),
+                anthropic_display: None,
+            })
+            .await;
+        assert_eq!(
+            cache.lookup_reverse("claude-fable-5"),
+            Some("claude-fable-5".to_string()),
+            "No-dot suffix 'claude-fable-5': no vendor to strip, use whole suffix → \
+             'claude-fable-5'; pre-fix returns 'JUNK'"
+        );
+    }
+
+    /// [PASS-REGRESSION] Empty suffix must NOT panic and must fall back to
+    /// `anthropic_prefix` (derivation of `""` yields `""`, triggering the fallback).
+    #[tokio::test]
+    async fn test_derive_empty_suffix_no_panic() {
+        let cache = ModelCache::new();
+        cache
+            .insert(CachedMapping {
+                anthropic_prefix: "fallback-model".to_string(),
+                bedrock_suffix: "".to_string(),
+                anthropic_display: None,
+            })
+            .await;
+        // Must not panic. If the row is matched, result must not be an empty string.
+        let result = cache.lookup_reverse("some-bedrock-model");
+        if let Some(ref id) = result {
+            assert!(
+                !id.is_empty(),
+                "fallback from empty suffix must not produce an empty id"
+            );
+        }
+    }
+
+    /// [PASS-REGRESSION] Dot-only suffix `"."` must NOT panic.
+    ///
+    /// Stripping the vendor from `"."` yields `""` (empty after the dot), which
+    /// triggers the fallback to `anthropic_prefix`. The result is deterministic:
+    /// `Some("fallback-model")`.
+    #[tokio::test]
+    async fn test_derive_dot_only_no_panic() {
+        let cache = ModelCache::new();
+        cache
+            .insert(CachedMapping {
+                anthropic_prefix: "fallback-model".to_string(),
+                bedrock_suffix: ".".to_string(),
+                anthropic_display: None,
+            })
+            .await;
+        // Exact match on "." in the fast path; derivation yields "" → fallback to prefix.
+        let result = cache.lookup_reverse(".");
+        assert_eq!(
+            result,
+            Some("fallback-model".to_string()),
+            "dot-only suffix: derivation yields empty string → fallback to anthropic_prefix"
+        );
+    }
+
+    // ── Section D: rows WITH a display value are unaffected ─────────────────────
+
+    /// [PASS-REGRESSION] A row with `anthropic_display = Some(...)` must return the
+    /// display value, not the suffix-derived id. The display value always wins over
+    /// derivation.
+    #[tokio::test]
+    async fn test_display_wins_over_derivation() {
+        let cache = ModelCache::new();
+        cache
+            .insert(CachedMapping {
+                anthropic_prefix: "claude-opus-4-6".to_string(),
+                bedrock_suffix: "anthropic.claude-opus-4-6-v1".to_string(),
+                anthropic_display: Some("claude-opus-4-6-20250605".to_string()),
+            })
+            .await;
+        let result = cache.lookup_reverse("us.anthropic.claude-opus-4-6-v1");
+        assert_eq!(
+            result,
+            Some("claude-opus-4-6-20250605".to_string()),
+            "Some(display) must win over suffix derivation: expected \
+             'claude-opus-4-6-20250605'; got: {result:?}"
         );
     }
 }
