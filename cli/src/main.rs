@@ -76,6 +76,10 @@ enum Commands {
     #[command(subcommand)]
     Betas(commands::betas::BetasCommands),
 
+    /// Govern MCP servers and tool access
+    #[command(subcommand)]
+    Mcp(commands::mcp::McpCommands),
+
     /// Check deployment status and health
     Status(commands::status::StatusArgs),
 
@@ -132,6 +136,7 @@ async fn main() -> anyhow::Result<()> {
         Commands::Idps(cmd) => commands::idps::run(cmd, cli.url, cli.token).await,
         Commands::Scim(cmd) => commands::scim::run(cmd, cli.url, cli.token).await,
         Commands::Betas(cmd) => commands::betas::run(cmd, cli.url, cli.token).await,
+        Commands::Mcp(cmd) => commands::mcp::run(cmd, cli.url, cli.token).await,
         Commands::Status(args) => commands::status::run(args, cli.url).await,
         Commands::Logs(args) => commands::logs::run(args).await,
         Commands::Update => commands::update::run().await,
