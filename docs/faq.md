@@ -284,6 +284,89 @@ In ECS, update the `RUST_LOG` environment variable in the task definition and re
 
 ---
 
+## Podman
+
+CCAG works with Podman and `podman-compose` as a drop-in replacement for Docker Compose. However, rootless Podman has several common issues.
+
+### Image pull fails with "insufficient UIDs or GIDs available in user namespace"
+
+This means Podman cannot map container UIDs into your user namespace. You need subordinate UID/GID ranges allocated for your user in `/etc/subuid` and `/etc/subgid`.
+
+**If you are a domain user** (e.g., Active Directory, LDAP, AWS WorkSpaces), Podman may look up your fully-qualified username (e.g., `user@domain.com`) rather than the short login name. Check with:
+
+```bash
+podman unshare cat /proc/self/uid_map
+```
+
+If you see `size: 1`, the mappings are not working. The most reliable fix is to add entries using your **numeric UID** (which avoids username resolution issues):
+
+```bash
+# Find your UID
+id -u
+
+# Add subordinate ranges by UID (replace 1000 with your UID)
+sudo sh -c 'echo "1000:200000:65536" >> /etc/subuid'
+sudo sh -c 'echo "1000:200000:65536" >> /etc/subgid'
+
+# Reset Podman storage to pick up the new mappings
+podman system reset --force
+```
+
+Verify the fix:
+
+```bash
+podman unshare cat /proc/self/uid_map
+# Should show: 0 <your-uid> 1
+#              1 200000     65536
+```
+
+### Container fails with "OCI runtime error: unknown version specified"
+
+This occurs when Podman uses an outdated `crun` OCI runtime. Check:
+
+```bash
+podman info | grep -A3 ociRuntime
+```
+
+If the `crun` package version is old (e.g., 0.17) but you have a newer `crun` installed elsewhere (e.g., via Homebrew), point Podman to it:
+
+```bash
+mkdir -p ~/.config/containers
+cat > ~/.config/containers/containers.conf << 'EOF'
+[engine]
+runtime = "/path/to/newer/crun"
+EOF
+```
+
+Find the newer binary with `which -a crun` and verify its version with `crun --version`.
+
+### AWS SSO credentials fail with "Permission denied" or "no valid credentials"
+
+Rootless Podman remaps UIDs inside the container. When `~/.aws` is mounted into the container, the files appear owned by `nobody` and are unreadable by the container process.
+
+**Workaround:** Export temporary credentials from your SSO session and pass them as environment variables instead of relying on the volume mount:
+
+```bash
+# Ensure your SSO session is active
+aws sso login --profile your-profile
+
+# Export credentials and start the gateway
+eval $(aws configure export-credentials --profile your-profile --format env)
+podman-compose up -d
+```
+
+The `docker-compose.yml` already accepts `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, and `AWS_SESSION_TOKEN` as environment variables, which take precedence over the `~/.aws` mount.
+
+Note: SSO credentials are temporary (typically 1-12 hours). You will need to re-export them after they expire.
+
+**Shell alias for convenience:**
+
+```bash
+alias ccag-up='eval $(aws configure export-credentials --profile your-profile --format env) && podman-compose up -d'
+```
+
+---
+
 ## See Also
 
 - [Getting Started](getting-started.md): initial setup
