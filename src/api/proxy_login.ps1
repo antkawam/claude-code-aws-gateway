@@ -149,6 +149,10 @@ public class TrustAll {
         }
     }
 
+    # The gateway only creates the session when the browser loads $AuthUrl,
+    # which is usually after the first poll, so not_found means "not yet" until
+    # the session has been seen pending. Allow 30s for the browser to get there.
+    $sessionSeen = $false
     for ($i = 0; $i -lt 60; $i++) {
         try {
             $pollUrl = "$ProxyUrl/auth/cli/poll?session=$SessionId"
@@ -176,10 +180,22 @@ public class TrustAll {
                     if ($CachedToken) { Write-Output $CachedToken }
                     exit 1
                 }
-                { $_ -eq 'expired' -or $_ -eq 'not_found' } {
+                'not_found' {
+                    if ($sessionSeen -or $i -ge 14) {
+                        New-Item -ItemType File -Path $FailFile -Force | Out-Null
+                        if ($CachedToken) { Write-Output $CachedToken }
+                        exit 1
+                    }
+                    Start-Sleep -Seconds 2
+                }
+                'expired' {
                     New-Item -ItemType File -Path $FailFile -Force | Out-Null
                     if ($CachedToken) { Write-Output $CachedToken }
                     exit 1
+                }
+                'pending' {
+                    $sessionSeen = $true
+                    Start-Sleep -Seconds 2
                 }
                 default {
                     Start-Sleep -Seconds 2
