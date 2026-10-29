@@ -128,10 +128,16 @@ elif command -v wslview &>/dev/null; then
     wslview "$AUTH_URL" 2>/dev/null
 fi
 
-# Poll for token (2s interval, 2 min timeout)
+# Poll for token (2s interval, 2 min timeout). The gateway only creates the
+# session when the browser loads AUTH_URL, which is usually after the first
+# poll, so not_found means "not yet" until the session has been seen pending.
+# Allow 30s for the browser to get there.
+SESSION_SEEN=0
 for i in $(seq 1 60); do
     RESPONSE=$(curl -sk "${PROXY_URL}/auth/cli/poll?session=${SESSION_ID}" 2>/dev/null || echo '{}')
-    STATUS=$(echo "$RESPONSE" | grep -o '"status":"[^"]*"' | head -1 | cut -d'"' -f4)
+    # A failed poll yields '{}', which grep cannot match; "|| true" keeps
+    # pipefail from exiting the script so the next poll can retry.
+    STATUS=$(echo "$RESPONSE" | grep -o '"status":"[^"]*"' | head -1 | cut -d'"' -f4 || true)
 
     case "$STATUS" in
         complete)
@@ -148,12 +154,21 @@ for i in $(seq 1 60); do
             [ -n "$CACHED_TOKEN" ] && echo "$CACHED_TOKEN"
             exit 1
             ;;
-        expired|not_found)
+        not_found)
+            if [ "$SESSION_SEEN" -eq 1 ] || [ "$i" -ge 15 ]; then
+                touch "$FAIL_FILE"
+                [ -n "$CACHED_TOKEN" ] && echo "$CACHED_TOKEN"
+                exit 1
+            fi
+            sleep 2
+            ;;
+        expired)
             touch "$FAIL_FILE"
             [ -n "$CACHED_TOKEN" ] && echo "$CACHED_TOKEN"
             exit 1
             ;;
-        pending|"")
+        pending)
+            SESSION_SEEN=1
             sleep 2
             ;;
         *)
