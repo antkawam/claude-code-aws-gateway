@@ -340,6 +340,11 @@ async fn main() -> anyhow::Result<()> {
     // Start cache version polling loop (5s interval)
     start_cache_poll_loop(Arc::clone(&state));
 
+    // mcpgov overlay: load the MCP/tool policy cache and start its background tasks.
+    // Self-contained — it runs its own poll loop and buffered writers, so nothing
+    // inside start_cache_poll_loop above needs to know about it.
+    ccag::mcpgov::start(state.db().await).await;
+
     // Self-healing startup migration: populate endpoint_aip_overrides from the
     // legacy inference_profile_arn column for endpoints that haven't been migrated yet.
     {

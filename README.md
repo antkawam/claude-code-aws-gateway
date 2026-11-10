@@ -122,6 +122,32 @@ curl -fsSL https://your-gateway/setup | sh   # one command, fully configured
 - Rate limiting: per-key sliding window rate limiter
 - Spend tracking: async batch writes to Postgres with per-key analytics
 
+### MCP & Tool Governance
+
+Control which MCP servers and tools developers can actually use, enforced at the gateway instead of in client-side config a developer can edit.
+
+- **Auto-discovered catalog**: MCP servers and tools are recorded as they appear in live traffic, each with an approval status (pending, approved, denied). Nothing has to be registered by hand before it shows up.
+- **Policies resolved global → team → user**: allow and deny glob patterns matched against tool names (`mcp__github__*`), plus a default action for tools the catalog has no decision on yet.
+- **Three rollout modes**: `observe` decides and logs but never modifies a request, `warn` allows and flags, `enforce` actually strips denied tools. Start in observe, read the audit log, then tighten.
+- **Scoped to MCP by default**: `mcp_only` leaves built-in tools (Read, Write, Bash) untouched. `all_tools` governs those too.
+- **Enforced in both directions**: denied tool definitions are removed from the request, denied `tool_use` blocks are refused on the way back including under streaming, and denied calls are scrubbed from the conversation history so the model does not learn to retry them.
+- **Simulator**: answer "what would this user actually see?" without sending a request.
+- **Audit trail**: every non-allow decision recorded with user, team, tool, mode, and reason.
+
+Manage it from the admin portal or the CLI:
+
+```bash
+ccag mcp status                                   # current posture and catalog counts
+ccag mcp servers                                  # discovered MCP servers
+ccag mcp set-server github --status approved
+ccag mcp set-policy --scope global --mode enforce --deny 'mcp__*__delete_*'
+ccag mcp set-policy --scope team --ref <team-uuid> --mode enforce --allow 'mcp__github__*'
+ccag mcp simulate --user dev@example.com --denied-only
+ccag mcp events --decision blocked
+```
+
+Enforcement lives in the request path, so it applies however the developer configured their client. That is deliberate: Claude Code's own MCP controls are client-side, and server-managed settings are skipped entirely for any session with a custom `ANTHROPIC_BASE_URL` — which is how CCAG is always used.
+
 ### Authentication
 
 Three-tier authentication for different use cases:
@@ -151,6 +177,7 @@ A built-in single-page application at `/portal` for:
 - Team administration
 - Identity provider configuration with SCIM provisioning setup
 - Gateway settings
+- MCP governance: server and tool catalog, policy editor, simulator, and audit log
 - Analytics dashboard with 4 tabs:
   - Spend: timeseries by team, spend by team/model/user, budget status, OLS cost forecast
   - Activity: active users over time (new vs returning), hourly request heatmap
