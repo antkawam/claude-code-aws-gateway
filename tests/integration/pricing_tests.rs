@@ -128,6 +128,46 @@ async fn estimate_cost_full_breakdown() {
 }
 
 // ============================================================
+// estimate_cost_usd: cross-region inference profile ids
+// ============================================================
+
+/// A client may send a cross-region inference profile id ("us.anthropic.claude-...").
+/// It must price the same as the bare id, not NULL ($0.00, and skipped by budgets).
+#[tokio::test]
+async fn estimate_cost_strips_region_prefix() {
+    let pool = helpers::setup_test_db().await;
+
+    for model in [
+        "claude-sonnet-4-6",
+        "us.anthropic.claude-sonnet-4-6",
+        "eu.anthropic.claude-sonnet-4-6",
+        "apac.anthropic.claude-sonnet-4-6",
+        "global.anthropic.claude-sonnet-4-6",
+    ] {
+        let cost: Option<f64> =
+            sqlx::query_scalar("SELECT estimate_cost_usd($1, 1000000, 0, 0, 0)")
+                .bind(model)
+                .fetch_one(&pool)
+                .await
+                .expect("estimate_cost_usd query must succeed");
+
+        assert_eq!(
+            cost,
+            Some(3.0),
+            "{model}: 1M input tokens should cost $3.00"
+        );
+    }
+
+    // An unknown model still prices as NULL once the prefix is stripped.
+    let unknown: Option<f64> = sqlx::query_scalar("SELECT estimate_cost_usd($1, 1000000, 0, 0, 0)")
+        .bind("us.anthropic.not-a-real-model")
+        .fetch_one(&pool)
+        .await
+        .expect("estimate_cost_usd query must succeed");
+    assert_eq!(unknown, None, "unknown model must price as NULL");
+}
+
+// ============================================================
 // estimate_cost_usd: unknown model returns NULL
 // ============================================================
 
