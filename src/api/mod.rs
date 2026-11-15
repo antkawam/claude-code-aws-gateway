@@ -22,13 +22,165 @@ use crate::proxy::GatewayState;
 
 static PORTAL_HTML: &str = include_str!("../../static/index.html");
 
+/// Gate the inference routes BEFORE the request body is read.
+///
+/// Axum runs extractors in parameter order and the handler body only after they all succeed, so
+/// `Json(body)` in `handlers::messages` buffers and deserializes the WHOLE request before that
+/// handler's own `check_auth` call runs. Without this guard an unauthenticated caller could make
+/// the gateway allocate and parse up to `MAX_INFERENCE_BODY_BYTES` before receiving its 401, and
+/// the per-key rate limiter, which runs after auth, would never see it.
+///
+/// Auth is deliberately re-run inside the handler rather than threaded through request
+/// extensions, so this layer cannot silently become a single point of failure for
+/// authentication. The duplicate cost is small: a virtual key is a SHA-256 and a map read, a
+/// gateway session token is an HMAC check, and OIDC uses cached JWKS (a cold cache or unknown
+/// `kid` still fetches at most once per request, because this guard short-circuits on failure).
+/// The guard uses `check_auth_silent` so the success-path log lines are not emitted twice.
+///
+/// On an auth failure the unread body is streamed away and discarded (see
+/// `discard_request_body`) before the 401 is returned. Replying and closing with the body still
+/// in flight can make a reverse proxy's write fail with a broken pipe, and it then answers 502
+/// instead of relaying the 401, so a client with an expired token never learns it must refresh.
+///
+/// It also normalises the body-limit rejection: axum answers an oversized body with a bare
+/// `text/plain` 413, whereas every other error from this gateway is an Anthropic-shaped JSON
+/// envelope that clients know how to display.
+async fn guard_inference_request(
+    axum::extract::State(state): axum::extract::State<Arc<GatewayState>>,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    if let Err(resp) = handlers::check_auth_silent(req.headers(), &state).await {
+        // A client waiting on `Expect: 100-continue` has not sent the body and will not; reading
+        // would only make hyper invite it.
+        if !req.headers().contains_key(axum::http::header::EXPECT) {
+            discard_request_body(req.into_body(), &AUTH_FAIL_DRAINS).await;
+        }
+        return resp;
+    }
+
+    let resp = next.run(req).await;
+
+    if resp.status() == axum::http::StatusCode::PAYLOAD_TOO_LARGE
+        && resp
+            .headers()
+            .get(axum::http::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .is_none_or(|ct| !ct.starts_with("application/json"))
+    {
+        // Nothing else logs this: `error_response` emits no tracing event and the router has no
+        // TraceLayer, so without this line an oversized request is refused silently.
+        tracing::warn!(
+            limit_bytes = MAX_INFERENCE_BODY_BYTES,
+            "Rejected request: body exceeds the inference body limit"
+        );
+        return handlers::error_response(
+            axum::http::StatusCode::PAYLOAD_TOO_LARGE,
+            "invalid_request_error",
+            &format!(
+                "Request body exceeds the {} MB limit. Reduce the size of the conversation \
+                 or attachments and retry.",
+                MAX_INFERENCE_BODY_BYTES / (1024 * 1024)
+            ),
+        );
+    }
+    resp
+}
+
+/// Most body bytes read and thrown away for a request that failed auth. A larger body is cut off
+/// with the remainder unread, so a reverse proxy in front may still answer 502 instead of the 401.
+const AUTH_FAIL_DRAIN_MAX_BYTES: usize = 16 * 1024 * 1024;
+
+/// Longest the discard may take, so a slow sender cannot hold a connection open. A refused
+/// request may wait up to this long for its 401.
+const AUTH_FAIL_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Most discards running at once. Past this a refused request gets its 401 immediately without
+/// draining, so a burst of slow invalid-token requests cannot pin more than this
+/// many connections for the timeout.
+const AUTH_FAIL_DRAIN_MAX_CONCURRENT: usize = 64;
+
+static AUTH_FAIL_DRAINS: tokio::sync::Semaphore =
+    tokio::sync::Semaphore::const_new(AUTH_FAIL_DRAIN_MAX_CONCURRENT);
+
+/// Read and drop a request body chunk by chunk, holding none of it. Stops at the byte or time
+/// limit, on a stream error, or when too many discards are already running; the connection is then
+/// closed with the remainder unread.
+async fn discard_request_body(body: axum::body::Body, slots: &tokio::sync::Semaphore) {
+    use futures::StreamExt;
+
+    let Ok(_permit) = slots.try_acquire() else {
+        tracing::debug!("Auth-failure body discard skipped: too many in progress");
+        return;
+    };
+
+    let mut stream = body.into_data_stream();
+    let mut read = 0usize;
+    let finished = tokio::time::timeout(AUTH_FAIL_DRAIN_TIMEOUT, async {
+        loop {
+            match stream.next().await {
+                Some(Ok(chunk)) => {
+                    read += chunk.len();
+                    if read > AUTH_FAIL_DRAIN_MAX_BYTES {
+                        return false;
+                    }
+                }
+                Some(Err(_)) => return false,
+                None => return true,
+            }
+        }
+    })
+    .await;
+    if finished != Ok(true) {
+        tracing::debug!(
+            bytes_read = read,
+            "Auth-failure body discard stopped early; the client may see a reset instead of the 401"
+        );
+    }
+}
+
+/// Maximum request-body size for the inference endpoints.
+///
+/// Axum's `Json` extractor defaults to 2 MB, which is far below what a large-context request
+/// needs: roughly 4 chars per token means a 1M-token request is about 4 MB of JSON, so the
+/// default rejects it before any handler runs. 32 MB matches Anthropic's own documented request
+/// limit, so this gateway is not the stricter link in the chain.
+///
+/// Scoped to the two inference routes only. The admin API keeps axum's 2 MB default: nothing it
+/// accepts is large, and a permissive limit there would be needless memory pressure.
+///
+/// A body this size is buffered in memory before it is parsed, so task memory should allow for
+/// a few concurrent large requests. Any reverse proxy in front with its own body cap must also
+/// allow this size for large-context requests to reach the gateway.
+pub const MAX_INFERENCE_BODY_BYTES: usize = 32 * 1024 * 1024;
+
 pub fn router(state: Arc<GatewayState>) -> Router {
     Router::new()
         .route("/", get(|| async { Redirect::temporary("/portal") }))
         .route("/health", get(handlers::health))
         .route("/health/deep", get(handlers::health_deep))
-        .route("/v1/messages", post(handlers::messages))
-        .route("/v1/messages/count_tokens", post(handlers::count_tokens))
+        .route(
+            "/v1/messages",
+            post(handlers::messages)
+                .layer(axum::extract::DefaultBodyLimit::max(
+                    MAX_INFERENCE_BODY_BYTES,
+                ))
+                .layer(axum::middleware::from_fn_with_state(
+                    Arc::clone(&state),
+                    guard_inference_request,
+                )),
+        )
+        .route(
+            "/v1/messages/count_tokens",
+            post(handlers::count_tokens)
+                .layer(axum::extract::DefaultBodyLimit::max(
+                    MAX_INFERENCE_BODY_BYTES,
+                ))
+                .layer(axum::middleware::from_fn_with_state(
+                    Arc::clone(&state),
+                    guard_inference_request,
+                )),
+        )
         .route("/v1/models", get(handlers::list_models))
         // Admin API — Pricing
         .route("/admin/pricing", get(admin::list_pricing))
@@ -1245,5 +1397,320 @@ mod tests {
         assert!(!is_allowed_cors_origin(&HeaderValue::from_static(
             "https://evil.claude.ai.attacker.com"
         )));
+    }
+}
+
+/// Body-size limits on the inference routes, and the auth gate in front of them.
+#[cfg(test)]
+mod tests_body_limit {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use tower::ServiceExt;
+
+    const TEST_KEY: &str = "sk-test-body-limit";
+
+    /// A state whose in-memory key cache accepts `TEST_KEY`, so tests can get PAST the auth
+    /// gate and reach the body limit behind it. No DB or network is involved: `check_auth`
+    /// resolves virtual keys entirely from this cache.
+    async fn authed_state() -> Arc<GatewayState> {
+        let state = crate::api::handlers::tests_list_models_slice2::make_test_state(vec![]);
+        state.set_virtual_keys_enabled(true);
+        state
+            .key_cache
+            .insert(
+                crate::db::keys::hash_key(TEST_KEY),
+                crate::auth::CachedKey {
+                    id: uuid::Uuid::nil(),
+                    name: Some("body-limit test".to_string()),
+                    user_id: None,
+                    user_email: None,
+                    team_id: None,
+                    rate_limit_rpm: None,
+                },
+            )
+            .await;
+        state
+    }
+
+    /// `bytes` of payload that is NOT valid JSON. Used to prove the body was READ without
+    /// letting the request proceed into the handler (which would try to reach Bedrock):
+    /// a body that is too large fails at the limit with 413, while one that is merely
+    /// unparseable fails at deserialization with 400/422. The two are distinguishable.
+    fn unparseable_body(bytes: usize) -> String {
+        "a".repeat(bytes)
+    }
+
+    async fn post(
+        state: Arc<GatewayState>,
+        uri: &str,
+        key: Option<&str>,
+        body: String,
+    ) -> axum::response::Response {
+        let mut b = Request::builder()
+            .method("POST")
+            .uri(uri)
+            .header("content-type", "application/json");
+        if let Some(k) = key {
+            b = b.header("x-api-key", k);
+        }
+        router(state)
+            .oneshot(b.body(Body::from(body)).unwrap())
+            .await
+            .unwrap()
+    }
+
+    /// Axum runs extractors before the handler body, so without the guard an unauthenticated
+    /// caller could make this process buffer and parse up to 32 MB and only then get a 401, with
+    /// the per-key rate limiter never seeing the request because it runs after auth. A 401 here means the body was never buffered or parsed
+    /// (it is streamed away and dropped, see `failed_auth_consumes_the_body_before_returning_401`).
+    #[tokio::test]
+    async fn unauthenticated_large_body_is_never_buffered_or_parsed() {
+        let resp = post(
+            authed_state().await,
+            "/v1/messages",
+            None,
+            unparseable_body(4 * 1024 * 1024),
+        )
+        .await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::UNAUTHORIZED,
+            "an unauthenticated request must be refused on headers alone, not after buffering the body"
+        );
+    }
+
+    /// Axum's `Json` extractor defaults to 2 MB; a ~1M-token request is roughly 4 MB of JSON, so
+    /// on the default every large-context request fails with 413 before any handler runs. 400/422 here means the body got past the limit and
+    /// reached the JSON parser.
+    #[tokio::test]
+    async fn authenticated_body_over_axums_two_megabyte_default_is_accepted() {
+        let resp = post(
+            authed_state().await,
+            "/v1/messages",
+            Some(TEST_KEY),
+            unparseable_body(4 * 1024 * 1024),
+        )
+        .await;
+        assert_ne!(
+            resp.status(),
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "a 4 MB body (about a 1M-token request) must not be rejected for size"
+        );
+        assert!(
+            resp.status() == StatusCode::BAD_REQUEST
+                || resp.status() == StatusCode::UNPROCESSABLE_ENTITY,
+            "the body should have been read and failed at JSON parsing, got {}",
+            resp.status()
+        );
+    }
+
+    /// The cap is raised, not removed, and the rejection is an Anthropic-shaped JSON envelope
+    /// rather than axum's bare text/plain 413, which a client would render as an opaque error.
+    #[tokio::test]
+    async fn body_over_the_cap_is_rejected_as_json() {
+        let resp = post(
+            authed_state().await,
+            "/v1/messages",
+            Some(TEST_KEY),
+            unparseable_body(MAX_INFERENCE_BODY_BYTES + 1024 * 1024),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        let ct = resp
+            .headers()
+            .get(axum::http::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default()
+            .to_string();
+        assert!(
+            ct.starts_with("application/json"),
+            "a size rejection must use the gateway's JSON error envelope, got content-type {ct:?}"
+        );
+        let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            v["type"], "error",
+            "body was not the standard error envelope: {v}"
+        );
+    }
+
+    /// `count_tokens` carries the SAME pair of layers and must behave identically. Claude Code
+    /// sends full conversations there, so a limit that applied only to `/v1/messages` would let a
+    /// large context fail on a different route for a different reason.
+    #[tokio::test]
+    async fn count_tokens_is_guarded_and_raised_like_messages() {
+        let unauth = post(
+            authed_state().await,
+            "/v1/messages/count_tokens",
+            None,
+            unparseable_body(4 * 1024 * 1024),
+        )
+        .await;
+        assert_eq!(
+            unauth.status(),
+            StatusCode::UNAUTHORIZED,
+            "count_tokens must also authenticate before reading the body"
+        );
+
+        let authed = post(
+            authed_state().await,
+            "/v1/messages/count_tokens",
+            Some(TEST_KEY),
+            unparseable_body(4 * 1024 * 1024),
+        )
+        .await;
+        assert_ne!(
+            authed.status(),
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "count_tokens must accept a body over axum's 2 MB default"
+        );
+    }
+
+    /// A body of `total` bytes in 64 KiB chunks, plus a counter of the bytes the receiver pulled.
+    fn counted_body(total: usize) -> (Body, Arc<std::sync::atomic::AtomicUsize>) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let pulled = Arc::new(AtomicUsize::new(0));
+        let counter = pulled.clone();
+        let chunks = total.div_ceil(65536);
+        let stream = futures::stream::iter((0..chunks).map(move |i| {
+            let len = 65536.min(total - i * 65536);
+            counter.fetch_add(len, Ordering::SeqCst);
+            Ok::<_, std::io::Error>(axum::body::Bytes::from(vec![b'a'; len]))
+        }));
+        (Body::from_stream(stream), pulled)
+    }
+
+    async fn post_stream(state: Arc<GatewayState>, body: Body) -> axum::response::Response {
+        router(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/messages")
+                    .header("content-type", "application/json")
+                    .header("authorization", "Bearer expired-or-bogus")
+                    .body(body)
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+    }
+
+    /// A request refused for bad credentials must have its body consumed before the
+    /// 401 goes out; otherwise the reverse proxy is still writing when the connection closes and
+    /// turns the 401 into a 502.
+    #[tokio::test]
+    async fn failed_auth_consumes_the_body_before_returning_401() {
+        use std::sync::atomic::Ordering;
+        let total = 4 * 1024 * 1024;
+        let (body, pulled) = counted_body(total);
+        let resp = post_stream(authed_state().await, body).await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            pulled.load(Ordering::SeqCst),
+            total,
+            "the whole body must have been read and discarded before the 401"
+        );
+    }
+
+    /// The discard is bounded: a body past the cap is not read to the end.
+    #[tokio::test]
+    async fn failed_auth_stops_discarding_at_the_cap() {
+        use std::sync::atomic::Ordering;
+        let total = AUTH_FAIL_DRAIN_MAX_BYTES * 2;
+        let (body, pulled) = counted_body(total);
+        let resp = post_stream(authed_state().await, body).await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        let got = pulled.load(Ordering::SeqCst);
+        assert!(
+            got > AUTH_FAIL_DRAIN_MAX_BYTES && got <= AUTH_FAIL_DRAIN_MAX_BYTES + 65536,
+            "an oversized body should be read to just past the cap and no further, got {got}"
+        );
+    }
+
+    /// A stream error ends the discard at that point: the chunk after the error is never pulled.
+    #[tokio::test]
+    async fn discard_stops_at_a_body_stream_error() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let polled = Arc::new(AtomicUsize::new(0));
+        let counter = polled.clone();
+        let stream = futures::stream::iter((0..3).map(move |i| {
+            counter.fetch_add(1, Ordering::SeqCst);
+            if i == 1 {
+                Err(std::io::Error::other("client went away"))
+            } else {
+                Ok(axum::body::Bytes::from_static(b"x"))
+            }
+        }));
+        discard_request_body(Body::from_stream(stream), &tokio::sync::Semaphore::new(1)).await;
+        assert_eq!(polled.load(Ordering::SeqCst), 2, "must stop at the error");
+    }
+
+    /// A stalled sender cannot hold the connection past the timeout.
+    #[tokio::test(start_paused = true)]
+    async fn discard_gives_up_on_a_stalled_body() {
+        let stalled = Body::from_stream(futures::stream::pending::<
+            Result<axum::body::Bytes, std::io::Error>,
+        >());
+        let started = tokio::time::Instant::now();
+        discard_request_body(stalled, &tokio::sync::Semaphore::new(1)).await;
+        assert!(started.elapsed() >= AUTH_FAIL_DRAIN_TIMEOUT);
+        assert!(started.elapsed() < AUTH_FAIL_DRAIN_TIMEOUT * 2);
+    }
+
+    /// `Expect: 100-continue` requests are refused without inviting the body.
+    #[tokio::test]
+    async fn expect_continue_request_is_refused_without_reading_the_body() {
+        use std::sync::atomic::Ordering;
+        let (body, pulled) = counted_body(1024 * 1024);
+        let resp = router(authed_state().await)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/messages")
+                    .header("content-type", "application/json")
+                    .header("expect", "100-continue")
+                    .header("authorization", "Bearer bogus")
+                    .body(body)
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(pulled.load(Ordering::SeqCst), 0);
+    }
+
+    /// When every drain slot is taken, the body must be left unread so the 401 is not delayed.
+    #[tokio::test]
+    async fn discard_is_skipped_when_drain_slots_are_exhausted() {
+        use std::sync::atomic::Ordering;
+        let (body, pulled) = counted_body(1024 * 1024);
+        discard_request_body(body, &tokio::sync::Semaphore::new(0)).await;
+        assert_eq!(pulled.load(Ordering::SeqCst), 0);
+
+        let (body, pulled) = counted_body(1024 * 1024);
+        discard_request_body(body, &tokio::sync::Semaphore::new(1)).await;
+        assert_eq!(pulled.load(Ordering::SeqCst), 1024 * 1024);
+    }
+
+    /// The admin surface keeps axum's 2 MB default. Nothing it accepts is large, and a
+    /// permissive limit there would be free memory pressure on a non-inference route. This
+    /// fails if a refactor ever hoists the raised limit onto the whole router.
+    #[tokio::test]
+    async fn admin_routes_keep_the_default_limit() {
+        let resp = post(
+            authed_state().await,
+            "/admin/keys",
+            Some(TEST_KEY),
+            unparseable_body(4 * 1024 * 1024),
+        )
+        .await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "admin routes must NOT inherit the raised inference limit"
+        );
     }
 }
