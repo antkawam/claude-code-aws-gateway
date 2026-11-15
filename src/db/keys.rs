@@ -19,7 +19,7 @@ pub fn generate_key() -> String {
 
 pub fn key_prefix(key: &str) -> String {
     if key.len() > 16 {
-        format!("{}...", &key[..16])
+        format!("{}...", crate::text::truncate_bytes(key, 16))
     } else {
         key.to_string()
     }

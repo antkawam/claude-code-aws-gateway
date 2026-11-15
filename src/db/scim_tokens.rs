@@ -22,7 +22,7 @@ pub fn generate_token() -> String {
 /// Token prefix for display (first 16 chars + "...").
 pub fn token_prefix(token: &str) -> String {
     if token.len() > 16 {
-        format!("{}...", &token[..16])
+        format!("{}...", crate::text::truncate_bytes(token, 16))
     } else {
         token.to_string()
     }

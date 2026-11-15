@@ -3182,7 +3182,7 @@ pub async fn test_search_provider(
             "results": results.iter().map(|r| json!({
                 "title": r.title,
                 "url": r.url,
-                "snippet": if r.snippet.len() > 200 { format!("{}...", &r.snippet[..200]) } else { r.snippet.clone() },
+                "snippet": if r.snippet.len() > 200 { format!("{}...", crate::text::truncate_bytes(&r.snippet, 200)) } else { r.snippet.clone() },
             })).collect::<Vec<_>>(),
         }))
         .into_response(),

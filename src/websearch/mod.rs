@@ -499,7 +499,7 @@ mod tests {
                         "  [{}] {} - {}",
                         r.url,
                         r.title,
-                        &r.snippet[..r.snippet.len().min(80)]
+                        crate::text::truncate_bytes(&r.snippet, 80)
                     );
                 }
             }

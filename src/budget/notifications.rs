@@ -117,7 +117,7 @@ pub async fn send_sns(
     sns_client
         .publish()
         .topic_arn(topic_arn)
-        .subject(&subject[..subject.len().min(100)])
+        .subject(crate::text::truncate_bytes(&subject, 100))
         .message(&message)
         .send()
         .await?;

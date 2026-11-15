@@ -107,7 +107,7 @@ pub fn detect(req: &AnthropicRequest) -> Vec<DetectionFlag> {
                         continue;
                     }
                     let preview = if command.len() > 100 {
-                        format!("{}...", &command[..100])
+                        format!("{}...", crate::text::truncate_bytes(command, 100))
                     } else {
                         command.to_string()
                     };
@@ -215,6 +215,22 @@ mod tests {
             "role": "assistant",
             "content": [{"type": "tool_use", "id": "t1", "name": "Bash", "input": {"command": cmd}}]
         })
+    }
+
+    #[test]
+    fn preview_truncation_handles_multi_byte_chars() {
+        // U+202F occupies bytes 98..101, straddling the 100-byte preview cut.
+        let cmd = format!("git push --force origin {}\u{202f}tail", "a".repeat(74));
+        assert_eq!(cmd.find('\u{202f}'), Some(98));
+
+        let flags = detect(&make_request(vec![bash_command(&cmd)]));
+        let preview = flags[0].evidence["flagged_commands"][0]["preview"]
+            .as_str()
+            .unwrap();
+        assert_eq!(
+            preview,
+            format!("git push --force origin {}...", "a".repeat(74))
+        );
     }
 
     #[test]

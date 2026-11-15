@@ -1182,17 +1182,7 @@ fn extract_request_info(req: &request::AnthropicRequest) -> RequestInfo {
                             let error_snippet = block
                                 .get("content")
                                 .and_then(|c| c.as_str())
-                                .map(|s| {
-                                    if s.len() > 100 {
-                                        let mut idx = 100;
-                                        while idx > 0 && !s.is_char_boundary(idx) {
-                                            idx -= 1;
-                                        }
-                                        &s[..idx]
-                                    } else {
-                                        s
-                                    }
-                                })
+                                .map(|s| crate::text::truncate_bytes(s, 100))
                                 .unwrap_or("unknown");
                             tool_errors.push(json!({
                                 "tool_use_id": tool_use_id,
@@ -2876,11 +2866,7 @@ async fn check_auth(headers: &HeaderMap, state: &GatewayState) -> Result<AuthRes
                     (format!("{:?}", h.alg), sub)
                 }
                 Err(_) => {
-                    let prefix = if key_str.len() > 8 {
-                        &key_str[..8]
-                    } else {
-                        key_str
-                    };
+                    let prefix = crate::text::truncate_bytes(key_str, 8);
                     ("non-jwt".to_string(), format!("key:{prefix}"))
                 }
             };
@@ -2902,11 +2888,7 @@ async fn check_auth(headers: &HeaderMap, state: &GatewayState) -> Result<AuthRes
         }
     }
 
-    let key_prefix = if key_str.len() > 8 {
-        &key_str[..8]
-    } else {
-        key_str
-    };
+    let key_prefix = crate::text::truncate_bytes(key_str, 8);
     let (fail_iss, fail_sub) = peek_jwt_claims(key_str).unwrap_or_default();
     tracing::warn!(key_prefix = %key_prefix, token_iss = %fail_iss, token_sub = %fail_sub, "Auth failure: invalid API key");
     state.metrics.record_auth_failure("invalid_key");
@@ -3016,7 +2998,7 @@ pub(crate) fn build_model_unavailable_error(model: &str) -> Response {
     )
 }
 
-fn error_response(status: StatusCode, error_type: &str, message: &str) -> Response {
+pub(crate) fn error_response(status: StatusCode, error_type: &str, message: &str) -> Response {
     let request_id = format!("req_{}", uuid::Uuid::new_v4().simple());
     Response::builder()
         .status(status)
