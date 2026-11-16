@@ -197,11 +197,17 @@ fn strip_bedrock_version_tag(s: &str) -> &str {
 /// Strip a YYYYMMDD date suffix from a model ID.
 /// e.g. "claude-sonnet-5-0-20260601" -> "claude-sonnet-5-0"
 pub fn strip_date_suffix(model: &str) -> &str {
-    // Look for pattern: -{8 digits} at the end
-    if model.len() >= 9 {
-        let candidate = &model[model.len() - 9..];
+    // Look for pattern: -{8 digits} at the end.
+    //
+    // `model` comes from the request body, so byte len-9 need not be a character
+    // boundary. A tail that doesn't start on one can't be `-` plus eight ASCII digits,
+    // so bailing out early loses nothing.
+    if let Some(cut) = model.len().checked_sub(9)
+        && model.is_char_boundary(cut)
+    {
+        let candidate = &model[cut..];
         if candidate.starts_with('-') && candidate[1..].chars().all(|c| c.is_ascii_digit()) {
-            return &model[..model.len() - 9];
+            return &model[..cut];
         }
     }
     model
@@ -773,6 +779,21 @@ mod tests {
     fn test_strip_date_suffix_no_date() {
         assert_eq!(strip_date_suffix("claude-sonnet-4-6"), "claude-sonnet-4-6");
         assert_eq!(strip_date_suffix("claude-opus"), "claude-opus");
+    }
+
+    #[test]
+    fn test_strip_date_suffix_non_ascii_model_id() {
+        // byte len-9 falls inside the first star; a non-boundary tail is never a date.
+        assert_eq!(
+            strip_date_suffix("\u{2605}\u{2605}\u{2605}x"),
+            "\u{2605}\u{2605}\u{2605}x"
+        );
+        assert_eq!(
+            strip_date_suffix("\u{1f4a5}\u{1f4a5}x"),
+            "\u{1f4a5}\u{1f4a5}x"
+        );
+        // a real date suffix behind non-ASCII still strips
+        assert_eq!(strip_date_suffix("caf\u{e9}-20260601"), "caf\u{e9}");
     }
 
     #[test]

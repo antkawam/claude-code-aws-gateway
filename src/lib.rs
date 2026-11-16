@@ -16,6 +16,7 @@ pub mod ratelimit;
 pub mod scim;
 pub mod spend;
 pub mod telemetry;
+pub mod text;
 pub mod translate;
 pub mod websearch;
 

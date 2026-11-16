@@ -329,7 +329,7 @@ async fn test_setup_script_deny_when_disabled() {
     assert!(
         body_str.contains("WebSearch"),
         "Setup script should contain 'WebSearch' in deny permissions when mode is disabled. Got: {}",
-        &body_str[..body_str.len().min(500)]
+        ccag::text::truncate_bytes(&body_str, 500)
     );
 }
 
@@ -367,7 +367,7 @@ async fn test_setup_script_no_deny_when_enabled() {
     assert!(
         !has_websearch_deny,
         "Setup script should NOT contain WebSearch deny permissions when mode is enabled (default). Got: {}",
-        &body_str[..body_str.len().min(500)]
+        ccag::text::truncate_bytes(&body_str, 500)
     );
 }
 

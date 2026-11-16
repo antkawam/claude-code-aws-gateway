@@ -16,6 +16,7 @@ use axum::{
     routing::{delete, get, patch, post, put},
 };
 use subtle::ConstantTimeEq;
+use tower_http::catch_panic::CatchPanicLayer;
 use tower_http::cors::{AllowHeaders, AllowOrigin, CorsLayer};
 
 use crate::proxy::GatewayState;
@@ -281,6 +282,68 @@ pub fn router(state: Arc<GatewayState>) -> Router {
                 ])
                 .allow_headers(AllowHeaders::mirror_request()),
         )
+        // Outermost on purpose: nothing inside this layer can kill the connection.
+        .layer(CatchPanicLayer::custom(panic_to_500))
+}
+
+/// Turn a handler panic into a 500 instead of a dropped connection.
+///
+/// Without this, a panic unwinds the request task without writing a response: hyper closes
+/// the connection and the load balancer reports 502 for every request on that connection,
+/// not just the one that panicked.
+///
+/// The payload is still logged at error level, so the underlying bug stays visible.
+///
+/// A panic raised while streaming a response body arrives after the status line is on the
+/// wire, so the client sees a truncated stream rather than this 500.
+fn panic_to_500(err: Box<dyn std::any::Any + Send + 'static>) -> axum::response::Response {
+    let detail = err
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .or_else(|| err.downcast_ref::<&'static str>().copied())
+        .unwrap_or("non-string panic payload");
+
+    tracing::error!(panic = %detail, "Handler panicked; returning 500");
+
+    handlers::error_response(
+        axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+        "api_error",
+        "Internal server error",
+    )
+}
+
+#[cfg(test)]
+mod catch_panic_tests {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use tower::ServiceExt;
+
+    #[tokio::test]
+    async fn handler_panic_returns_500_instead_of_dropping_the_connection() {
+        let app = Router::new()
+            .route(
+                "/boom",
+                get(|| async {
+                    // A byte-offset slice landing inside a multi-byte character.
+                    let s = format!("{}\u{202f}tail", "e".repeat(98));
+                    let _ = &s[..100];
+                    "unreachable"
+                }),
+            )
+            .layer(CatchPanicLayer::custom(panic_to_500));
+
+        let res = app
+            .oneshot(Request::builder().uri("/boom").body(Body::empty()).unwrap())
+            .await
+            .expect("the service must yield a response, not an error");
+
+        assert_eq!(res.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            res.headers().get("content-type").unwrap(),
+            "application/json"
+        );
+    }
 }
 
 async fn portal() -> impl IntoResponse {

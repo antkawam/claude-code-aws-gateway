@@ -69,13 +69,14 @@ fn split_and(input: &str) -> Option<(&str, &str)> {
             continue;
         }
         if !in_quotes {
-            // Check for " and " (5 bytes: space + a + n + d + space)
-            // We need at least 5 chars remaining starting at i.
-            if i + 5 <= len {
-                let candidate = &input[i..i + 5];
-                if candidate.eq_ignore_ascii_case(" and ") {
-                    return Some((&input[..i], &input[i + 5..]));
-                }
+            // Check for " and " (5 bytes: space + a + n + d + space).
+            //
+            // Compare BYTES, never `&input[i..i + 5]`: `i` walks one byte at a time and
+            // lands inside multi-byte characters, where slicing panics. The needle is pure
+            // ASCII, so a match guarantees `i` and `i + 5` are both boundaries and the
+            // slices below are safe.
+            if i + 5 <= len && bytes[i..i + 5].eq_ignore_ascii_case(b" and ") {
+                return Some((&input[..i], &input[i + 5..]));
             }
         }
         i += 1;
@@ -161,6 +162,24 @@ fn parse_comp_value(input: &str) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn non_ascii_filter_does_not_panic() {
+        // `i` byte-walks, so an unquoted multi-byte char puts it mid-character
+        // inside the " and " window.
+        assert_eq!(
+            parse_filter("us\u{e9}rName eq \"x\"").unwrap(),
+            ScimFilter::Eq("us\u{e9}rName".to_string(), "x".to_string())
+        );
+        assert_eq!(
+            parse_filter("userName eq \"jos\u{e9}@example.com\"").unwrap(),
+            ScimFilter::Eq("userName".to_string(), "jos\u{e9}@example.com".to_string())
+        );
+
+        // ...and " and " splitting still works with non-ASCII on both sides.
+        let f = parse_filter("userName eq \"jos\u{e9}\" and active eq true").unwrap();
+        assert!(matches!(f, ScimFilter::And(_, _)));
+    }
 
     #[test]
     fn parse_eq_string() {
