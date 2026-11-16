@@ -40,7 +40,7 @@ impl Drop for InFlightGuard {
 }
 
 /// Auth result: either a virtual key or an authenticated identity.
-enum AuthResult {
+pub(crate) enum AuthResult {
     VirtualKey(CachedKey),
     Oidc(OidcIdentity),
 }
@@ -2824,7 +2824,34 @@ fn peek_jwt_claims(token: &str) -> Option<(String, String)> {
 /// 1. Virtual keys (from DB cache, if enabled)
 /// 2. Gateway session tokens (HS256, issued by this gateway)
 /// 3. OIDC JWT tokens (RS256, from external IDPs)
-async fn check_auth(headers: &HeaderMap, state: &GatewayState) -> Result<AuthResult, Response> {
+///
+/// Logs the outcome; use this on the path that owns the request. See
+/// [`check_auth_silent`] for the pre-body guard, which must not double-log.
+pub(crate) async fn check_auth(
+    headers: &HeaderMap,
+    state: &GatewayState,
+) -> Result<AuthResult, Response> {
+    check_auth_inner(headers, state, true).await
+}
+
+/// Authenticate WITHOUT emitting the success/diagnostic log lines.
+///
+/// `api::guard_inference_request` runs auth before the body is read, and the handler runs it
+/// again for its own `AuthResult`. Logging from both would double every "OIDC token validated" /
+/// "Session token check failed" line for every SSO request. Failure paths still log and record
+/// metrics from whichever call short-circuits first, so nothing is lost.
+pub(crate) async fn check_auth_silent(
+    headers: &HeaderMap,
+    state: &GatewayState,
+) -> Result<AuthResult, Response> {
+    check_auth_inner(headers, state, false).await
+}
+
+async fn check_auth_inner(
+    headers: &HeaderMap,
+    state: &GatewayState,
+    log: bool,
+) -> Result<AuthResult, Response> {
     let provided = headers
         .get("x-api-key")
         .or_else(|| headers.get("anthropic-api-key"))
@@ -2862,7 +2889,9 @@ async fn check_auth(headers: &HeaderMap, state: &GatewayState) -> Result<AuthRes
     // Try gateway session token (cheap HMAC check, no network call)
     match crate::auth::session::validate(&state.session_signing_key, key_str) {
         Ok(identity) => {
-            tracing::info!(sub = %identity.sub, idp = %identity.idp_name, "Gateway session token validated");
+            if log {
+                tracing::info!(sub = %identity.sub, idp = %identity.idp_name, "Gateway session token validated");
+            }
             return Ok(AuthResult::Oidc(identity));
         }
         Err(e) => {
@@ -2884,7 +2913,9 @@ async fn check_auth(headers: &HeaderMap, state: &GatewayState) -> Result<AuthRes
                     ("non-jwt".to_string(), format!("key:{prefix}"))
                 }
             };
-            tracing::info!(reason = %e, alg = %token_alg, id = %id_hint, "Session token check failed");
+            if log {
+                tracing::info!(reason = %e, alg = %token_alg, id = %id_hint, "Session token check failed");
+            }
         }
     }
 
@@ -2892,7 +2923,9 @@ async fn check_auth(headers: &HeaderMap, state: &GatewayState) -> Result<AuthRes
     if state.idp_validator.idp_count().await > 0 {
         match state.idp_validator.validate_token(key_str).await {
             Ok(identity) => {
-                tracing::info!(sub = %identity.sub, idp = %identity.idp_name, "OIDC token validated");
+                if log {
+                    tracing::info!(sub = %identity.sub, idp = %identity.idp_name, "OIDC token validated");
+                }
                 return Ok(AuthResult::Oidc(identity));
             }
             Err(e) => {
@@ -3016,7 +3049,7 @@ pub(crate) fn build_model_unavailable_error(model: &str) -> Response {
     )
 }
 
-fn error_response(status: StatusCode, error_type: &str, message: &str) -> Response {
+pub(crate) fn error_response(status: StatusCode, error_type: &str, message: &str) -> Response {
     let request_id = format!("req_{}", uuid::Uuid::new_v4().simple());
     Response::builder()
         .status(status)
@@ -3087,7 +3120,7 @@ fn extract_error_message(debug_msg: &str) -> Option<String> {
 // ── Slice 2: dynamic list_models tests ──
 
 #[cfg(test)]
-mod tests_list_models_slice2 {
+pub(crate) mod tests_list_models_slice2 {
     use super::*;
     use axum::extract::State;
     use serde_json::Value;
@@ -3103,7 +3136,7 @@ mod tests_list_models_slice2 {
     /// - `model_cache` — used by bedrock_to_anthropic for reverse mapping
     ///
     /// All other fields are zeroed/stubbed so we never touch the network or DB.
-    pub(super) fn make_test_state(default_models: Vec<String>) -> Arc<GatewayState> {
+    pub(crate) fn make_test_state(default_models: Vec<String>) -> Arc<GatewayState> {
         let (metrics, _provider) = crate::telemetry::Metrics::new(None).unwrap();
         let metrics = Arc::new(metrics);
         let db_pool = Arc::new(tokio::sync::RwLock::new(
